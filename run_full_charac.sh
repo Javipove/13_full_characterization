@@ -1,10 +1,16 @@
 #!/bin/bash
 
 # Default value for runtime arguments
+# List of valid test types:
+# 0: Empty Kernel Launch
+# 1: Compute MM
+# 2: Invalid Test
+
 NUM_RT_ARGS=255
 CLEAN_MODE=0
+TEST_TYPE=2
 
-# Search for --num-rt-args in arguments to generate correct kernels
+# Search for arguments to generate correct kernels
 args=("$@")
 for ((i=0; i < ${#args[@]}; i++)); do
     if [[ "${args[i]}" == "--num-rt-args" ]]; then
@@ -12,6 +18,9 @@ for ((i=0; i < ${#args[@]}; i++)); do
     fi
     if [[ "${args[i]}" == "--clean-mode" ]]; then
         CLEAN_MODE="${args[i+1]}"
+    fi
+    if [[ "${args[i]}" == "--test" ]]; then
+        TEST_TYPE="${args[i+1]}"
     fi
 done
 
@@ -39,13 +48,17 @@ echo "Generating kernels with $NUM_RT_ARGS runtime arguments..."
 KERNEL_DIR="${TT_METAL_HOME}/tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels"
 KERNEL_COMMON_DIR="${TT_METAL_HOME}/tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels_common"
 
+# Clean kernel directory
+rm -rf $KERNEL_DIR
 mkdir -p $KERNEL_DIR
 
-# Copy common kernels
-cp $KERNEL_COMMON_DIR/*.cpp $KERNEL_DIR/
+if [[ "$TEST_TYPE" == "0" ]]; then
+    # Empty Kernel Launch
+    echo "Preparing Empty Kernel Launch kernels..."
+    cp $KERNEL_COMMON_DIR/empty_compute.cpp $KERNEL_DIR/
 
-# Generate empty_reader.cpp
-cat <<EOF > $KERNEL_DIR/empty_reader.cpp
+    # Generate empty_reader.cpp
+    cat <<EOF > $KERNEL_DIR/empty_reader.cpp
 // Auto-generated empty_reader.cpp
 // SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
 //
@@ -60,14 +73,14 @@ void kernel_main() {
     uint32_t compile_arg0 = get_compile_time_arg_val(0);
 EOF
 
-for ((i=0; i < NUM_RT_ARGS; i++)); do
-    echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_reader.cpp
-done
+    for ((i=0; i < NUM_RT_ARGS; i++)); do
+        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_reader.cpp
+    done
 
-echo "}" >> $KERNEL_DIR/empty_reader.cpp
+    echo "}" >> $KERNEL_DIR/empty_reader.cpp
 
-# Generate empty_writer.cpp
-cat <<EOF > $KERNEL_DIR/empty_writer.cpp
+    # Generate empty_writer.cpp
+    cat <<EOF > $KERNEL_DIR/empty_writer.cpp
 // SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -79,13 +92,28 @@ void kernel_main() {
     uint32_t compile_arg0 = get_compile_time_arg_val(0);
 EOF
 
-for ((i=0; i < NUM_RT_ARGS; i++)); do
-    echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_writer.cpp
-done
+    for ((i=0; i < NUM_RT_ARGS; i++)); do
+        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_writer.cpp
+    done
 
-echo "}" >> $KERNEL_DIR/empty_writer.cpp
+    echo "}" >> $KERNEL_DIR/empty_writer.cpp
+
+elif [[ "$TEST_TYPE" == "1" ]]; then
+    # Compute MM
+    # Compute MM
+    echo "Preparing Compute MM kernels..."
+    cp $KERNEL_COMMON_DIR/bmm_large_block_zm_fused_bias_activation.cpp $KERNEL_DIR/
+    cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout.cpp $KERNEL_DIR/
+    cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout.cpp $KERNEL_DIR/
+else
+    echo "Unknown or No Kernel Generation needed for Test Type $TEST_TYPE"
+fi
 
 # Execute the benchmark with all passed arguments
 # Usage example: ./run_full_charac.sh ./build/test/test_full_charac --num-rt-args 512 ...
+if [[ "$TEST_TYPE" != "2" ]]; then
 echo "Executing: $@"
 "$@"
+else
+    echo "Skipping execution for  for testing, invalid test type $TEST_TYPE"
+fi
