@@ -135,7 +135,8 @@ constexpr uint32_t MAX_ARGS = 255;
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
   ComputeMM = 1,
-  InvalidTest = 2
+  SubDeviceMM = 2,
+  InvalidTest = 3
 };
 
 // Definition of test parameters structure
@@ -226,7 +227,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
 
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
-                                                                "--test", 2);
+                                                                "--test", 3);
     test = static_cast<TestType>(test_uint);
     test_args::validate_remaining_args(input_args);
 
@@ -356,6 +357,123 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
   return in0_block_w;
 }
 
+// 1-to-1 match with usage in 1_compute_mm/test_compute_mm.cpp
+void create_program_compute_mm(
+    tt_metal::distributed::MeshDevice *device, tt::DataFormat cb_data_format,
+    MathFidelity math_fidelity, bool fp32_dest_acc_en,
+    uint32_t single_tile_size, CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+    uint32_t Kt, uint32_t in0_block_w, uint32_t out_subblock_h,
+    uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
+    uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
+    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
+    uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y = 0);
+
+//! Phase 2: Sub-Device Parallelism Test
+//! Partitions the device into 2 Sub-Devices and runs independent MM workloads
+//! on each.
+bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
+                                const TestParams &params) {
+  bool pass = true;
+  try {
+    log_info(LogTest, "Starting Phase 2: Sub-Device Parallelism Test");
+
+    if (params.core_y < 2) {
+      log_fatal(
+          LogTest,
+          "Sub-Device test requires at least 2 rows of cores (y_size >= 2)");
+      return false;
+    }
+
+    uint32_t num_sub_devices = 2;
+    uint32_t rows_per_sub_device = params.core_y / num_sub_devices;
+
+    // 1. Get Common Params
+    auto arch = device->arch();
+    uint32_t l1_size = get_l1_size(arch);
+    uint32_t l1_unreserved_base =
+        device->allocator()->get_base_allocator_addr(HalMemType::L1);
+    auto [math_fidelity, fp32_dest_acc_en] = get_compute_params(arch);
+    tt::DataFormat data_format = (params.dtype == 0)
+                                     ? tt::DataFormat::Bfp8_b
+                                     : tt::DataFormat::Float16_b;
+    uint32_t single_tile_size = tt::tile_size(data_format);
+
+    // 2. Prepare Program with Loop over Splits
+    tt_metal::Program program;
+    uint32_t M_split = params.M / num_sub_devices;
+
+    for (uint32_t i = 0; i < num_sub_devices; i++) {
+      // Define Core Range for this Split
+      uint32_t start_y = i * rows_per_sub_device;
+      uint32_t end_y = (i == num_sub_devices - 1)
+                           ? params.core_y - 1
+                           : (start_y + rows_per_sub_device - 1);
+      CoreCoord split_grid_size = {(std::size_t)params.core_x,
+                                   (std::size_t)(end_y - start_y + 1)};
+      CoreRange split_core_range(
+          {0, (std::size_t)start_y},
+          {(std::size_t)params.core_x - 1, (std::size_t)end_y});
+
+      log_info(LogTest, "SubDevice {}: Rows {}-{} (M={})", i, start_y, end_y,
+               M_split);
+
+      // Calculate Blockings for this Split
+      auto [Mt, Nt, Kt] =
+          get_aligned_input_tile_num(M_split, params.N, params.K);
+
+      uint32_t per_core_Mt = ((Mt - 1) / split_grid_size.y) + 1;
+      uint32_t per_core_Nt = ((Nt - 1) / split_grid_size.x) + 1;
+
+      uint32_t in0_block_w =
+          get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                          l1_size, l1_unreserved_base);
+      if (in0_block_w == 0)
+        throw std::runtime_error("Insufficient L1 for SubDevice split");
+
+      auto [out_subblock_h, out_subblock_w] =
+          get_out_subblock_params(per_core_Mt, per_core_Nt);
+
+      auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
+            in1_addr, out_addr] =
+          get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
+                                    single_tile_size, l1_unreserved_base);
+
+      // Create Kernels/Buffers (Appends to program using strict CoreRange)
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
+          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, in0_cb_addr,
+          in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr, in1_addr, out_addr,
+          program, start_y);
+
+      // Prepare Inputs for this split
+      prepare_inputs_compute_mm(device, split_grid_size, Mt, Nt, Kt,
+                                per_core_Mt, per_core_Nt, in0_block_w,
+                                single_tile_size, in0_addr, in1_addr,
+                                in2_cb_addr, start_y);
+    }
+
+    // 3. Profiling Loop (Standard Dispatch)
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
+
+    log_info(LogTest, "Num tests {}", params.num_iters);
+    for (uint32_t i = 0; i < params.num_iters; ++i) {
+      ZoneScoped("Sub-Device Parallel Dispatch");
+      tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
+                                                 mesh_workload, false);
+      tt_metal::distributed::Finish(device->mesh_command_queue());
+    }
+
+    return pass;
+  } catch (const std::exception &e) {
+    log_error(LogTest, "Error: {}", e.what());
+    return false;
+  }
+}
+
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch) {
   MathFidelity math_fidelity = MathFidelity::HiFi4;
@@ -480,7 +598,8 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
                                uint32_t Kt, uint32_t per_core_Mt,
                                uint32_t per_core_Nt, uint32_t in0_block_w,
                                uint32_t single_tile_size, uint32_t in0_addr,
-                               uint32_t in1_addr, uint32_t in2_cb_addr) {
+                               uint32_t in1_addr, uint32_t in2_cb_addr,
+                               uint32_t start_core_y = 0) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   bool pass = true;
@@ -536,7 +655,7 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
       // Copy to L1
       {
         ZoneScopedN("Host->Device Transfer (L1 Write)");
-        CoreCoord core = {(std::size_t)c, (std::size_t)r};
+        CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
         // NOTE: We assume device 0 for now as per original code, but we should
         // iterate if mesh
         auto *target_device = device->get_devices()[0];
@@ -558,576 +677,562 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
 // 1_compute_mm/test_compute_mm.cpp. Hardcoded to Multi-Core Tile Layout (no
 // single core branching), removed deprecated packing args.
 
-    tt_metal::distributed::MeshDevice* device,
-    tt::DataFormat cb_data_format,
-    MathFidelity math_fidelity,
-    bool fp32_dest_acc_en,
-    uint32_t single_tile_size,
-    CoreCoord core_range,
-    uint32_t Mt,
-    uint32_t Nt,
-    uint32_t Kt,
-    uint32_t in0_block_w,
-    uint32_t out_subblock_h,
-    uint32_t out_subblock_w,
-    uint32_t per_core_Mt,
-    uint32_t per_core_Nt,
-    uint32_t in0_cb_addr,
-    uint32_t in1_cb_addr,
-    uint32_t in2_cb_addr,
-    uint32_t out_cb_addr,
-    uint32_t in0_addr,
-    uint32_t in1_addr,
-    uint32_t out_addr) {
+// 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
+void create_program_compute_mm(
+    tt_metal::distributed::MeshDevice *device, tt::DataFormat cb_data_format,
+    MathFidelity math_fidelity, bool fp32_dest_acc_en,
+    uint32_t single_tile_size, CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+    uint32_t Kt, uint32_t in0_block_w, uint32_t out_subblock_h,
+    uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
+    uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
+    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
+    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
+    uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y) {
 
-      tt_metal::Program program{};
+  // Program is passed by reference, no need to create it.
+  // tt_metal::Program program{};
 
-      // 1. Define buffer sizes in "tiles" (32x32 elements)
-      // Double buffering (num_buffer = 2) allows the reader/writer to work on
-      // one buffer while the compute engine works on the other, hiding data
-      // movement latency.
-      uint32_t num_buffer = 2;
-      uint32_t in0_block_tiles = per_core_Mt * in0_block_w;
-      uint32_t in0_CB_tiles = in0_block_tiles * num_buffer;
-      uint32_t in1_block_tiles = per_core_Nt * in0_block_w;
-      uint32_t in1_CB_tiles = in1_block_tiles * num_buffer;
-      uint32_t out_block_tiles = per_core_Mt * per_core_Nt;
-      uint32_t out_CB_tiles = out_block_tiles;
-      uint32_t out_CB_size = out_CB_tiles * single_tile_size;
+  // 1. Define buffer sizes in "tiles" (32x32 elements)
+  // Double buffering (num_buffer = 2) allows the reader/writer to work on
+  // one buffer while the compute engine works on the other, hiding data
+  // movement latency.
+  uint32_t num_buffer = 2;
+  uint32_t in0_block_tiles = per_core_Mt * in0_block_w;
+  uint32_t in0_CB_tiles = in0_block_tiles * num_buffer;
+  uint32_t in1_block_tiles = per_core_Nt * in0_block_w;
+  uint32_t in1_CB_tiles = in1_block_tiles * num_buffer;
+  uint32_t out_block_tiles = per_core_Mt * per_core_Nt;
+  uint32_t out_CB_tiles = out_block_tiles;
+  uint32_t out_CB_size = out_CB_tiles * single_tile_size;
 
-      // 2. Define Compute Kernel Compile-Time Arguments
-      // These arguments tell the FPU (Float Point Unit) how to process the
-      // block. 'in0_block_w' is the K-dimension width of the block.
-      // 'out_subblock_h/w' are the dimensions of the sub-block for register
-      // accumulation.
-      uint32_t num_blocks = (Kt / in0_block_w);
-      uint32_t in0_num_subblocks = (per_core_Mt / out_subblock_h);
-      uint32_t in0_block_num_tiles =
-          out_subblock_h * in0_block_w * in0_num_subblocks;
-      uint32_t in0_subblock_num_tiles = out_subblock_h * in0_block_w;
-      uint32_t in1_num_subblocks = (per_core_Nt / out_subblock_w);
-      uint32_t in1_block_num_tiles =
-          out_subblock_w * in0_block_w * in1_num_subblocks;
-      uint32_t in1_per_core_w = out_subblock_w * in1_num_subblocks;
-      uint32_t out_subblock_num_tiles = out_subblock_h * out_subblock_w;
+  // 2. Define Compute Kernel Compile-Time Arguments
+  // These arguments tell the FPU (Float Point Unit) how to process the
+  // block. 'in0_block_w' is the K-dimension width of the block.
+  // 'out_subblock_h/w' are the dimensions of the sub-block for register
+  // accumulation.
+  uint32_t num_blocks = (Kt / in0_block_w);
+  uint32_t in0_num_subblocks = (per_core_Mt / out_subblock_h);
+  uint32_t in0_block_num_tiles =
+      out_subblock_h * in0_block_w * in0_num_subblocks;
+  uint32_t in0_subblock_num_tiles = out_subblock_h * in0_block_w;
+  uint32_t in1_num_subblocks = (per_core_Nt / out_subblock_w);
+  uint32_t in1_block_num_tiles =
+      out_subblock_w * in0_block_w * in1_num_subblocks;
+  uint32_t in1_per_core_w = out_subblock_w * in1_num_subblocks;
+  uint32_t out_subblock_num_tiles = out_subblock_h * out_subblock_w;
 
-      vector<uint32_t> compute_kernel_args = {in0_block_w,
-                                              in0_num_subblocks,
-                                              in0_block_num_tiles,
-                                              in0_subblock_num_tiles,
-                                              in1_num_subblocks,
-                                              in1_block_num_tiles,
-                                              in1_per_core_w,
-                                              num_blocks,
-                                              out_subblock_h,
-                                              out_subblock_w,
-                                              out_subblock_num_tiles,
-                                              1,
-                                              per_core_Mt * per_core_Nt};
+  vector<uint32_t> compute_kernel_args = {in0_block_w,
+                                          in0_num_subblocks,
+                                          in0_block_num_tiles,
+                                          in0_subblock_num_tiles,
+                                          in1_num_subblocks,
+                                          in1_block_num_tiles,
+                                          in1_per_core_w,
+                                          num_blocks,
+                                          out_subblock_h,
+                                          out_subblock_w,
+                                          out_subblock_num_tiles,
+                                          1,
+                                          per_core_Mt * per_core_Nt};
 
-      CoreRange all_cores(
-          {(std::size_t)0, (std::size_t)0},
-          {(std::size_t)core_range.x - 1, (std::size_t)core_range.y - 1});
+  CoreRange all_cores({(std::size_t)0, (std::size_t)start_core_y},
+                      {(std::size_t)core_range.x - 1,
+                       (std::size_t)(core_range.y - 1 + start_core_y)});
 
-      // 3. Create Circular Buffers (CBs)
-      // CB 0: Input 0 (Matrix A block)
-      tt_metal::CircularBufferConfig cb_src0 =
-          tt_metal::CircularBufferConfig(in0_CB_tiles * single_tile_size,
-                                         {{tt::CBIndex::c_0, cb_data_format}})
-              .set_page_size(tt::CBIndex::c_0, single_tile_size);
-      tt_metal::CreateCircularBuffer(program, all_cores, cb_src0);
+  // 3. Create Circular Buffers (CBs)
+  // CB 0: Input 0 (Matrix A block)
+  tt_metal::CircularBufferConfig cb_src0 =
+      tt_metal::CircularBufferConfig(in0_CB_tiles * single_tile_size,
+                                     {{tt::CBIndex::c_0, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_0, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src0);
 
-      // CB 1: Input 1 (Matrix B block)
-      tt_metal::CircularBufferConfig cb_src1 =
-          tt_metal::CircularBufferConfig(in1_CB_tiles * single_tile_size,
-                                         {{tt::CBIndex::c_1, cb_data_format}})
-              .set_page_size(tt::CBIndex::c_1, single_tile_size);
-      tt_metal::CreateCircularBuffer(program, all_cores, cb_src1);
+  // CB 1: Input 1 (Matrix B block)
+  tt_metal::CircularBufferConfig cb_src1 =
+      tt_metal::CircularBufferConfig(in1_CB_tiles * single_tile_size,
+                                     {{tt::CBIndex::c_1, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_1, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src1);
 
-      // CB 2: Scaling/Padding (used by some kernels, often small)
-      tt_metal::CircularBufferConfig cb_src2 =
-          tt_metal::CircularBufferConfig(single_tile_size,
-                                         {{tt::CBIndex::c_2, cb_data_format}})
-              .set_page_size(tt::CBIndex::c_2, single_tile_size);
-      tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
+  // CB 2: Scaling/Padding (used by some kernels, often small)
+  tt_metal::CircularBufferConfig cb_src2 =
+      tt_metal::CircularBufferConfig(single_tile_size,
+                                     {{tt::CBIndex::c_2, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_2, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
 
-      // CB 16: Output (Matrix C)
-      tt_metal::CircularBufferConfig cb_out =
-          tt_metal::CircularBufferConfig(out_CB_size,
-                                         {{tt::CBIndex::c_16, cb_data_format},
-                                          {tt::CBIndex::c_24, cb_data_format}})
-              .set_page_size(tt::CBIndex::c_16, single_tile_size)
-              .set_page_size(tt::CBIndex::c_24, single_tile_size);
-      tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
-                                     cb_out);
+  // CB 16: Output (Matrix C)
+  tt_metal::CircularBufferConfig cb_out =
+      tt_metal::CircularBufferConfig(out_CB_size,
+                                     {{tt::CBIndex::c_16, cb_data_format},
+                                      {tt::CBIndex::c_24, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_16, single_tile_size)
+          .set_page_size(tt::CBIndex::c_24, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_out);
 
-      // 4. Create Kernels
-      // Reader: Fetch data from L1/DRAM into CB0/CB1
-      auto mm_reader_id = tt_metal::CreateKernel(
+  // 4. Create Kernels
+  // Reader: Fetch data from L1/DRAM into CB0/CB1
+  auto mm_reader_id = tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
+      "in0_reader_bmm_tile_layout.cpp",
+      all_cores,
+      tt_metal::DataMovementConfig{.processor =
+                                       tt_metal::DataMovementProcessor::RISCV_1,
+                                   .noc = tt_metal::NOC::RISCV_0_default});
+
+  // Writer: Write data from CB16 to L1/DRAM. Also handles In1 reading in
+  // some configs.
+  std::map<std::string, std::string> writer_defines;
+  writer_defines["IN1_IS_IDENTITY"] = "1";
+  auto mm_writer_id = tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
+      "in1_reader_writer_bmm_tile_layout.cpp",
+      all_cores,
+      tt_metal::DataMovementConfig{.processor =
+                                       tt_metal::DataMovementProcessor::RISCV_0,
+                                   .noc = tt_metal::NOC::RISCV_1_default,
+                                   .defines = writer_defines});
+
+  // Compute: Matrix Multiplication (block_w loops)
+  tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
+      "bmm_large_block_zm_fused_bias_activation.cpp",
+      all_cores,
+      tt_metal::ComputeConfig{.math_fidelity = math_fidelity,
+                              .fp32_dest_acc_en = fp32_dest_acc_en,
+                              .compile_args = compute_kernel_args});
+
+  // 5. Runtime Arguments
+  // Set specific arguments for each core so it knows which "chunk" of the
+  // large matrix to process.
+  uint32_t last_block_h =
+      Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
+  uint32_t last_block_w =
+      Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+
+  for (int y = 0; y < core_range.y; y++) {
+    for (int x = 0; x < core_range.x; x++) {
+      CoreCoord core = {(std::size_t)x, (std::size_t)(y + start_core_y)};
+      auto phy_core = device->worker_core_from_logical_core(core);
+
+      std::vector<uint32_t> reader_args = {in0_addr,
+                                           0,
+                                           1,
+                                           in0_block_w,
+                                           in0_block_w,
+                                           in0_block_w,
+                                           per_core_Mt,
+                                           in0_block_w * per_core_Mt,
+                                           num_blocks,
+                                           (uint32_t)phy_core.x,
+                                           (uint32_t)phy_core.y};
+      if (y == core_range.y - 1)
+        reader_args.back() = last_block_h; // Update last arg for edge case
+
+      // Writer/IN1 Args - simplified for brevity, assuming standard tiling
+      std::vector<uint32_t> writer_args = {in1_addr,
+                                           0,
+                                           1,
+                                           per_core_Nt,
+                                           in0_block_w * per_core_Nt,
+                                           per_core_Nt,
+                                           in0_block_w,
+                                           per_core_Nt * in0_block_w,
+                                           num_blocks,
+                                           in2_cb_addr,
+                                           (uint32_t)phy_core.x,
+                                           (uint32_t)phy_core.y,
+                                           out_addr,
+                                           0,
+                                           1,
+                                           per_core_Nt,
+                                           out_subblock_w,
+                                           out_subblock_h * per_core_Nt,
+                                           out_subblock_w,
+                                           out_subblock_h,
+                                           out_subblock_w * out_subblock_h,
+                                           per_core_Nt / out_subblock_w,
+                                           per_core_Mt / out_subblock_h};
+      // Padding handling omitted for brevity/risk-reduction (assumes
+      // divisible or standard) If rigor needed, copy full logic from
+      // 1_compute_mm.
+
+      tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);
+      tt_metal::SetRuntimeArgs(program, mm_writer_id, core, writer_args);
+    }
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+/// Compute MM Test
+///////////////////////////////////////////////////////////////////////////////////////////
+bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
+                     const TestParams &params) {
+  bool pass = true;
+  try {
+    log_info(LogTest, "Starting Compute MM Test");
+    log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+
+    // 1. Get L1 size and arch params
+    auto arch = device->arch();
+    uint32_t l1_size = get_l1_size(arch);
+    uint32_t l1_unreserved_base =
+        device->allocator()->get_base_allocator_addr(HalMemType::L1);
+    auto [math_fidelity, fp32_dest_acc_en] = get_compute_params(arch);
+
+    // 2. Calculate blocking parameters
+    auto [Mt, Nt, Kt] =
+        get_aligned_input_tile_num(params.M, params.N, params.K);
+    uint32_t num_cores_x = params.core_x;
+    uint32_t num_cores_y = params.core_y;
+    CoreCoord core_range(num_cores_x, num_cores_y);
+
+    uint32_t per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+    uint32_t per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
+
+    tt::DataFormat data_format = (params.dtype == 0)
+                                     ? tt::DataFormat::Bfp8_b
+                                     : tt::DataFormat::Float16_b;
+    uint32_t single_tile_size = tt::tile_size(data_format);
+
+    uint32_t in0_block_w =
+        get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+                        l1_unreserved_base);
+    if (in0_block_w == 0) {
+      log_error(LogTest, "Insufficient L1 memory for M={}, N={}, K={}",
+                params.M, params.N, params.K);
+      return false;
+    }
+
+    auto [out_subblock_h, out_subblock_w] =
+        get_out_subblock_params(per_core_Mt, per_core_Nt);
+
+    // 3. Buffer Addresses
+    auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
+          in1_addr, out_addr] =
+        get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
+                                  single_tile_size, l1_unreserved_base);
+
+    // 4. Create Program and Kernels (Device)
+    tt_metal::Program program;
+    create_program_compute_mm(
+        device, data_format, math_fidelity, fp32_dest_acc_en, single_tile_size,
+        core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h, out_subblock_w,
+        per_core_Mt, per_core_Nt, in0_cb_addr, in1_cb_addr, in2_cb_addr,
+        out_cb_addr, in0_addr, in1_addr, out_addr, program);
+
+    // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
+    // This function has internal ZoneScoped measurements for Host Data Gen,
+    // Tilize, Transfer
+    prepare_inputs_compute_mm(device, core_range, Mt, Nt, Kt, per_core_Mt,
+                              per_core_Nt, in0_block_w, single_tile_size,
+                              in0_addr, in1_addr, in2_cb_addr, 0);
+
+    // 6. Profiling loop
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
+
+    log_info(LogTest, "Num tests {}", params.num_iters);
+    for (uint32_t i = 0; i < params.num_iters; ++i) {
+      ZoneScoped("Dispatch Overhead"); // Measuring Dispatch Latency
+      tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
+                                                 mesh_workload, false);
+      tt_metal::distributed::Finish(device->mesh_command_queue());
+    }
+
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+/// Empty Kernel Launch Test
+///////////////////////////////////////////////////////////////////////////////////////////
+bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
+                              const TestParams &params) {
+  bool pass = true;
+  try {
+    ////////////////////////////////////////////////////////////////////////////
+    //                      Application Setup
+    ////////////////////////////////////////////////////////////////////////////
+    tt_metal::Program program = tt_metal::Program();
+    uint32_t single_tile_size = 2 * 1024;
+    std::vector<unsigned long> elapsed_us;
+
+    for (int core_group_idx = 0; core_group_idx < params.core_groups;
+         ++core_group_idx) {
+      CoreCoord start_core = {0, (params.core_y / params.core_groups) *
+                                     core_group_idx};
+      CoreCoord end_core = {
+          (std::size_t)params.core_x - 1,
+          (core_group_idx == params.core_groups - 1)
+              ? (std::size_t)params.core_y - 1
+              : ((params.core_y / params.core_groups) * (core_group_idx + 1)) -
+                    1};
+      CoreRange group_of_cores(start_core, end_core);
+
+      log_info(
+          LogTest, "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
+          core_group_idx, start_core.x, start_core.y, end_core.x, end_core.y);
+
+      for (int i = start_core.y; i <= end_core.y; i++) {
+        for (int j = start_core.x; j <= end_core.x; j++) {
+          CoreCoord core = {(std::size_t)j, (std::size_t)i};
+          uint32_t cb_index = 0;
+          uint32_t cb_tiles = 8;
+          tt_metal::CircularBufferConfig cb_config =
+              tt_metal::CircularBufferConfig(
+                  cb_tiles * single_tile_size,
+                  {{cb_index, tt::DataFormat::Float16_b}})
+                  .set_page_size(cb_index, single_tile_size);
+          tt_metal::CreateCircularBuffer(program, core, cb_config);
+        }
+      }
+
+      std::vector<uint32_t> reader_compile_args = {uint32_t(core_group_idx)};
+      auto reader_kernel = tt_metal::CreateKernel(
           program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
-          "in0_reader_bmm_tile_layout.cpp",
-          all_cores,
+          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+          "kernels/"
+          "empty_reader.cpp",
+          group_of_cores,
           tt_metal::DataMovementConfig{
               .processor = tt_metal::DataMovementProcessor::RISCV_1,
-              .noc = tt_metal::NOC::RISCV_0_default});
+              .noc = tt_metal::NOC::RISCV_1_default,
+              .compile_args = reader_compile_args});
 
-      // Writer: Write data from CB16 to L1/DRAM. Also handles In1 reading in
-      // some configs.
-      std::map<std::string, std::string> writer_defines;
-      writer_defines["IN1_IS_IDENTITY"] = "1";
-      auto mm_writer_id = tt_metal::CreateKernel(
+      std::vector<uint32_t> writer_compile_args = {uint32_t(core_group_idx)};
+      auto writer_kernel = tt_metal::CreateKernel(
           program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
-          "in1_reader_writer_bmm_tile_layout.cpp",
-          all_cores,
+          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+          "kernels/"
+          "empty_writer.cpp",
+          group_of_cores,
           tt_metal::DataMovementConfig{
               .processor = tt_metal::DataMovementProcessor::RISCV_0,
-              .noc = tt_metal::NOC::RISCV_1_default,
-              .defines = writer_defines});
+              .noc = tt_metal::NOC::RISCV_0_default,
+              .compile_args = writer_compile_args});
 
-      // Compute: Matrix Multiplication (block_w loops)
+      std::vector<uint32_t> compute_compile_args = {uint32_t(core_group_idx)};
       tt_metal::CreateKernel(
           program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
-          "bmm_large_block_zm_fused_bias_activation.cpp",
-          all_cores,
-          tt_metal::ComputeConfig{.math_fidelity = math_fidelity,
-                                  .fp32_dest_acc_en = fp32_dest_acc_en,
-                                  .compile_args = compute_kernel_args});
+          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+          "kernels/"
+          "empty_compute.cpp",
+          group_of_cores,
+          tt_metal::ComputeConfig{.compile_args = compute_compile_args});
 
-      // 5. Runtime Arguments
-      // Set specific arguments for each core so it knows which "chunk" of the
-      // large matrix to process.
-      uint32_t last_block_h =
-          Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
-      uint32_t last_block_w =
-          Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+      for (int i = start_core.y; i <= end_core.y; i++) {
+        for (int j = start_core.x; j <= end_core.x; j++) {
+          CoreCoord core = {(std::size_t)j, (std::size_t)i};
+          int core_index = (i * params.core_x) + j;
 
-      for (int y = 0; y < core_range.y; y++) {
-        for (int x = 0; x < core_range.x; x++) {
-          CoreCoord core = {(std::size_t)x, (std::size_t)y};
-          auto phy_core = device->worker_core_from_logical_core(core);
-
-          std::vector<uint32_t> reader_args = {in0_addr,
-                                               0,
-                                               1,
-                                               in0_block_w,
-                                               in0_block_w,
-                                               in0_block_w,
-                                               per_core_Mt,
-                                               in0_block_w * per_core_Mt,
-                                               num_blocks,
-                                               (uint32_t)phy_core.x,
-                                               (uint32_t)phy_core.y};
-          if (y == core_range.y - 1)
-            reader_args.back() = last_block_h; // Update last arg for edge case
-
-          // Writer/IN1 Args - simplified for brevity, assuming standard tiling
-          std::vector<uint32_t> writer_args = {in1_addr,
-                                               0,
-                                               1,
-                                               per_core_Nt,
-                                               in0_block_w * per_core_Nt,
-                                               per_core_Nt,
-                                               in0_block_w,
-                                               per_core_Nt * in0_block_w,
-                                               num_blocks,
-                                               in2_cb_addr,
-                                               (uint32_t)phy_core.x,
-                                               (uint32_t)phy_core.y,
-                                               out_addr,
-                                               0,
-                                               1,
-                                               per_core_Nt,
-                                               out_subblock_w,
-                                               out_subblock_h * per_core_Nt,
-                                               out_subblock_w,
-                                               out_subblock_h,
-                                               out_subblock_w * out_subblock_h,
-                                               per_core_Nt / out_subblock_w,
-                                               per_core_Mt / out_subblock_h};
-          // Padding handling omitted for brevity/risk-reduction (assumes
-          // divisible or standard) If rigor needed, copy full logic from
-          // 1_compute_mm.
-
-          tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);
-          tt_metal::SetRuntimeArgs(program, mm_writer_id, core, writer_args);
-        }
-      }
-      return program;
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////
-    /// Compute MM Test
-    ///////////////////////////////////////////////////////////////////////////////////////////
-    bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
-                         const TestParams &params) {
-      bool pass = true;
-      try {
-        log_info(LogTest, "Starting Compute MM Test");
-        log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
-
-        // 1. Get L1 size and arch params
-        auto arch = device->arch();
-        uint32_t l1_size = get_l1_size(arch);
-        uint32_t l1_unreserved_base =
-            device->allocator()->get_base_allocator_addr(HalMemType::L1);
-        auto [math_fidelity, fp32_dest_acc_en] = get_compute_params(arch);
-
-        // 2. Calculate blocking parameters
-        auto [Mt, Nt, Kt] =
-            get_aligned_input_tile_num(params.M, params.N, params.K);
-        uint32_t num_cores_x = params.core_x;
-        uint32_t num_cores_y = params.core_y;
-        CoreCoord core_range(num_cores_x, num_cores_y);
-
-        uint32_t per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
-        uint32_t per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
-
-        tt::DataFormat data_format = (params.dtype == 0)
-                                         ? tt::DataFormat::Bfp8_b
-                                         : tt::DataFormat::Float16_b;
-        uint32_t single_tile_size = tt::tile_size(data_format);
-
-        uint32_t in0_block_w =
-            get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
-                            l1_size, l1_unreserved_base);
-        if (in0_block_w == 0) {
-          log_error(LogTest, "Insufficient L1 memory for M={}, N={}, K={}",
-                    params.M, params.N, params.K);
-          return false;
-        }
-
-        auto [out_subblock_h, out_subblock_w] =
-            get_out_subblock_params(per_core_Mt, per_core_Nt);
-
-        // 3. Buffer Addresses
-        auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
-              in1_addr, out_addr] =
-            get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
-                                      single_tile_size, l1_unreserved_base);
-
-        // 4. Create Program and Kernels (Device)
-        tt_metal::Program program = create_program_compute_mm(
-            device, data_format, math_fidelity, fp32_dest_acc_en,
-            single_tile_size, core_range, Mt, Nt, Kt, in0_block_w,
-            out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt,
-            in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
-            in1_addr, out_addr);
-
-        // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
-        // This function has internal ZoneScoped measurements for Host Data Gen,
-        // Tilize, Transfer
-        prepare_inputs_compute_mm(device, core_range, Mt, Nt, Kt, per_core_Mt,
-                                  per_core_Nt, in0_block_w, single_tile_size,
-                                  in0_addr, in1_addr, in2_cb_addr);
-
-        // 6. Profiling loop
-        auto mesh_workload = tt_metal::distributed::MeshWorkload();
-        mesh_workload.add_program(
-            tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
-            std::move(program));
-
-        log_info(LogTest, "Num tests {}", params.num_iters);
-        for (uint32_t i = 0; i < params.num_iters; ++i) {
-          ZoneScoped("Dispatch Overhead"); // Measuring Dispatch Latency
-          tt_metal::distributed::EnqueueMeshWorkload(
-              device->mesh_command_queue(), mesh_workload, false);
-          tt_metal::distributed::Finish(device->mesh_command_queue());
-        }
-
-      } catch (const std::exception &e) {
-        pass = false;
-        log_error(LogTest, "{}", e.what());
-      }
-      return pass;
-    }
-
-    ///////////////////////////////////////////////////////////////////////////////////////////
-    /// Empty Kernel Launch Test
-    ///////////////////////////////////////////////////////////////////////////////////////////
-    bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
-                                  const TestParams &params) {
-      bool pass = true;
-      try {
-        ////////////////////////////////////////////////////////////////////////////
-        //                      Application Setup
-        ////////////////////////////////////////////////////////////////////////////
-        tt_metal::Program program = tt_metal::Program();
-        uint32_t single_tile_size = 2 * 1024;
-        std::vector<unsigned long> elapsed_us;
-
-        for (int core_group_idx = 0; core_group_idx < params.core_groups;
-             ++core_group_idx) {
-          CoreCoord start_core = {0, (params.core_y / params.core_groups) *
-                                         core_group_idx};
-          CoreCoord end_core = {(std::size_t)params.core_x - 1,
-                                (core_group_idx == params.core_groups - 1)
-                                    ? (std::size_t)params.core_y - 1
-                                    : ((params.core_y / params.core_groups) *
-                                       (core_group_idx + 1)) -
-                                          1};
-          CoreRange group_of_cores(start_core, end_core);
-
-          log_info(LogTest,
-                   "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
-                   core_group_idx, start_core.x, start_core.y, end_core.x,
-                   end_core.y);
-
-          for (int i = start_core.y; i <= end_core.y; i++) {
-            for (int j = start_core.x; j <= end_core.x; j++) {
-              CoreCoord core = {(std::size_t)j, (std::size_t)i};
-              uint32_t cb_index = 0;
-              uint32_t cb_tiles = 8;
-              tt_metal::CircularBufferConfig cb_config =
-                  tt_metal::CircularBufferConfig(
-                      cb_tiles * single_tile_size,
-                      {{cb_index, tt::DataFormat::Float16_b}})
-                      .set_page_size(cb_index, single_tile_size);
-              tt_metal::CreateCircularBuffer(program, core, cb_config);
-            }
+          std::vector<uint32_t> reader_runtime_args(params.num_rt_args);
+          std::vector<uint32_t> writer_runtime_args(params.num_rt_args);
+          for (uint32_t k = 0; k < params.num_rt_args; ++k) {
+            reader_runtime_args[k] = core_index + k;
+            writer_runtime_args[k] = core_index + k;
           }
 
-          std::vector<uint32_t> reader_compile_args = {
-              uint32_t(core_group_idx)};
-          auto reader_kernel = tt_metal::CreateKernel(
-              program,
-              "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-              "kernels/"
-              "empty_reader.cpp",
-              group_of_cores,
-              tt_metal::DataMovementConfig{
-                  .processor = tt_metal::DataMovementProcessor::RISCV_1,
-                  .noc = tt_metal::NOC::RISCV_1_default,
-                  .compile_args = reader_compile_args});
-
-          std::vector<uint32_t> writer_compile_args = {
-              uint32_t(core_group_idx)};
-          auto writer_kernel = tt_metal::CreateKernel(
-              program,
-              "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-              "kernels/"
-              "empty_writer.cpp",
-              group_of_cores,
-              tt_metal::DataMovementConfig{
-                  .processor = tt_metal::DataMovementProcessor::RISCV_0,
-                  .noc = tt_metal::NOC::RISCV_0_default,
-                  .compile_args = writer_compile_args});
-
-          std::vector<uint32_t> compute_compile_args = {
-              uint32_t(core_group_idx)};
-          tt_metal::CreateKernel(
-              program,
-              "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-              "kernels/"
-              "empty_compute.cpp",
-              group_of_cores,
-              tt_metal::ComputeConfig{.compile_args = compute_compile_args});
-
-          for (int i = start_core.y; i <= end_core.y; i++) {
-            for (int j = start_core.x; j <= end_core.x; j++) {
-              CoreCoord core = {(std::size_t)j, (std::size_t)i};
-              int core_index = (i * params.core_x) + j;
-
-              std::vector<uint32_t> reader_runtime_args(params.num_rt_args);
-              std::vector<uint32_t> writer_runtime_args(params.num_rt_args);
-              for (uint32_t k = 0; k < params.num_rt_args; ++k) {
-                reader_runtime_args[k] = core_index + k;
-                writer_runtime_args[k] = core_index + k;
-              }
-
-              SetRuntimeArgs(program, writer_kernel, core, writer_runtime_args);
-              SetRuntimeArgs(program, reader_kernel, core, reader_runtime_args);
-            }
-          }
+          SetRuntimeArgs(program, writer_kernel, core, writer_runtime_args);
+          SetRuntimeArgs(program, reader_kernel, core, reader_runtime_args);
         }
-
-        ////////////////////////////////////////////////////////////////////////////
-        //                      Execute Application
-        ////////////////////////////////////////////////////////////////////////////
-        auto mesh_workload = tt_metal::distributed::MeshWorkload();
-        mesh_workload.add_program(
-            tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
-            std::move(program));
-
-        // Explicitly compile the program to measure compile overhead WITH TRACY
-        // THIS IS NOT NEEDED
-        /*
-        auto t_compile_begin = std::chrono::steady_clock::now();
-        for (auto& [range, prog] : mesh_workload.get_programs()) {
-            tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
-        }
-        auto t_compile_end = std::chrono::steady_clock::now();
-        auto compile_time =
-        std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
-        t_compile_begin).count(); log_info(LogTest, "Time elapsed for
-        compilation: {}us", compile_time);
-        */
-        // Now we should have a cache hit
-        log_info(LogTest, "Num tests {}", params.num_iters);
-        for (uint32_t i = 0; i < params.num_iters; ++i) {
-          // auto t_begin = std::chrono::steady_clock::now();
-          ZoneScoped("Empty Kernel Launch Execution");
-          ZoneValue(i);
-          tt_metal::distributed::EnqueueMeshWorkload(
-              device->mesh_command_queue(), mesh_workload, false);
-          tt_metal::distributed::Finish(device->mesh_command_queue());
-
-          // auto t_end = std::chrono::steady_clock::now();
-          // elapsed_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t_end
-          // - t_begin).count()); log_info(LogTest, "Time elapsed for executing
-          // empty kernels: {}us", elapsed_us[i]);
-        }
-
-        // Calculate stats
-        // std::sort(elapsed_us.begin(), elapsed_us.end());
-
-        // Filter outliers if we have enough data (e.g. > 2 samples)
-        // std::vector<unsigned long> filtered_elapsed_us;
-        // if (elapsed_us.size() > 2) {
-        //     // Exclude min and max
-        //     filtered_elapsed_us.assign(elapsed_us.begin() + 1,
-        //     elapsed_us.end() - 1);
-        //} else {
-        //     filtered_elapsed_us = elapsed_us;
-        //}
-        //
-        // auto min_val = *std::min_element(filtered_elapsed_us.begin(),
-        // filtered_elapsed_us.end()); auto max_val =
-        // *std::max_element(filtered_elapsed_us.begin(),
-        // filtered_elapsed_us.end()); auto sum_val =
-        // std::accumulate(filtered_elapsed_us.begin(),
-        // filtered_elapsed_us.end(), 0.0); auto avg_val = sum_val /
-        // filtered_elapsed_us.size();
-        //
-        // double sum_sq_diff = 0.0;
-        // for (const auto& val : filtered_elapsed_us) {
-        //    double diff = val - avg_val;
-        //    sum_sq_diff += diff * diff;
-        //}
-        // auto std_dev = std::sqrt(sum_sq_diff / filtered_elapsed_us.size());
-        // log_info(LogTest, "Execution Stats (us) [Trimmed]: Min={}, Max={},
-        // Avg={:.2f}, StdDev={:.2f}", min_val, max_val, avg_val, std_dev);
-
-        //        pass &= device->close(); // THIS WAS THE ORIGINAL VERSION, NOW
-        //        WE CLOSE THE DEVICE IN MAIN
-      } catch (const std::exception &e) {
-        pass = false;
-        log_error(LogTest, "{}", e.what());
-        log_error(LogTest, "System error message: {}", std::strerror(errno));
-      }
-      return pass;
-    }
-
-    void pin_to_cpu(int cpu) {
-      cpu_set_t set;
-      CPU_ZERO(&set);
-      CPU_SET(cpu, &set);
-      if (sched_setaffinity(0, sizeof(set), &set) != 0) {
-        log_warning(tt::LogTest, "Failed to pin to CPU {}: {}", cpu,
-                    std::strerror(errno));
-      } else {
-        log_info(tt::LogTest, "Pinned to CPU {}", cpu);
       }
     }
 
-    //////////////////////////////////////////////////////////////////////////////////////////
-    // Main Benchmarking Test
-    //////////////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    //                      Execute Application
+    ////////////////////////////////////////////////////////////////////////////
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
 
-    int main(int argc, char **argv) {
-      // Disable Tracy to avoid interference with measurements
-      unsetenv("TT_METAL_DEVICE_PROFILER");
-      unsetenv("TRACY_ENABLE");
-
-      if (std::getenv("TT_METAL_SLOW_DISPATCH_MODE") != nullptr) {
-        log_error(tt::LogTest, "Test not supported w/ slow dispatch, exiting");
-      }
-
-      // Legacy Definition of max cores in each dimension for the architecture
-      // being tested Left to know the limits
-      /*
-          uint32_t max_x = 0;
-          uint32_t max_y = 0;
-          const char *arch_env = std::getenv("ARCH_NAME");
-          const std::string arch = arch_env ? arch_env : std::string();
-
-       if (arch == "grayskull") {
-              max_x = 11; max_y = 8;
-              log_info(tt::LogTest, "Configured core range for grayskull:
-       max_x={}, max_y={}", max_x, max_y); } else if (arch == "wormhole_b0") {
-              max_x = 7; max_y = 6;
-              log_info(tt::LogTest, "Configured core range for wormhole_b0:
-       max_x={}, max_y={}", max_x, max_y); } else if (arch == "blackhole") {
-              max_x = 12; max_y = 9;
-              log_info(tt::LogTest, "Configured core range for blackhole:
-       max_x={}, max_y={}", max_x, max_y); } else { log_error(tt::LogTest,
-       "Unknown or unset ARCH_NAME ('{}'). Set ARCH_NAME env var or pass
-       explicit --x_size/--y_size.", arch); throw std::runtime_error("Unknown
-       ARCH_NAME; please set ARCH_NAME environment variable");
-          }
-      */
-
-      // Create mesh device
-      int device_id = 0;
-      DeviceParams device_params;
-
-      device_params.device =
-          tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
-      device_params.grid_coord =
-          device_params.device->compute_with_storage_grid_size();
-
-      // Definition of max cores in each dimension for the architecture being
-      // tested
-      uint32_t max_x = device_params.grid_coord.x;
-      uint32_t max_y = device_params.grid_coord.y;
-
-      // Parse input arguments
-      std::vector<std::string> input_args(argv, argv + argc);
-      TestParams params = parse_input_arguments(input_args, device_params);
-
-      if (params.cpu_id != 0xFFFFFFFF) {
-        pin_to_cpu(params.cpu_id);
-      }
-
-      //// Print test summary
-      log_info(LogTest, "Full Characterization Benchmarking Test");
-      log_info(LogTest, "=======================================");
-      log_info(LogTest, "Selectec Test: {}",
-               static_cast<uint32_t>(params.test));
-      log_info(
-          LogTest,
-          "Starting with parameters: M={}, N={}, K={}, dtype={}, fidel={}, "
-          "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}",
-          params.M, params.N, params.K, params.dtype, params.fidel,
-          params.core_x, params.core_y, params.core_groups, params.num_iters,
-          params.clean_mode);
-
-      if (params.core_x > max_x || params.core_y > max_y) {
-        log_error(
-            tt::LogTest,
-            "Requested core size ({},{}) exceeds max for architecture ({},{})",
-            params.core_x, params.core_y, max_x, max_y);
-        return -1;
-      }
-
-      bool pass = false;
-      switch (params.test) {
-      case TestType::EmptyKernelLaunch:
-        pass = test_empty_kernel_launch(device_params.device.get(), params);
-        break;
-      case TestType::ComputeMM:
-        pass = test_compute_mm(device_params.device.get(), params);
-        break;
-      default:
-        log_error(tt::LogTest, "Invalid test type selected: {}",
-                  static_cast<uint32_t>(params.test));
-        return -1;
-      }
-
-      // We finalize the device
-      device_params.device->close();
-
-      return 0;
+    // Explicitly compile the program to measure compile overhead WITH TRACY
+    // THIS IS NOT NEEDED
+    /*
+    auto t_compile_begin = std::chrono::steady_clock::now();
+    for (auto& [range, prog] : mesh_workload.get_programs()) {
+        tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
     }
+    auto t_compile_end = std::chrono::steady_clock::now();
+    auto compile_time =
+    std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
+    t_compile_begin).count(); log_info(LogTest, "Time elapsed for
+    compilation: {}us", compile_time);
+    */
+    // Now we should have a cache hit
+    log_info(LogTest, "Num tests {}", params.num_iters);
+    for (uint32_t i = 0; i < params.num_iters; ++i) {
+      // auto t_begin = std::chrono::steady_clock::now();
+      ZoneScoped("Empty Kernel Launch Execution");
+      ZoneValue(i);
+      tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
+                                                 mesh_workload, false);
+      tt_metal::distributed::Finish(device->mesh_command_queue());
+
+      // auto t_end = std::chrono::steady_clock::now();
+      // elapsed_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t_end
+      // - t_begin).count()); log_info(LogTest, "Time elapsed for executing
+      // empty kernels: {}us", elapsed_us[i]);
+    }
+
+    // Calculate stats
+    // std::sort(elapsed_us.begin(), elapsed_us.end());
+
+    // Filter outliers if we have enough data (e.g. > 2 samples)
+    // std::vector<unsigned long> filtered_elapsed_us;
+    // if (elapsed_us.size() > 2) {
+    //     // Exclude min and max
+    //     filtered_elapsed_us.assign(elapsed_us.begin() + 1,
+    //     elapsed_us.end() - 1);
+    //} else {
+    //     filtered_elapsed_us = elapsed_us;
+    //}
+    //
+    // auto min_val = *std::min_element(filtered_elapsed_us.begin(),
+    // filtered_elapsed_us.end()); auto max_val =
+    // *std::max_element(filtered_elapsed_us.begin(),
+    // filtered_elapsed_us.end()); auto sum_val =
+    // std::accumulate(filtered_elapsed_us.begin(),
+    // filtered_elapsed_us.end(), 0.0); auto avg_val = sum_val /
+    // filtered_elapsed_us.size();
+    //
+    // double sum_sq_diff = 0.0;
+    // for (const auto& val : filtered_elapsed_us) {
+    //    double diff = val - avg_val;
+    //    sum_sq_diff += diff * diff;
+    //}
+    // auto std_dev = std::sqrt(sum_sq_diff / filtered_elapsed_us.size());
+    // log_info(LogTest, "Execution Stats (us) [Trimmed]: Min={}, Max={},
+    // Avg={:.2f}, StdDev={:.2f}", min_val, max_val, avg_val, std_dev);
+
+    //        pass &= device->close(); // THIS WAS THE ORIGINAL VERSION, NOW
+    //        WE CLOSE THE DEVICE IN MAIN
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+    log_error(LogTest, "System error message: {}", std::strerror(errno));
+  }
+  return pass;
+}
+
+void pin_to_cpu(int cpu) {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+    log_warning(tt::LogTest, "Failed to pin to CPU {}: {}", cpu,
+                std::strerror(errno));
+  } else {
+    log_info(tt::LogTest, "Pinned to CPU {}", cpu);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Main Benchmarking Test
+//////////////////////////////////////////////////////////////////////////////////////////
+
+int main(int argc, char **argv) {
+  // Disable Tracy to avoid interference with measurements
+  unsetenv("TT_METAL_DEVICE_PROFILER");
+  unsetenv("TRACY_ENABLE");
+
+  if (std::getenv("TT_METAL_SLOW_DISPATCH_MODE") != nullptr) {
+    log_error(tt::LogTest, "Test not supported w/ slow dispatch, exiting");
+  }
+
+  // Legacy Definition of max cores in each dimension for the architecture
+  // being tested Left to know the limits
+  /*
+      uint32_t max_x = 0;
+      uint32_t max_y = 0;
+      const char *arch_env = std::getenv("ARCH_NAME");
+      const std::string arch = arch_env ? arch_env : std::string();
+
+   if (arch == "grayskull") {
+          max_x = 11; max_y = 8;
+          log_info(tt::LogTest, "Configured core range for grayskull:
+   max_x={}, max_y={}", max_x, max_y); } else if (arch == "wormhole_b0") {
+          max_x = 7; max_y = 6;
+          log_info(tt::LogTest, "Configured core range for wormhole_b0:
+   max_x={}, max_y={}", max_x, max_y); } else if (arch == "blackhole") {
+          max_x = 12; max_y = 9;
+          log_info(tt::LogTest, "Configured core range for blackhole:
+   max_x={}, max_y={}", max_x, max_y); } else { log_error(tt::LogTest,
+   "Unknown or unset ARCH_NAME ('{}'). Set ARCH_NAME env var or pass
+   explicit --x_size/--y_size.", arch); throw std::runtime_error("Unknown
+   ARCH_NAME; please set ARCH_NAME environment variable");
+      }
+  */
+
+  // Create mesh device
+  int device_id = 0;
+  DeviceParams device_params;
+
+  device_params.device =
+      tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+  device_params.grid_coord =
+      device_params.device->compute_with_storage_grid_size();
+
+  // Definition of max cores in each dimension for the architecture being
+  // tested
+  uint32_t max_x = device_params.grid_coord.x;
+  uint32_t max_y = device_params.grid_coord.y;
+
+  // Parse input arguments
+  std::vector<std::string> input_args(argv, argv + argc);
+  TestParams params = parse_input_arguments(input_args, device_params);
+
+  if (params.cpu_id != 0xFFFFFFFF) {
+    pin_to_cpu(params.cpu_id);
+  }
+
+  //// Print test summary
+  log_info(LogTest, "Full Characterization Benchmarking Test");
+  log_info(LogTest, "=======================================");
+  log_info(LogTest, "Selectec Test: {}", static_cast<uint32_t>(params.test));
+  log_info(LogTest,
+           "Starting with parameters: M={}, N={}, K={}, dtype={}, fidel={}, "
+           "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}",
+           params.M, params.N, params.K, params.dtype, params.fidel,
+           params.core_x, params.core_y, params.core_groups, params.num_iters,
+           params.clean_mode);
+
+  if (params.core_x > max_x || params.core_y > max_y) {
+    log_error(
+        tt::LogTest,
+        "Requested core size ({},{}) exceeds max for architecture ({},{})",
+        params.core_x, params.core_y, max_x, max_y);
+    return -1;
+  }
+
+  bool pass = false;
+  switch (params.test) {
+  case TestType::EmptyKernelLaunch:
+    pass = test_empty_kernel_launch(device_params.device.get(), params);
+    break;
+  case TestType::ComputeMM:
+    pass = test_compute_mm(device_params.device.get(), params);
+    break;
+  case TestType::SubDeviceMM:
+    pass = test_sub_device_manager_mm(device_params.device.get(), params);
+    break;
+  default:
+    log_error(tt::LogTest, "Invalid test type selected: {}",
+              static_cast<uint32_t>(params.test));
+    return -1;
+  }
+
+  // We finalize the device
+  device_params.device->close();
+
+  return 0;
+}

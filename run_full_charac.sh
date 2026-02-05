@@ -4,11 +4,12 @@
 # List of valid test types:
 # 0: Empty Kernel Launch
 # 1: Compute MM
-# 2: Invalid Test
+# 2: SubDevice MM
+# 3: Invalid Test
 
 NUM_RT_ARGS=255
 CLEAN_MODE=0
-TEST_TYPE=2
+TEST_TYPE=3
 
 # Search for arguments to generate correct kernels
 args=("$@")
@@ -98,8 +99,8 @@ EOF
 
     echo "}" >> $KERNEL_DIR/empty_writer.cpp
 
-elif [[ "$TEST_TYPE" == "1" ]]; then
-    # Compute MM
+elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" ]]; then
+    # Compute MM (1) or SubDevice MM (2)
     # Compute MM
     echo "Preparing Compute MM kernels..."
     cp $KERNEL_COMMON_DIR/bmm_large_block_zm_fused_bias_activation.cpp $KERNEL_DIR/
@@ -111,9 +112,9 @@ fi
 
 # Execute the benchmark with all passed arguments
 # Usage example: ./run_full_charac.sh ./build/test/test_full_charac --num-rt-args 512 ...
-if [[ "$TEST_TYPE" != "2" ]]; then
+if [[ "$TEST_TYPE" != "3" ]]; then
 echo "Executing: $@"
 "$@"
 else
-    echo "Skipping execution for  for testing, invalid test type $TEST_TYPE"
+    echo "Skipping execution for invalid test type $TEST_TYPE"
 fi
