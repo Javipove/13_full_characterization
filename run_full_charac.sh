@@ -23,6 +23,9 @@ for ((i=0; i < ${#args[@]}; i++)); do
     if [[ "${args[i]}" == "--test" ]]; then
         TEST_TYPE="${args[i+1]}"
     fi
+    if [[ "${args[i]}" == "--core-groups" ]]; then
+        CORE_GROUPS="${args[i+1]}"
+    fi
 done
 
 if [[ "$CLEAN_MODE" == "1" ]]; then

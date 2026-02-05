@@ -384,7 +384,14 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
       return false;
     }
 
-    uint32_t num_sub_devices = 2;
+    uint32_t num_sub_devices = params.core_groups;
+    if (num_sub_devices < 2) {
+      log_info(
+          LogTest,
+          "Note: SubDevice test running with 1 Core Group (Single SubDevice)");
+      num_sub_devices = 1;
+    }
+
     uint32_t rows_per_sub_device = params.core_y / num_sub_devices;
 
     // 1. Get Common Params
@@ -410,9 +417,6 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
                            : (start_y + rows_per_sub_device - 1);
       CoreCoord split_grid_size = {(std::size_t)params.core_x,
                                    (std::size_t)(end_y - start_y + 1)};
-      CoreRange split_core_range(
-          {0, (std::size_t)start_y},
-          {(std::size_t)params.core_x - 1, (std::size_t)end_y});
 
       log_info(LogTest, "SubDevice {}: Rows {}-{} (M={})", i, start_y, end_y,
                M_split);

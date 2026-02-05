@@ -17,9 +17,35 @@ The benchmark supports the following test types, selected via the `--test` argum
     *   **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
 
 3.  **Sub-Device Parallelism (`--test 2`)**:
-    *   **Purpose**: Validates the ability to partition a device and run independent, parallel workloads (Test Phase 2).
-    *   **Mechanism**: Splits the grid into 2 "Sub-Devices" (Top half rows vs Bottom half rows) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
-    *   **Requirement**: Requires at least 2 rows of cores (`--y_size >= 2`).
+    *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
+    *   **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
+    *   **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
+        *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
+        *   Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
+
+### Partitioning Logic Examples
+The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core-groups`:
+
+**1. Perfect Split (2 Groups)**
+*   `--y_size 8 --core-groups 2`
+*   **Math**: `8 / 2 = 4` rows per group.
+*   **Result**:
+    *   **Group 0**: Rows 0-3 (8x4 grid, 32 cores)
+    *   **Group 1**: Rows 4-7 (8x4 grid, 32 cores)
+
+**2. Uneven Split (3 Groups)**
+*   `--y_size 8 --core-groups 3`
+*   **Math**: `8 / 3 = 2` rows per group (integer division). Remainder goes to the last group.
+*   **Result**:
+    *   **Group 0**: Rows 0-1 (8x2 grid, 16 cores)
+    *   **Group 1**: Rows 2-3 (8x2 grid, 16 cores)
+    *   **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *<-- Absorbs remainder*
+
+**3. Row-Level Turn (8 Groups)**
+*   `--y_size 8 --core-groups 8`
+*   **Math**: `8 / 8 = 1` row per group.
+*   **Result**:
+    *   **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
 
 ## Build and Run
 
@@ -37,6 +63,7 @@ Use the provided shell script `run_full_charac.sh` to compile and run the tests.
 | `--x_size <N>` | `0` (Max) | Number of columns in the core grid. |
 | `--y_size <N>` | `0` (Max) | Number of rows in the core grid. |
 | `--num-iters <N>` | `15` | Number of iterations to run the dispatch loop. |
+| `--core-groups <N>`| `2` | Number of sub-devices/splits for Test 2. |
 | `--clean-mode <0/1>`| `0` | If 1, cleans kernel cache before running. |
 
 ### Matrix Arguments (for ComputeMM and SubDeviceMM)
