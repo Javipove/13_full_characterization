@@ -37,6 +37,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -368,13 +369,14 @@ void create_program_compute_mm(
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
     uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y = 0);
 
-void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
-                               CoreCoord core_range, uint32_t Mt, uint32_t Nt,
-                               uint32_t Kt, uint32_t per_core_Mt,
-                               uint32_t per_core_Nt, uint32_t in0_block_w,
-                               uint32_t single_tile_size, uint32_t in0_addr,
-                               uint32_t in1_addr, uint32_t in2_cb_addr,
-                               uint32_t start_core_y = 0);
+std::tuple<std::vector<float>, std::vector<float>, std::vector<float>>
+prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
+                          CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+                          uint32_t Kt, uint32_t per_core_Mt,
+                          uint32_t per_core_Nt, uint32_t in0_block_w,
+                          uint32_t single_tile_size, uint32_t in0_addr,
+                          uint32_t in1_addr, uint32_t in2_cb_addr,
+                          uint32_t start_core_y = 0);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -470,10 +472,11 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
           program, start_y);
 
       // Prepare Inputs for this split
-      prepare_inputs_compute_mm(device, split_grid_size, Mt, Nt, Kt,
-                                per_core_Mt, per_core_Nt, in0_block_w,
-                                single_tile_size, in0_addr, in1_addr,
-                                in2_cb_addr, start_y);
+      // Prepare Inputs for this split
+      auto inputs_split = prepare_inputs_compute_mm(
+          device, split_grid_size, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+          in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+          start_y);
     }
 
     // 3. Profiling Loop (Standard Dispatch)
@@ -614,18 +617,81 @@ std::vector<T> get_col_slice(std::vector<T> data, int start_col_index,
   return result;
 }
 
+// Calculates the Pearson Correlation Coefficient (PCC) between two vectors.
+// Used to validate BFP8/FP16 outputs against FP32 golden reference.
+float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
+  if (x.size() != y.size()) {
+    return 0.0f;
+  }
+
+  double sum_x = 0.0, sum_y = 0.0;
+  double sum_xx = 0.0, sum_yy = 0.0;
+  double sum_xy = 0.0;
+
+  for (size_t i = 0; i < x.size(); ++i) {
+    sum_x += x[i];
+    sum_y += y[i];
+    sum_xx += x[i] * x[i];
+    sum_yy += y[i] * y[i];
+    sum_xy += x[i] * y[i];
+  }
+
+  size_t n = x.size();
+  double numerator = n * sum_xy - sum_x * sum_y;
+  double denominator = std::sqrt(n * sum_xx - sum_x * sum_x) *
+                       std::sqrt(n * sum_yy - sum_y * sum_y);
+
+  if (denominator == 0)
+    return 0.0f;
+  return static_cast<float>(numerator / denominator);
+}
+
+// Calculates Root Mean Square Error (RMSE)
+float get_rmse(const std::vector<float> &x, const std::vector<float> &y) {
+  if (x.size() != y.size()) {
+    return std::numeric_limits<float>::infinity();
+  }
+
+  double sum_sq_diff = 0.0;
+  for (size_t i = 0; i < x.size(); ++i) {
+    double diff = x[i] - y[i];
+    sum_sq_diff += diff * diff;
+  }
+  return static_cast<float>(std::sqrt(sum_sq_diff / x.size()));
+}
+
+// Reference Matrix Multiplication (row-major)
+// C = A * B. A is (M x K), B is (K x N), C is (M x N)
+std::vector<float> matmul_reference(const std::vector<float> &a,
+                                    const std::vector<float> &b, uint32_t M,
+                                    uint32_t N, uint32_t K) {
+  std::vector<float> c(M * N, 0.0f);
+  for (uint32_t i = 0; i < M; ++i) {
+    for (uint32_t k = 0; k < K; ++k) {
+      float val_a = a[i * K + k];
+      for (uint32_t j = 0; j < N; ++j) {
+        c[i * N + j] += val_a * b[k * N + j];
+      }
+    }
+  }
+  return c;
+}
+
 // MODIFIED: heavily instrumented with Tracy zones for Host-side benchmarking.
 // Based on `prepare_inputs` from 1_compute_mm/test_compute_mm.cpp
-void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
-                               CoreCoord core_range, uint32_t Mt, uint32_t Nt,
-                               uint32_t Kt, uint32_t per_core_Mt,
-                               uint32_t per_core_Nt, uint32_t in0_block_w,
-                               uint32_t single_tile_size, uint32_t in0_addr,
-                               uint32_t in1_addr, uint32_t in2_cb_addr,
-                               uint32_t start_core_y) {
+std::tuple<std::vector<float>, std::vector<float>, std::vector<float>>
+prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
+                          CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+                          uint32_t Kt, uint32_t per_core_Mt,
+                          uint32_t per_core_Nt, uint32_t in0_block_w,
+                          uint32_t single_tile_size, uint32_t in0_addr,
+                          uint32_t in1_addr, uint32_t in2_cb_addr,
+                          uint32_t start_core_y) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   auto in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
+  auto in1_vec = generate_fp32_random(
+      Nt * Kt * constants::TILE_HW); // Pre-generate full IN1
 
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
@@ -658,10 +724,31 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
     for (int c = 0; c < num_cores_x; c++) {
       int num_c = (c == num_cores_x - 1) ? (last_block_w) : (per_core_Nt);
 
-      // Generate and Tilize IN1 (On the fly for simplicity/randomness)
+      // Generate and Tilize IN1
+      // MODIFIED: Use pre-generated in1_vec instead of on-the-fly generation
       std::vector<uint32_t> in1;
       {
-        ZoneScopedN("Generate and Tilize IN1");
+        ZoneScopedN("Slicing and Tilizing IN1");
+        // Get col slice from full matrix IN1 (which is Kt x Nt)
+        // Wait, standard MM is (Mt x Kt) * (Kt x Nt) -> (Mt x Nt)
+        // generate_fp32_random generates linear buffer.
+        // We need to carefully map linear IN1 to tiles.
+        // For simplicity in validation, we can just use the same logic as
+        // before but store it in a full vector if we want exact match. OR:
+        // transform the previous on-the-fly logic to fill 'in1_vec'
+        // appropriately.
+
+        // Let's stick to the original "Identity-like" pattern for validation
+        // consistency but write it to a full host buffer so we can compute
+        // Golden later.
+
+        // Actually, the original code generated a standalone block per core.
+        // If we want to validate, we should construct the full IN1 matrix that
+        // *would* produce these blocks.
+
+        // Re-implementing original logic to populate `in1` and *also* update
+        // `in1_vec` or a shadow buffer for validation.
+
         std::vector<float> in1_block_slice(in0_block_w * num_c * 1024,
                                            (float)0);
         int num_ones = std::min(in0_block_w, static_cast<uint32_t>(num_c)) * 32;
@@ -669,18 +756,54 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
           in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
         }
 
+        // To construct the full golden IN1, we would need to map this block
+        // back to the global IN1 matrix. Since the original benchmark uses a
+        // randomized IN0 but a *fixed structural* IN1 (sparse identity blocks)
+        // to ensure output behaves a certain way (or just for speed), we should
+        // probably just return the *blocks* if we want to verify per-core or
+        // construct a full IN1.
+
+        // Simpler approach for now:
+        // 1. Generate local `in1_block_slice`.
+        // 2. Tilize and send to device. (As before)
+        // 3. *Save* this `in1_block_slice` into a global `in1_vec` at the
+        // correct offset
+        //    if we want global validation.
+
+        auto in1_block_tilized =
+            tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
+        in1 = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
+                                 /*row_major_input=*/true, /*is_exp_a=*/false);
+
+        // Slicing IN1: We need (Kt x Nt) matrix.
+        // The inner loop iterates `c` (cols of output / cols of IN1).
+        // `get_col_slice` from full IN1.
+        // We need block: rows [0, in0_block_w*32], cols [c_start, c_end].
+
+        // Using `get_row_slice(in1_vec, ...)`
+        // IN1 is Kt rows, Nt cols.
+        // Row start: 0. Row count: in0_block_w * 32.
+        // Col start: c * per_core_Nt * 32. Col count: num_c * 32.
+
+        std::vector<float> in1_pico =
+            get_row_slice(in1_vec, 0, in0_block_w * 32, Kt * 32, Nt * 32);
+        // Note: arguments are (data, start_row, num_rows, total_rows,
+        // total_cols)
+
+        std::vector<float> in1_block_slice =
+            get_col_slice(in1_pico, c * per_core_Nt * 32, num_c * 32,
+                          in0_block_w * 32, Nt * 32);
+
         auto in1_block_tilized =
             tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
         in1 = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
                                  /*row_major_input=*/true, /*is_exp_a=*/false);
       }
 
-      // Copy to L1
+      // ... Transfer ...
       {
         ZoneScopedN("Host->Device Transfer (L1 Write)");
         CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
-        // NOTE: We assume device 0 for now as per original code, but we should
-        // iterate if mesh
         auto *target_device = device->get_devices()[0];
         tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr, in0);
         tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr, in1);
@@ -689,6 +812,10 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
       }
     }
   }
+
+  // Return the full vectors so verification can simulate the exact same slicing
+  return {in0_vec, in1_vec,
+          std::vector<float>()}; // 3rd usually Golden, but we compute later
 }
 
 // Creates the device program for Matrix Multiplication.
@@ -949,9 +1076,12 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
     // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
     // This function has internal ZoneScoped measurements for Host Data Gen,
     // Tilize, Transfer
-    prepare_inputs_compute_mm(device, core_range, Mt, Nt, Kt, per_core_Mt,
-                              per_core_Nt, in0_block_w, single_tile_size,
-                              in0_addr, in1_addr, in2_cb_addr, 0);
+    // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
+    // This function has internal ZoneScoped measurements for Host Data Gen,
+    // Tilize, Transfer
+    auto inputs = prepare_inputs_compute_mm(
+        device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt, in0_block_w,
+        single_tile_size, in0_addr, in1_addr, in2_cb_addr, 0);
 
     // 6. Profiling loop
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
@@ -965,6 +1095,82 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
       tt_metal::distributed::Finish(device->mesh_command_queue());
+    }
+
+    if (!params.bypass_check) {
+      log_info(LogTest, "Validation Started...");
+      auto [in0_vec, in1_vec, unused_golden] = inputs;
+      (void)unused_golden; // Suppress unused variable warning
+      // Compute Golden
+      log_info(LogTest, "Computing Golden Reference (FP32)...");
+      auto golden_vec =
+          matmul_reference(in0_vec, in1_vec, params.M, params.N, params.K);
+
+      // Read Back Results
+      log_info(LogTest, "Reading Device Results...");
+      std::vector<float> device_vec(params.M * params.N, 0.0f);
+      auto *target_device =
+          device->get_devices()[0]; // Assume single device for now
+
+      // Read per-core partitions and stitch
+      // Implementation Note: Since output is tiled and partitioning is complex,
+      // we iterate cores and read their sub-blocks. Output is in `out_addr`.
+      // The kernel writes `per_core_Mt * per_core_Nt` tiles.
+
+      // Each core contributes a block of size (per_core_Mt*32) x
+      // (per_core_Nt*32) We need to unpack this block and place it into
+      // `device_vec`.
+
+      for (int y = 0; y < num_cores_y; y++) {
+        for (int x = 0; x < num_cores_x; x++) {
+          CoreCoord core = {(std::size_t)x, (std::size_t)y};
+          // Read from out_addr
+          // Size in bytes = tiles * tile_size
+          uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+          uint32_t read_size = core_n_tiles * single_tile_size;
+
+          std::vector<uint32_t> core_data_tiles;
+          tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
+                                             read_size, core_data_tiles);
+
+          // Unpack and Untilize
+          auto core_data_float = unpack_bfp8_tiles_into_float_vec(
+              core_data_tiles, /*row_major_output=*/true, /*is_exp_a=*/false);
+          auto core_data_untilized = untilize_swizzled(
+              core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+
+          // Copy into global device_vec
+          uint32_t global_r_start = y * per_core_Mt * 32;
+          uint32_t global_c_start = x * per_core_Nt * 32;
+          uint32_t r_len = per_core_Mt * 32;
+          uint32_t c_len = per_core_Nt * 32;
+
+          for (uint32_t r = 0; r < r_len; ++r) {
+            for (uint32_t c = 0; c < c_len; ++c) {
+              uint32_t global_idx =
+                  (global_r_start + r) * (params.N) + (global_c_start + c);
+              // Ensure bounds (handle edge cases if necessary)
+              if (global_idx < device_vec.size()) {
+                device_vec[global_idx] = core_data_untilized[r * c_len + c];
+              }
+            }
+          }
+        }
+      }
+
+      // Comparison
+      float pcc = get_pcc(golden_vec, device_vec);
+      float rmse = get_rmse(golden_vec, device_vec);
+
+      log_info(LogTest, "Validation Result: PCC = {:.4f}, RMSE = {:.4f}", pcc,
+               rmse);
+
+      if (pcc < 0.99f) {
+        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+        pass = false;
+      } else {
+        log_info(LogTest, "Validation PASSED");
+      }
     }
 
   } catch (const std::exception &e) {
