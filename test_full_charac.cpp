@@ -622,7 +622,7 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
                                uint32_t per_core_Nt, uint32_t in0_block_w,
                                uint32_t single_tile_size, uint32_t in0_addr,
                                uint32_t in1_addr, uint32_t in2_cb_addr,
-                               uint32_t start_core_y = 0) {
+                               uint32_t start_core_y) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   auto in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
