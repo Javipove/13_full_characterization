@@ -368,7 +368,7 @@ void create_program_compute_mm(
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
     uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y = 0);
 
-bool prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
+void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
                                CoreCoord core_range, uint32_t Mt, uint32_t Nt,
                                uint32_t Kt, uint32_t per_core_Mt,
                                uint32_t per_core_Nt, uint32_t in0_block_w,
@@ -518,7 +518,7 @@ std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch) {
 // 1_compute_mm/test_compute_mm.cpp
 std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
                                                        uint32_t per_core_Nt,
-                                                       uint32_t choice = 0) {
+                                                       uint32_t choice) {
   constexpr std::array<std::tuple<uint32_t, uint32_t>, 20> SUBBLOCK_HW_CHOICES =
       {{
           {4, 2}, {2, 4}, {8, 1}, {1, 8}, {7, 1}, {1, 7}, {3, 2},
