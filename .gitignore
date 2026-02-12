@@ -1,6 +1,5 @@
 # Porject specific folders
 kernels/
-kernels_common/
 
 # Generic build files
 build/
