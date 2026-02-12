@@ -368,6 +368,25 @@ void create_program_compute_mm(
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
     uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y = 0);
 
+bool prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
+                               CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+                               uint32_t Kt, uint32_t per_core_Mt,
+                               uint32_t per_core_Nt, uint32_t in0_block_w,
+                               uint32_t single_tile_size, uint32_t in0_addr,
+                               uint32_t in1_addr, uint32_t in2_cb_addr,
+                               uint32_t start_core_y = 0);
+
+std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
+
+std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
+                                                       uint32_t per_core_Nt,
+                                                       uint32_t choice = 0);
+
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
+get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
+                          uint32_t in0_block_w, uint32_t single_tile_size,
+                          uint32_t l1_unreserved_base);
+
 //! Phase 2: Sub-Device Parallelism Test
 //! Partitions the device into 2 Sub-Devices and runs independent MM workloads
 //! on each.
@@ -465,7 +484,7 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
 
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScoped("Sub-Device Parallel Dispatch");
+      ZoneScopedN("Sub-Device Parallel Dispatch");
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
       tt_metal::distributed::Finish(device->mesh_command_queue());
@@ -606,8 +625,8 @@ void prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
                                uint32_t start_core_y = 0) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
-  bool pass = true;
   auto in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
+
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
   uint32_t num_cores_y = core_range.y;
@@ -690,7 +709,6 @@ void create_program_compute_mm(
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
     uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y) {
 
   // Program is passed by reference, no need to create it.
@@ -725,19 +743,19 @@ void create_program_compute_mm(
   uint32_t in1_per_core_w = out_subblock_w * in1_num_subblocks;
   uint32_t out_subblock_num_tiles = out_subblock_h * out_subblock_w;
 
-  vector<uint32_t> compute_kernel_args = {in0_block_w,
-                                          in0_num_subblocks,
-                                          in0_block_num_tiles,
-                                          in0_subblock_num_tiles,
-                                          in1_num_subblocks,
-                                          in1_block_num_tiles,
-                                          in1_per_core_w,
-                                          num_blocks,
-                                          out_subblock_h,
-                                          out_subblock_w,
-                                          out_subblock_num_tiles,
-                                          1,
-                                          per_core_Mt * per_core_Nt};
+  std::vector<uint32_t> compute_kernel_args = {in0_block_w,
+                                               in0_num_subblocks,
+                                               in0_block_num_tiles,
+                                               in0_subblock_num_tiles,
+                                               in1_num_subblocks,
+                                               in1_block_num_tiles,
+                                               in1_per_core_w,
+                                               num_blocks,
+                                               out_subblock_h,
+                                               out_subblock_w,
+                                               out_subblock_num_tiles,
+                                               1,
+                                               per_core_Mt * per_core_Nt};
 
   CoreRange all_cores({(std::size_t)0, (std::size_t)start_core_y},
                       {(std::size_t)core_range.x - 1,
@@ -814,8 +832,8 @@ void create_program_compute_mm(
   // large matrix to process.
   uint32_t last_block_h =
       Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
-  uint32_t last_block_w =
-      Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+  // uint32_t last_block_w =
+  //    Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
 
   for (int y = 0; y < core_range.y; y++) {
     for (int x = 0; x < core_range.x; x++) {
@@ -943,7 +961,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScoped("Dispatch Overhead"); // Measuring Dispatch Latency
+      ZoneScopedN("Dispatch Overhead"); // Measuring Dispatch Latency
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
       tt_metal::distributed::Finish(device->mesh_command_queue());
@@ -1076,7 +1094,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       // auto t_begin = std::chrono::steady_clock::now();
-      ZoneScoped("Empty Kernel Launch Execution");
+      ZoneScopedN("Empty Kernel Launch Execution");
       ZoneValue(i);
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
