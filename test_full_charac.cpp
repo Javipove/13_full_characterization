@@ -472,7 +472,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base, bool use_dram = false);
+                          uint32_t l1_unreserved_base, bool use_dram);
 
 //! Phase 2: Sub-Device Parallelism Test
 //! Partitions the device into 2 Sub-Devices and runs independent MM workloads
@@ -640,7 +640,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base, bool use_dram = false) {
+                          uint32_t l1_unreserved_base, bool use_dram) {
   uint32_t num_buffer = 2; // double buffering
   uint32_t in0_cb_addr = l1_unreserved_base;
   uint32_t in0_cb_size =
