@@ -147,6 +147,7 @@ struct TestParams {
   uint32_t K;
   uint32_t dtype; // 0: BFP8, 1: FP16
   uint32_t fidel; // 0: low, 1: high
+  bool use_dram;  // Enable DRAM input buffers
   uint32_t core_x;
   uint32_t core_y;
   uint32_t core_groups;
@@ -173,6 +174,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   uint32_t fidel; // 0: low, 1: high
   uint32_t core_x, core_y, core_groups;
   uint32_t num_iters;
+  bool use_dram;
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t cpu_id;
@@ -196,6 +198,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(fidel, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--fidel", 0);
+    std::tie(use_dram, input_args) =
+        test_args::has_command_option_and_remaining_args(input_args, "--dram",
+                                                         false);
 
     // Core grid size args
     std::tie(core_x, input_args) =
@@ -262,6 +267,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .K = K,
                     .dtype = dtype,
                     .fidel = fidel,
+                    .use_dram = use_dram,
                     .core_x = core_x,
                     .core_y = core_y,
                     .core_groups = core_groups,
@@ -358,7 +364,73 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
   return in0_block_w;
 }
 
-// 1-to-1 match with usage in 1_compute_mm/test_compute_mm.cpp
+////////////////////////////////////////////////////////////////////////////////
+// Helper Struct for Benchmark I/O
+//
+// This struct bundles all data returned by prepare_inputs_compute_mm().
+// It stores the original FP32 input vectors (needed by the host-side golden
+// reference validation) and, when DRAM mode is active, shared pointers to
+// the device-side DRAM interleaved buffers.
+//
+// WHY?
+//   - L1 mode:  Data is written directly to each core's L1 SRAM using
+//               WriteToDeviceL1(). The kernel reads from a fixed local
+//               address. No Buffer objects are needed.
+//   - DRAM mode: Data is stored in device DRAM using tt_metal::CreateBuffer()
+//                with InterleavedBufferConfig. Tiles are distributed across
+//                DRAM banks in round-robin order (page 0 → bank 0,
+//                page 1 → bank 1, ...). The kernel uses
+//                InterleavedAddrGenFast<true> to compute NoC addresses at
+//                runtime given the buffer's base address and page size.
+//                We need the Buffer objects here so we can:
+//                  1. Extract buffer->address() for runtime args (see
+//                     test_compute_mm)
+//                  2. Call ReadFromBuffer() for host-side verification
+//                  3. Keep the buffers alive (shared_ptr prevents dealloc)
+////////////////////////////////////////////////////////////////////////////////
+struct BenchmarkInputs {
+  // Original FP32 input matrices — kept for golden-reference comparison.
+  // in0_vec: Matrix A, row-major, size = Mt*32 * Kt*32
+  // in1_vec: Matrix B, row-major, size = Kt*32 * Nt*32
+  std::vector<float> in0_vec;
+  std::vector<float> in1_vec;
+
+  // Device-side DRAM interleaved buffers.
+  // These are nullptr when use_dram=false (L1 mode).
+  // When use_dram=true, each buffer holds tilized+packed data distributed
+  // across all DRAM banks via InterleavedBufferConfig{BufferType::DRAM}.
+  std::shared_ptr<tt_metal::Buffer> in0_buffer; // IN0 (A matrix) in DRAM
+  std::shared_ptr<tt_metal::Buffer> in1_buffer; // IN1 (B matrix) in DRAM
+  std::shared_ptr<tt_metal::Buffer> out_buffer; // Output (C matrix) in DRAM
+};
+
+// ============================================================================
+// Forward Declarations
+// ============================================================================
+
+// Creates the device program (circular buffers, kernels, runtime args) for
+// matrix multiplication C = A * B.  When use_dram=true, DRAM-specific kernels
+// are compiled and runtime args use global matrix strides (Kt, Nt).
+// When use_dram=false, the original L1 kernels from 1_compute_mm are used.
+//
+// Parameters:
+//   device           - mesh device handle
+//   cb_data_format   - tile data format (Bfp8_b or Float16_b)
+//   math_fidelity    - compute fidelity (LoFi / HiFi)
+//   fp32_dest_acc_en - enable FP32 accumulation in DST registers
+//   single_tile_size - size in bytes of one tile (depends on data format)
+//   core_range       - (num_cores_x, num_cores_y) grid dimensions
+//   Mt, Nt, Kt       - matrix dims in tiles (M/32, N/32, K/32)
+//   in0_block_w      - block width along K dimension (tiles per block)
+//   out_subblock_h/w - subblock dims for register accumulation
+//   per_core_Mt/Nt   - tiles per core in M and N dimensions
+//   in0/1/2_cb_addr  - L1 circular buffer base addresses
+//   out_cb_addr      - L1 output circular buffer base address
+//   in0/1_addr       - L1 or DRAM base address for IN0/IN1 data
+//   out_addr         - L1 or DRAM base address for output data
+//   use_dram         - if true, select DRAM kernels and global strides
+//   program          - reference to the Program object (kernels appended)
+//   start_core_y     - first Y-coordinate (for sub-device splits)
 void create_program_compute_mm(
     tt_metal::distributed::MeshDevice *device, tt::DataFormat cb_data_format,
     MathFidelity math_fidelity, bool fp32_dest_acc_en,
@@ -367,16 +439,24 @@ void create_program_compute_mm(
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y = 0);
+    uint32_t out_addr, bool use_dram, tt_metal::Program &program,
+    uint32_t start_core_y = 0);
 
-std::tuple<std::vector<float>, std::vector<float>, std::vector<float>>
-prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
-                          CoreCoord core_range, uint32_t Mt, uint32_t Nt,
-                          uint32_t Kt, uint32_t per_core_Mt,
-                          uint32_t per_core_Nt, uint32_t in0_block_w,
-                          uint32_t single_tile_size, uint32_t in0_addr,
-                          uint32_t in1_addr, uint32_t in2_cb_addr,
-                          uint32_t start_core_y = 0);
+// Generates random FP32 input matrices, tilizes/packs them, and transfers
+// them to the device. Returns a BenchmarkInputs struct.
+//
+// L1 mode:  Slices the matrix per-core, tilizes each slice, and writes
+//           to each core's L1 at in0_addr / in1_addr.
+// DRAM mode: Tilizes the FULL matrix, packs into BFP8, creates DRAM
+//            interleaved buffers (one contiguous buffer per matrix),
+//            and writes via WriteToBuffer(). The output DRAM buffer is
+//            also created (empty) to receive kernel results.
+BenchmarkInputs prepare_inputs_compute_mm(
+    tt_metal::distributed::MeshDevice *device, CoreCoord core_range,
+    uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
+    uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
+    uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
+    uint32_t start_core_y = 0);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -469,14 +549,14 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
           single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
           out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, in0_cb_addr,
           in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr, in1_addr, out_addr,
-          program, start_y);
+          /*use_dram=*/false, program, start_y);
 
       // Prepare Inputs for this split
       // Prepare Inputs for this split
       auto inputs_split = prepare_inputs_compute_mm(
           device, split_grid_size, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
           in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          start_y);
+          /*use_dram=*/false, start_y);
     }
 
     // 3. Profiling Loop (Standard Dispatch)
@@ -677,157 +757,290 @@ std::vector<float> matmul_reference(const std::vector<float> &a,
   return c;
 }
 
-// MODIFIED: heavily instrumented with Tracy zones for Host-side benchmarking.
-// Based on `prepare_inputs` from 1_compute_mm/test_compute_mm.cpp
-std::tuple<std::vector<float>, std::vector<float>, std::vector<float>>
-prepare_inputs_compute_mm(tt_metal::distributed::MeshDevice *device,
-                          CoreCoord core_range, uint32_t Mt, uint32_t Nt,
-                          uint32_t Kt, uint32_t per_core_Mt,
-                          uint32_t per_core_Nt, uint32_t in0_block_w,
-                          uint32_t single_tile_size, uint32_t in0_addr,
-                          uint32_t in1_addr, uint32_t in2_cb_addr,
-                          uint32_t start_core_y) {
+////////////////////////////////////////////////////////////////////////////////
+// prepare_inputs_compute_mm
+//
+// Generates random FP32 input matrices A (MxK) and B (KxN), converts them to
+// tilized BFP8 format, and transfers them to the device. The function handles
+// two distinct data paths:
+//
+// L1 MODE (use_dram=false):
+//   For each core (y,x), the function:
+//     1. Slices out the core's row-block from IN0 (get_row_slice →
+//     get_col_slice)
+//     2. Tilizes the slice (32x32 tile groups) and packs to BFP8
+//     3. Writes the tile block to the core's L1 at `in0_addr`
+//     4. Generates an identity-like IN1 block for that core and writes to
+//     `in1_addr`
+//     5. Writes a zeros tile to `in2_cb_addr` (used as bias/padding by compute
+//     kernel)
+//   This is the original approach from 1_compute_mm/test_compute_mm.cpp.
+//   The kernels read from local L1 addresses using noc_async_read() with the
+//   core's own NOC coordinates (phy_core.x, phy_core.y).
+//
+// DRAM MODE (use_dram=true):
+//   Instead of splitting per-core, the ENTIRE matrix is tilized at once:
+//     1. Tilizes the full IN0 (Mt*32 × Kt*32) and packs to BFP8
+//     2. Creates a DRAM interleaved buffer via
+//     CreateBuffer(InterleavedBufferConfig)
+//        - Tiles are distributed round-robin across DRAM banks (page 0 → bank
+//        0,
+//          page 1 → bank 1, ..., page N → bank 0, etc.)
+//        - The hardware has multiple DRAM channels; interleaving maximizes
+//        bandwidth
+//     3. Writes the packed tile data to the buffer via WriteToBuffer()
+//     4. Repeats for IN1 (Kt*32 × Nt*32) and creates an empty output buffer
+//     (Mt*Nt tiles)
+//     5. Still writes zeros to each core's L1 at in2_cb_addr (bias/padding)
+//   The DRAM kernels use InterleavedAddrGenFast<true> to compute NOC addresses
+//   from a tile ID, translating it to the correct DRAM bank and offset.
+//
+// TRACY ZONES:
+//   Each major phase is wrapped in ZoneScopedN for profiling host-side
+//   bottlenecks (data gen, tilization, transfer).
+//
+// MODIFIED: Added DRAM branch and Tracy instrumentation (original from
+// 1_compute_mm).
+////////////////////////////////////////////////////////////////////////////////
+BenchmarkInputs prepare_inputs_compute_mm(
+    tt_metal::distributed::MeshDevice *device, CoreCoord core_range,
+    uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
+    uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
+    uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
+    uint32_t start_core_y) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
-  auto in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
-  auto in1_vec = generate_fp32_random(
-      Nt * Kt * constants::TILE_HW); // Pre-generate full IN1
+  BenchmarkInputs inputs;
 
+  // Generate random FP32 matrices. These are kept in the BenchmarkInputs struct
+  // for later host-side golden-reference validation (matmul_reference).
+  // TILE_HW = 32*32 = 1024 elements per tile.
+  inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
+  inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW);
+
+  // Zeros buffer for the "in2" circular buffer (CB index 2).
+  // This is written to every core's L1 regardless of L1/DRAM mode.
+  // The compute kernel reads from CB2 for bias/padding initialization;
+  // we fill it with zeros since we don't use bias in this benchmark.
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
+  auto *target_device = device->get_devices()[0];
 
-  uint32_t num_cores_y = core_range.y;
-  uint32_t num_cores_x = core_range.x;
+  if (use_dram) {
+    ZoneScopedN("Prepare DRAM Inputs");
 
-  uint32_t last_block_h =
-      Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
-  uint32_t last_block_w =
-      Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
-
-  for (int r = 0; r < num_cores_y; r++) {
-    int num_r = (r == num_cores_y - 1) ? (last_block_h) : (per_core_Mt);
-
-    // Slice and Tilize IN0
-    std::vector<uint32_t> in0;
+    // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) ----
+    // tilize_swizzled() converts from row-major to the hardware tile layout
+    // (32x32 element groups in Z-order). pack_as_bfp8_tiles() then quantizes
+    // the FP32 data into BFP8_b format (block floating point, 8-bit mantissa).
+    // We tilize the ENTIRE matrix at once (Mt*32 × Kt*32), unlike L1 mode
+    // which slices per-core.
     {
-      ZoneScopedN("Slicing and Tilizing IN0");
-      std::vector<float> in0_slice = get_row_slice(
-          in0_vec, r * per_core_Mt * 32, num_r * 32, Mt * 32, Kt * 32);
-      // only use the first block of in0_slice
-      auto in0_block_slice =
-          get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-      auto in0_block_tilized =
-          tilize_swizzled(in0_block_slice, num_r * 32, in0_block_w * 32);
-      in0 = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_block_tilized),
-                               /*row_major_input=*/true, /*is_exp_a=*/false);
+      ZoneScopedN("Tilize and Pack IN0 (DRAM)");
+      auto in0_tilized = tilize_swizzled(inputs.in0_vec, Mt * 32, Kt * 32);
+      auto in0_packed =
+          pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
+                             /*row_major_input=*/true, /*is_exp_a=*/false);
+
+      // Create a DRAM interleaved buffer to hold Mt*Kt tiles.
+      // InterleavedBufferConfig tells the allocator to distribute tiles
+      // across DRAM banks in round-robin order. Each "page" = one tile.
+      // The buffer's base address (buffer->address()) will be passed to the
+      // kernel as a runtime argument for InterleavedAddrGenFast<true>.
+      uint32_t in0_num_tiles = Mt * Kt;
+      uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
+      inputs.in0_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = target_device,
+              .size = in0_size_bytes,
+              .page_size = single_tile_size, // one tile per page
+              .buffer_type = tt_metal::BufferType::DRAM});
+
+      // WriteToBuffer writes the packed data to the interleaved buffer.
+      // Internally, this writes each page (tile) to the correct DRAM bank
+      // based on the round-robin interleaving scheme.
+      tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
     }
 
-    for (int c = 0; c < num_cores_x; c++) {
-      int num_c = (c == num_cores_x - 1) ? (last_block_w) : (per_core_Nt);
+    // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) ----
+    // Same flow as IN0: tilize → pack BFP8 → create DRAM buffer → write.
+    // IN1 has dimensions Kt*32 (rows) × Nt*32 (cols), totaling Kt*Nt tiles.
+    {
+      ZoneScopedN("Tilize and Pack IN1 (DRAM)");
+      auto in1_tilized = tilize_swizzled(inputs.in1_vec, Kt * 32, Nt * 32);
+      auto in1_packed =
+          pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
+                             /*row_major_input=*/true, /*is_exp_a=*/false);
 
-      // Generate and Tilize IN1
-      // MODIFIED: Use pre-generated in1_vec instead of on-the-fly generation
-      std::vector<uint32_t> in1;
-      {
-        ZoneScopedN("Slicing and Tilizing IN1");
-        // Get col slice from full matrix IN1 (which is Kt x Nt)
-        // Wait, standard MM is (Mt x Kt) * (Kt x Nt) -> (Mt x Nt)
-        // generate_fp32_random generates linear buffer.
-        // We need to carefully map linear IN1 to tiles.
-        // For simplicity in validation, we can just use the same logic as
-        // before but store it in a full vector if we want exact match. OR:
-        // transform the previous on-the-fly logic to fill 'in1_vec'
-        // appropriately.
+      uint32_t in1_num_tiles = Kt * Nt;
+      uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+      inputs.in1_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = target_device,
+              .size = in1_size_bytes,
+              .page_size = single_tile_size, // one tile per page
+              .buffer_type = tt_metal::BufferType::DRAM});
+      tt_metal::detail::WriteToBuffer(inputs.in1_buffer, in1_packed);
+    }
 
-        // Let's stick to the original "Identity-like" pattern for validation
-        // consistency but write it to a full host buffer so we can compute
-        // Golden later.
+    // ---- DRAM Step 3: Create empty output buffer ----
+    // The output buffer holds the result C = A*B. Total tiles = Mt * Nt.
+    // The kernel will write to this buffer using InterleavedAddrGenFast<true>
+    // and noc_async_write_tile().
+    {
+      uint32_t out_num_tiles = Mt * Nt;
+      uint32_t out_size_bytes = out_num_tiles * single_tile_size;
+      inputs.out_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = target_device,
+              .size = out_size_bytes,
+              .page_size = single_tile_size,
+              .buffer_type = tt_metal::BufferType::DRAM});
+    }
 
-        // Actually, the original code generated a standalone block per core.
-        // If we want to validate, we should construct the full IN1 matrix that
-        // *would* produce these blocks.
-
-        // Re-implementing original logic to populate `in1` and *also* update
-        // `in1_vec` or a shadow buffer for validation.
-
-        std::vector<float> in1_block_slice(in0_block_w * num_c * 1024,
-                                           (float)0);
-        int num_ones = std::min(in0_block_w, static_cast<uint32_t>(num_c)) * 32;
-        for (int i = 0; i < num_ones; i++) {
-          in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
-        }
-
-        // To construct the full golden IN1, we would need to map this block
-        // back to the global IN1 matrix. Since the original benchmark uses a
-        // randomized IN0 but a *fixed structural* IN1 (sparse identity blocks)
-        // to ensure output behaves a certain way (or just for speed), we should
-        // probably just return the *blocks* if we want to verify per-core or
-        // construct a full IN1.
-
-        // Simpler approach for now:
-        // 1. Generate local `in1_block_slice`.
-        // 2. Tilize and send to device. (As before)
-        // 3. *Save* this `in1_block_slice` into a global `in1_vec` at the
-        // correct offset
-        //    if we want global validation.
-
-        auto in1_block_tilized =
-            tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
-        in1 = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
-                                 /*row_major_input=*/true, /*is_exp_a=*/false);
-
-        // Slicing IN1: We need (Kt x Nt) matrix.
-        // The inner loop iterates `c` (cols of output / cols of IN1).
-        // `get_col_slice` from full IN1.
-        // We need block: rows [0, in0_block_w*32], cols [c_start, c_end].
-
-        // Using `get_row_slice(in1_vec, ...)`
-        // IN1 is Kt rows, Nt cols.
-        // Row start: 0. Row count: in0_block_w * 32.
-        // Col start: c * per_core_Nt * 32. Col count: num_c * 32.
-
-        std::vector<float> in1_pico =
-            get_row_slice(in1_vec, 0, in0_block_w * 32, Kt * 32, Nt * 32);
-        // Note: arguments are (data, start_row, num_rows, total_rows,
-        // total_cols)
-
-        std::vector<float> in1_block_slice =
-            get_col_slice(in1_pico, c * per_core_Nt * 32, num_c * 32,
-                          in0_block_w * 32, Nt * 32);
-
-        auto in1_block_tilized =
-            tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
-        in1 = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
-                                 /*row_major_input=*/true, /*is_exp_a=*/false);
-      }
-
-      // ... Transfer ...
-      {
-        ZoneScopedN("Host->Device Transfer (L1 Write)");
+    // ---- DRAM Step 4: Write zeros to each core's L1 at in2_cb_addr ----
+    // Even in DRAM mode, the compute kernel still needs the bias/padding tile
+    // to be present in L1. We write zeros since we don't use bias.
+    for (int r = 0; r < (int)core_range.y; r++) {
+      for (int c = 0; c < (int)core_range.x; c++) {
         CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
-        auto *target_device = device->get_devices()[0];
-        tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr, in0);
-        tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr, in1);
         tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
                                           in2);
       }
     }
+
+  } else {
+    // ===========================================================================
+    // L1 MODE (Original Logic from 1_compute_mm/test_compute_mm.cpp)
+    // ===========================================================================
+    // In L1 mode, each core holds its own slice of IN0 and IN1 locally in L1.
+    // The host slices and tilizes per-core, then writes to each core's L1.
+    // The kernels read from a fixed local L1 address using the core's own
+    // NOC coordinates (phy_core.x, phy_core.y) — no DRAM access needed.
+    //
+    // Edge-case handling:
+    //   - last_block_h: the last row of cores may have fewer tile-rows
+    //   - last_block_w: the last column of cores may have fewer tile-columns
+    uint32_t num_cores_y = core_range.y;
+    uint32_t num_cores_x = core_range.x;
+
+    uint32_t last_block_h =
+        Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
+    uint32_t last_block_w =
+        Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+
+    for (int r = 0; r < (int)num_cores_y; r++) {
+      // Determine actual tile-height for this core row (edge cores may be
+      // smaller)
+      int num_r = (r == (int)num_cores_y - 1) ? (last_block_h) : (per_core_Mt);
+
+      // Slice and Tilize IN0 for this core row.
+      // get_row_slice: extracts rows [r*per_core_Mt*32 .. r*per_core_Mt*32 +
+      // num_r*32) get_col_slice: extracts the first in0_block_w*32 columns
+      // (K-dim block) tilize_swizzled: converts from row-major to tile layout
+      // pack_as_bfp8_tiles: quantizes FP32 → BFP8_b format
+      std::vector<uint32_t> in0;
+      {
+        ZoneScopedN("Slicing and Tilizing IN0");
+        std::vector<float> in0_slice = get_row_slice(
+            inputs.in0_vec, r * per_core_Mt * 32, num_r * 32, Mt * 32, Kt * 32);
+        auto in0_block_slice =
+            get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
+        auto in0_block_tilized =
+            tilize_swizzled(in0_block_slice, num_r * 32, in0_block_w * 32);
+        in0 = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_block_tilized),
+                                 /*row_major_input=*/true, /*is_exp_a=*/false);
+      }
+
+      for (int c = 0; c < (int)num_cores_x; c++) {
+        // Determine actual tile-width for this core column
+        int num_c =
+            (c == (int)num_cores_x - 1) ? (last_block_w) : (per_core_Nt);
+
+        // Generate an identity-like IN1 block for this (row, col) core.
+        // In L1 mode with IN1_IS_IDENTITY define, the kernel reuses the same
+        // IN1 block across all K-blocks. This block has 1.0 on the diagonal
+        // so that A * I = A (passthrough for validation). It's not a real
+        // full matrix multiply — use DRAM mode for realistic workloads.
+        std::vector<uint32_t> in1;
+        {
+          ZoneScopedN("Generating and Tilizing IN1");
+          std::vector<float> in1_block_slice(in0_block_w * num_c * 1024,
+                                             (float)0);
+          int num_ones =
+              std::min(in0_block_w, static_cast<uint32_t>(num_c)) * 32;
+          for (int i = 0; i < num_ones; i++) {
+            in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
+          }
+
+          auto in1_block_tilized =
+              tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
+          in1 =
+              pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
+                                 /*row_major_input=*/true, /*is_exp_a=*/false);
+        }
+
+        // Transfer tile blocks to this core's L1 SRAM.
+        // WriteToDeviceL1 writes directly to a specific address in the target
+        // core's L1 memory. The kernel reads from these addresses using local
+        // NOC self-read (noc_async_read with phy_core coordinates).
+        {
+          ZoneScopedN("Host->Device Transfer (L1 Write)");
+          CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr, in0);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr, in1);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
+                                            in2);
+        }
+      }
+    }
   }
 
-  // Return the full vectors so verification can simulate the exact same slicing
-  return {in0_vec, in1_vec,
-          std::vector<float>()}; // 3rd usually Golden, but we compute later
+  return inputs;
 }
 
-// Creates the device program for Matrix Multiplication.
-// This function defines the compute graph:
-// 1. Allocates Circular Buffers (L1 memory for data flow).
-// 2. Creates Data Movement Kernels (Reader/Writer) and Compute Kernels.
-// 3. Sets Runtime Arguments for each core (telling them which part of the
-// matrix to process). MODIFIED: Simplified version of `create_program` from
-// 1_compute_mm/test_compute_mm.cpp. Hardcoded to Multi-Core Tile Layout (no
-// single core branching), removed deprecated packing args.
-
-// 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
+////////////////////////////////////////////////////////////////////////////////
+// create_program_compute_mm
+//
+// Creates the full device program for blocked matrix multiplication C = A * B.
+// This function defines the entire compute graph that runs on the Tensix cores:
+//
+//   1. Circular Buffers (L1 scratch memory for data flow between kernels)
+//   2. Data Movement Kernels (Reader for IN0/IN1, Writer for output)
+//   3. Compute Kernel (FPU matrix multiply on blocks/subblocks)
+//   4. Runtime Arguments (per-core addresses, strides, block sizes)
+//
+// The program is appended to the `program` reference; this allows
+// test_sub_device_manager_mm to add multiple independent MM programs
+// (one per sub-device split) into a single Program object.
+//
+// L1 vs DRAM KERNEL SELECTION:
+//   When use_dram=false:
+//     - Reader: in0_reader_bmm_tile_layout.cpp (reads from local L1)
+//     - Writer: in1_reader_writer_bmm_tile_layout.cpp (reads IN1 from L1,
+//               writes output to L1; IN1_IS_IDENTITY define = reuse same block)
+//     - Strides are local (in0_block_w, per_core_Nt) — within the core's buffer
+//
+//   When use_dram=true:
+//     - Reader: in0_reader_bmm_tile_layout_dram.cpp (reads from DRAM
+//     interleaved)
+//     - Writer: in1_reader_writer_bmm_tile_layout_dram.cpp (reads IN1 from
+//     DRAM,
+//               writes output to DRAM; no IN1_IS_IDENTITY — real data)
+//     - Strides are GLOBAL (Kt for IN0 row stride, Nt for IN1 row stride)
+//       because tiles are laid out across the full matrix in DRAM.
+//     - Start tile IDs are computed per-core: core(y,x) starts at
+//       in0: y * per_core_Mt * Kt    (global row offset in tile IDs)
+//       in1: x * per_core_Nt          (global column offset)
+//       out: y * per_core_Mt * Nt + x * per_core_Nt
+//
+// NOC ASSIGNMENT:
+//   Reader kernel runs on RISCV_1 / NOC_0 (reads IN0 into CB0)
+//   Writer kernel runs on RISCV_0 / NOC_1 (reads IN1 into CB1, writes from
+//   CB16) Compute kernel runs on the FPU (Tensix math engine)
+//
+// 1-to-1 match with 1_compute_mm/test_compute_mm.cpp (L1 path).
+// MODIFIED: Added DRAM kernel selection and DRAM runtime argument computation.
+////////////////////////////////////////////////////////////////////////////////
 void create_program_compute_mm(
     tt_metal::distributed::MeshDevice *device, tt::DataFormat cb_data_format,
     MathFidelity math_fidelity, bool fp32_dest_acc_en,
@@ -836,15 +1049,13 @@ void create_program_compute_mm(
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
     uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_addr, tt_metal::Program &program, uint32_t start_core_y) {
+    uint32_t out_addr, bool use_dram, tt_metal::Program &program,
+    uint32_t start_core_y) {
 
-  // Program is passed by reference, no need to create it.
-  // tt_metal::Program program{};
-
-  // 1. Define buffer sizes in "tiles" (32x32 elements)
-  // Double buffering (num_buffer = 2) allows the reader/writer to work on
-  // one buffer while the compute engine works on the other, hiding data
-  // movement latency.
+  // ---- Step 1: Define buffer sizes in tiles ----
+  // Double buffering (num_buffer=2) allows the reader/writer to fill one
+  // buffer while the compute engine processes the other, hiding data
+  // movement latency behind compute.
   uint32_t num_buffer = 2;
   uint32_t in0_block_tiles = per_core_Mt * in0_block_w;
   uint32_t in0_CB_tiles = in0_block_tiles * num_buffer;
@@ -854,11 +1065,17 @@ void create_program_compute_mm(
   uint32_t out_CB_tiles = out_block_tiles;
   uint32_t out_CB_size = out_CB_tiles * single_tile_size;
 
-  // 2. Define Compute Kernel Compile-Time Arguments
-  // These arguments tell the FPU (Float Point Unit) how to process the
-  // block. 'in0_block_w' is the K-dimension width of the block.
-  // 'out_subblock_h/w' are the dimensions of the sub-block for register
-  // accumulation.
+  // ---- Step 2: Compute kernel compile-time arguments ----
+  // These arguments configure the FPU (Tensix math engine) for block matrix
+  // multiplication. The FPU processes data in "subblocks" that fit into
+  // its DST (destination) registers.
+  //
+  // num_blocks:             how many K-dimension blocks to iterate over
+  // in0_num_subblocks:      per_core_Mt / out_subblock_h
+  // in0_block_num_tiles:    total tiles in one IN0 block
+  // in0_subblock_num_tiles: tiles in one subblock of IN0
+  // out_subblock_h/w:       subblock dimensions for register accumulation
+  // out_subblock_num_tiles: tiles in one output subblock (must fit in DST)
   uint32_t num_blocks = (Kt / in0_block_w);
   uint32_t in0_num_subblocks = (per_core_Mt / out_subblock_h);
   uint32_t in0_block_num_tiles =
@@ -888,29 +1105,36 @@ void create_program_compute_mm(
                       {(std::size_t)core_range.x - 1,
                        (std::size_t)(core_range.y - 1 + start_core_y)});
 
-  // 3. Create Circular Buffers (CBs)
-  // CB 0: Input 0 (Matrix A block)
+  // ---- Step 3: Create Circular Buffers (CBs) ----
+  // Circular Buffers are L1 memory regions that pipeline data between the
+  // reader/writer kernels and the compute kernel.
+  //   CB0 (c_0):  IN0 block (Matrix A)   — double-buffered
+  //   CB1 (c_1):  IN1 block (Matrix B)   — double-buffered
+  //   CB2 (c_2):  Bias/padding tile      — single tile (zeros)
+  //   CB16 (c_16): Output accumulation   — compute writes here
+  //   CB24 (c_24): Output staging        — same memory as CB16 (aliased)
+  //
+  // The compute kernel reads from CB0/CB1, accumulates in DST registers,
+  // and writes results to CB16. The writer kernel reads from CB16 and
+  // writes to L1 or DRAM.
   tt_metal::CircularBufferConfig cb_src0 =
       tt_metal::CircularBufferConfig(in0_CB_tiles * single_tile_size,
                                      {{tt::CBIndex::c_0, cb_data_format}})
           .set_page_size(tt::CBIndex::c_0, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src0);
 
-  // CB 1: Input 1 (Matrix B block)
   tt_metal::CircularBufferConfig cb_src1 =
       tt_metal::CircularBufferConfig(in1_CB_tiles * single_tile_size,
                                      {{tt::CBIndex::c_1, cb_data_format}})
           .set_page_size(tt::CBIndex::c_1, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src1);
 
-  // CB 2: Scaling/Padding (used by some kernels, often small)
   tt_metal::CircularBufferConfig cb_src2 =
       tt_metal::CircularBufferConfig(single_tile_size,
                                      {{tt::CBIndex::c_2, cb_data_format}})
           .set_page_size(tt::CBIndex::c_2, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
 
-  // CB 16: Output (Matrix C)
   tt_metal::CircularBufferConfig cb_out =
       tt_metal::CircularBufferConfig(out_CB_size,
                                      {{tt::CBIndex::c_16, cb_data_format},
@@ -919,95 +1143,215 @@ void create_program_compute_mm(
           .set_page_size(tt::CBIndex::c_24, single_tile_size);
   tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_out);
 
-  // 4. Create Kernels
-  // Reader: Fetch data from L1/DRAM into CB0/CB1
+  // ---- Step 4: Create Data Movement and Compute Kernels ----
+  // The kernel binary path determines whether data is read from L1 or DRAM.
+  //
+  // DRAM kernels use InterleavedAddrGenFast<true> in the kernel code to
+  // translate tile IDs into DRAM NOC addresses. They read the full matrix
+  // from a global interleaved buffer shared across all cores.
+  //
+  // L1 kernels read from a fixed local L1 address. The IN1_IS_IDENTITY
+  // define tells the L1 writer kernel to reuse the same IN1 block for
+  // every K-block iteration (since in L1 mode we load an identity matrix).
+  std::string reader_kernel_path;
+  std::string writer_kernel_path;
+  std::map<std::string, std::string> writer_defines;
+
+  if (use_dram) {
+    // DRAM kernels: read real data from DRAM interleaved buffers.
+    // These kernels use InterleavedAddrGenFast<true> for address generation.
+    // No IN1_IS_IDENTITY — every K-block reads fresh data from DRAM.
+    // NOTE: The shell script (run_full_charac.sh) copies these from
+    //       kernels_common/ into kernels/ when --dram is specified.
+    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in0_reader_bmm_tile_layout_dram.cpp";
+    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in1_reader_writer_bmm_tile_layout_dram.cpp";
+    // No IN1_IS_IDENTITY for DRAM — we read real matrix data from DRAM
+  } else {
+    // L1 kernels: read from local L1 SRAM.
+    // IN1_IS_IDENTITY define tells the writer kernel to reuse the same
+    // IN1 block for all K-block iterations (identity matrix workaround).
+    // NOTE: The shell script copies these from kernels_common/ into kernels/.
+    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in0_reader_bmm_tile_layout.cpp";
+    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in1_reader_writer_bmm_tile_layout.cpp";
+    writer_defines["IN1_IS_IDENTITY"] = "1";
+  }
+
   auto mm_reader_id = tt_metal::CreateKernel(
-      program,
-      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
-      "in0_reader_bmm_tile_layout.cpp",
-      all_cores,
+      program, reader_kernel_path, all_cores,
       tt_metal::DataMovementConfig{.processor =
                                        tt_metal::DataMovementProcessor::RISCV_1,
                                    .noc = tt_metal::NOC::RISCV_0_default});
 
-  // Writer: Write data from CB16 to L1/DRAM. Also handles In1 reading in
-  // some configs.
-  std::map<std::string, std::string> writer_defines;
-  writer_defines["IN1_IS_IDENTITY"] = "1";
   auto mm_writer_id = tt_metal::CreateKernel(
-      program,
-      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
-      "in1_reader_writer_bmm_tile_layout.cpp",
-      all_cores,
+      program, writer_kernel_path, all_cores,
       tt_metal::DataMovementConfig{.processor =
                                        tt_metal::DataMovementProcessor::RISCV_0,
                                    .noc = tt_metal::NOC::RISCV_1_default,
                                    .defines = writer_defines});
 
-  // Compute: Matrix Multiplication (block_w loops)
+  // Compute kernel: Tensix FPU math engine (same for both L1/DRAM modes).
+  // The compute kernel operates entirely on L1 circular buffers,
+  // so it doesn't need to know whether data came from L1 or DRAM.
+  // NOTE: Shell script always copies this from kernels_common/ into kernels/.
   tt_metal::CreateKernel(
       program,
-      "tests/tt_metal/tt_metal/perf_microbenchmark/1_compute_mm/kernels/"
+      "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels/"
       "bmm_large_block_zm_fused_bias_activation.cpp",
       all_cores,
       tt_metal::ComputeConfig{.math_fidelity = math_fidelity,
                               .fp32_dest_acc_en = fp32_dest_acc_en,
                               .compile_args = compute_kernel_args});
 
-  // 5. Runtime Arguments
-  // Set specific arguments for each core so it knows which "chunk" of the
-  // large matrix to process.
+  // ---- Step 5: Set Runtime Arguments per core ----
+  // Each core needs to know which portion of the matrix to process.
+  // The key difference between L1 and DRAM modes:
+  //
+  // L1 MODE:
+  //   - in0_addr/in1_addr point to the core's own L1 memory
+  //   - start_tile_id = 0 (data starts at beginning of local buffer)
+  //   - stride_h = in0_block_w (stride within the local block)
+  //   - All cores use the same address; data was pre-loaded per-core
+  //
+  // DRAM MODE:
+  //   - in0_addr/in1_addr/out_addr point to DRAM buffer base addresses
+  //   - start_tile_id is computed per-core using GLOBAL matrix coordinates:
+  //       IN0: y * per_core_Mt * Kt  (row offset into full A matrix)
+  //       IN1: x * per_core_Nt       (column offset into full B matrix)
+  //       OUT: y * per_core_Mt * Nt + x * per_core_Nt
+  //   - stride_h uses GLOBAL width (Kt for IN0, Nt for IN1/OUT)
+  //   - next_block_stride for IN0 = in0_block_w (advance along K in tiles)
+  //   - next_block_stride for IN1 = in0_block_w * Nt (skip Nt columns per
+  //   K-row)
+  //
+  // last_block_h/w handle edge cores that may have fewer tiles.
   uint32_t last_block_h =
       Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
-  // uint32_t last_block_w =
-  //    Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+  uint32_t last_block_w =
+      Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
 
-  for (int y = 0; y < core_range.y; y++) {
-    for (int x = 0; x < core_range.x; x++) {
+  for (int y = 0; y < (int)core_range.y; y++) {
+    for (int x = 0; x < (int)core_range.x; x++) {
       CoreCoord core = {(std::size_t)x, (std::size_t)(y + start_core_y)};
       auto phy_core = device->worker_core_from_logical_core(core);
 
-      std::vector<uint32_t> reader_args = {in0_addr,
-                                           0,
-                                           1,
-                                           in0_block_w,
-                                           in0_block_w,
-                                           in0_block_w,
-                                           per_core_Mt,
-                                           in0_block_w * per_core_Mt,
-                                           num_blocks,
-                                           (uint32_t)phy_core.x,
-                                           (uint32_t)phy_core.y};
-      if (y == core_range.y - 1)
-        reader_args.back() = last_block_h; // Update last arg for edge case
+      uint32_t cur_last_block_h =
+          (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
 
-      // Writer/IN1 Args - simplified for brevity, assuming standard tiling
-      std::vector<uint32_t> writer_args = {in1_addr,
-                                           0,
-                                           1,
-                                           per_core_Nt,
-                                           in0_block_w * per_core_Nt,
-                                           per_core_Nt,
-                                           in0_block_w,
-                                           per_core_Nt * in0_block_w,
-                                           num_blocks,
-                                           in2_cb_addr,
-                                           (uint32_t)phy_core.x,
-                                           (uint32_t)phy_core.y,
-                                           out_addr,
-                                           0,
-                                           1,
-                                           per_core_Nt,
-                                           out_subblock_w,
-                                           out_subblock_h * per_core_Nt,
-                                           out_subblock_w,
-                                           out_subblock_h,
-                                           out_subblock_w * out_subblock_h,
-                                           per_core_Nt / out_subblock_w,
-                                           per_core_Mt / out_subblock_h};
-      // Padding handling omitted for brevity/risk-reduction (assumes
-      // divisible or standard) If rigor needed, copy full logic from
-      // 1_compute_mm.
+      std::vector<uint32_t> reader_args;
+      std::vector<uint32_t> writer_args;
+
+      if (use_dram) {
+        // === DRAM Reader Args (12 args) ===
+        // Matches in0_reader_bmm_tile_layout_dram.cpp get_arg_val indices
+        uint32_t in0_start_tile_id = y * per_core_Mt * Kt; // global row * Kt
+        reader_args = {
+            in0_addr,                  // 0: in0_tensor_addr
+            in0_start_tile_id,         // 1: in0_tensor_start_tile_id
+            1,                         // 2: in0_tensor_stride_w (tiles)
+            Kt,                        // 3: in0_tensor_stride_h (full K width)
+            in0_block_w,               // 4: in0_tensor_next_block_stride
+            in0_block_w,               // 5: in0_block_w
+            per_core_Mt,               // 6: in0_block_h
+            in0_block_w * per_core_Mt, // 7: in0_block_num_tiles
+            num_blocks,                // 8: num_blocks
+            (uint32_t)phy_core.x,      // 9: noc_x
+            (uint32_t)phy_core.y,      // 10: noc_y
+            cur_last_block_h,          // 11: last_block_h
+        };
+
+        // === DRAM Writer Args (31 args) ===
+        // Matches in1_reader_writer_bmm_tile_layout_dram.cpp get_arg_val
+        // indices
+        uint32_t in1_start_tile_id = x * per_core_Nt; // global col
+        uint32_t out_start_tile_id = y * per_core_Mt * Nt + x * per_core_Nt;
+
+        // Padding calculations for writer
+        uint32_t cur_last_block_w =
+            (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
+
+        writer_args = {
+            in1_addr,                  // 0: in1_tensor_addr
+            in1_start_tile_id,         // 1: in1_tensor_start_tile_id
+            1,                         // 2: in1_tensor_stride_w
+            Nt,                        // 3: in1_tensor_stride_h (full N width)
+            in0_block_w * Nt,          // 4: in1_tensor_next_block_stride
+            per_core_Nt,               // 5: in1_block_w
+            in0_block_w,               // 6: in1_block_h
+            per_core_Nt * in0_block_w, // 7: in1_block_num_tiles
+            num_blocks,                // 8: num_blocks
+            in2_cb_addr,               // 9: in2_cb_addr
+            (uint32_t)phy_core.x,      // 10: noc_x
+            (uint32_t)phy_core.y,      // 11: noc_y
+            out_addr,                  // 12: out_tensor_addr
+            out_start_tile_id,         // 13: out_tensor_start_tile_id
+            1,                         // 14: out_tensor_stride_w
+            Nt,                        // 15: out_tensor_stride_h (full N width)
+            out_subblock_w,            // 16: out_tensor_next_subblock_stride_w
+            out_subblock_h * Nt,       // 17: out_tensor_next_subblock_stride_h
+            out_subblock_w,            // 18: out_subblock_w
+            out_subblock_h,            // 19: out_subblock_h
+            out_subblock_num_tiles,    // 20: out_subblock_tile_count
+            in1_num_subblocks,         // 21: out_num_subblocks_w
+            in0_num_subblocks,         // 22: out_num_subblocks_h
+            cur_last_block_w,          // 23: last_block_w (padding)
+            in0_num_subblocks,         // 24: out_num_nonzero_subblocks_h
+            out_subblock_h,            // 25: out_last_subblock_h
+            0,                         // 26: padded_block_tiles_h_skip
+            in1_num_subblocks,         // 27: out_num_nonzero_subblocks_w
+            out_subblock_w,            // 28: out_last_subblock_w
+            0,                         // 29: padded_subblock_tiles_addr_skip
+            0,                         // 30: padded_block_tiles_w_skip
+        };
+
+      } else {
+        // === L1 Reader Args (11 args — original) ===
+        reader_args = {in0_addr,
+                       0,           // start_tile_id (local buffer)
+                       1,           // stride_w
+                       in0_block_w, // stride_h
+                       in0_block_w, // next_block_stride
+                       in0_block_w, // block_w
+                       per_core_Mt, // block_h
+                       in0_block_w * per_core_Mt, // block_num_tiles
+                       num_blocks,
+                       (uint32_t)phy_core.x,
+                       (uint32_t)phy_core.y};
+        if (y == (int)core_range.y - 1)
+          reader_args.back() = last_block_h;
+
+        // === L1 Writer Args (23 args — original) ===
+        writer_args = {in1_addr,
+                       0,
+                       1,
+                       per_core_Nt,
+                       in0_block_w * per_core_Nt,
+                       per_core_Nt,
+                       in0_block_w,
+                       per_core_Nt * in0_block_w,
+                       num_blocks,
+                       in2_cb_addr,
+                       (uint32_t)phy_core.x,
+                       (uint32_t)phy_core.y,
+                       out_addr,
+                       0,
+                       1,
+                       per_core_Nt,
+                       out_subblock_w,
+                       out_subblock_h * per_core_Nt,
+                       out_subblock_w,
+                       out_subblock_h,
+                       out_subblock_w * out_subblock_h,
+                       per_core_Nt / out_subblock_w,
+                       per_core_Mt / out_subblock_h};
+      }
 
       tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);
       tt_metal::SetRuntimeArgs(program, mm_writer_id, core, writer_args);
@@ -1065,25 +1409,33 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
                                   single_tile_size, l1_unreserved_base);
 
-    // 4. Create Program and Kernels (Device)
+    // 4. Prepare Inputs (BEFORE program creation for DRAM addr resolution)
+    auto inputs = prepare_inputs_compute_mm(
+        device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt, in0_block_w,
+        single_tile_size, in0_addr, in1_addr, in2_cb_addr, params.use_dram);
+
+    // 5. Resolve addresses: DRAM buffers override L1 addresses
+    uint32_t effective_in0_addr = in0_addr;
+    uint32_t effective_in1_addr = in1_addr;
+    uint32_t effective_out_addr = out_addr;
+    if (params.use_dram) {
+      effective_in0_addr = inputs.in0_buffer->address();
+      effective_in1_addr = inputs.in1_buffer->address();
+      effective_out_addr = inputs.out_buffer->address();
+      log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+               effective_in0_addr, effective_in1_addr, effective_out_addr);
+    }
+
+    // 6. Create Program and Kernels (Device)
     tt_metal::Program program;
     create_program_compute_mm(
         device, data_format, math_fidelity, fp32_dest_acc_en, single_tile_size,
         core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h, out_subblock_w,
         per_core_Mt, per_core_Nt, in0_cb_addr, in1_cb_addr, in2_cb_addr,
-        out_cb_addr, in0_addr, in1_addr, out_addr, program);
+        out_cb_addr, effective_in0_addr, effective_in1_addr, effective_out_addr,
+        params.use_dram, program);
 
-    // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
-    // This function has internal ZoneScoped measurements for Host Data Gen,
-    // Tilize, Transfer
-    // 5. Prepare Inputs (Host Gen -> Tiling -> Transfer)
-    // This function has internal ZoneScoped measurements for Host Data Gen,
-    // Tilize, Transfer
-    auto inputs = prepare_inputs_compute_mm(
-        device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt, in0_block_w,
-        single_tile_size, in0_addr, in1_addr, in2_cb_addr, 0);
-
-    // 6. Profiling loop
+    // 7. Profiling loop
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
     mesh_workload.add_program(
         tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
@@ -1099,59 +1451,70 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
     if (!params.bypass_check) {
       log_info(LogTest, "Validation Started...");
-      auto [in0_vec, in1_vec, unused_golden] = inputs;
-      (void)unused_golden; // Suppress unused variable warning
-      // Compute Golden
+
+      // Compute Golden Reference
       log_info(LogTest, "Computing Golden Reference (FP32)...");
-      auto golden_vec =
-          matmul_reference(in0_vec, in1_vec, params.M, params.N, params.K);
+      auto golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
+                                         params.M, params.N, params.K);
 
       // Read Back Results
       log_info(LogTest, "Reading Device Results...");
       std::vector<float> device_vec(params.M * params.N, 0.0f);
-      auto *target_device =
-          device->get_devices()[0]; // Assume single device for now
+      auto *target_device = device->get_devices()[0];
 
-      // Read per-core partitions and stitch
-      // Implementation Note: Since output is tiled and partitioning is complex,
-      // we iterate cores and read their sub-blocks. Output is in `out_addr`.
-      // The kernel writes `per_core_Mt * per_core_Nt` tiles.
+      if (params.use_dram) {
+        // === DRAM Readback ===
+        // Read entire output buffer from DRAM
+        std::vector<uint32_t> out_data;
+        tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
 
-      // Each core contributes a block of size (per_core_Mt*32) x
-      // (per_core_Nt*32) We need to unpack this block and place it into
-      // `device_vec`.
+        // Unpack and untilize the full output
+        auto out_float = unpack_bfp8_tiles_into_float_vec(
+            out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
+        // out_float is in tilized layout (Mt*32 rows x Nt*32 cols)
+        device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
+        // Trim to actual M x N if needed
+        if (device_vec.size() > (size_t)(params.M * params.N)) {
+          std::vector<float> trimmed(params.M * params.N, 0.0f);
+          for (uint32_t r = 0; r < params.M; ++r) {
+            for (uint32_t c = 0; c < params.N; ++c) {
+              trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+            }
+          }
+          device_vec = trimmed;
+        }
+      } else {
+        // === L1 Readback (per-core stitching) ===
+        for (int y = 0; y < (int)num_cores_y; y++) {
+          for (int x = 0; x < (int)num_cores_x; x++) {
+            CoreCoord core = {(std::size_t)x, (std::size_t)y};
+            uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+            uint32_t read_size = core_n_tiles * single_tile_size;
 
-      for (int y = 0; y < num_cores_y; y++) {
-        for (int x = 0; x < num_cores_x; x++) {
-          CoreCoord core = {(std::size_t)x, (std::size_t)y};
-          // Read from out_addr
-          // Size in bytes = tiles * tile_size
-          uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
-          uint32_t read_size = core_n_tiles * single_tile_size;
+            std::vector<uint32_t> core_data_tiles;
+            tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
+                                               read_size, core_data_tiles);
 
-          std::vector<uint32_t> core_data_tiles;
-          tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
-                                             read_size, core_data_tiles);
+            // Unpack and Untilize
+            auto core_data_float = unpack_bfp8_tiles_into_float_vec(
+                core_data_tiles, /*row_major_output=*/true,
+                /*is_exp_a=*/false);
+            auto core_data_untilized = untilize_swizzled(
+                core_data_float, per_core_Mt * 32, per_core_Nt * 32);
 
-          // Unpack and Untilize
-          auto core_data_float = unpack_bfp8_tiles_into_float_vec(
-              core_data_tiles, /*row_major_output=*/true, /*is_exp_a=*/false);
-          auto core_data_untilized = untilize_swizzled(
-              core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+            // Copy into global device_vec
+            uint32_t global_r_start = y * per_core_Mt * 32;
+            uint32_t global_c_start = x * per_core_Nt * 32;
+            uint32_t r_len = per_core_Mt * 32;
+            uint32_t c_len = per_core_Nt * 32;
 
-          // Copy into global device_vec
-          uint32_t global_r_start = y * per_core_Mt * 32;
-          uint32_t global_c_start = x * per_core_Nt * 32;
-          uint32_t r_len = per_core_Mt * 32;
-          uint32_t c_len = per_core_Nt * 32;
-
-          for (uint32_t r = 0; r < r_len; ++r) {
-            for (uint32_t c = 0; c < c_len; ++c) {
-              uint32_t global_idx =
-                  (global_r_start + r) * (params.N) + (global_c_start + c);
-              // Ensure bounds (handle edge cases if necessary)
-              if (global_idx < device_vec.size()) {
-                device_vec[global_idx] = core_data_untilized[r * c_len + c];
+            for (uint32_t r = 0; r < r_len; ++r) {
+              for (uint32_t c = 0; c < c_len; ++c) {
+                uint32_t global_idx =
+                    (global_r_start + r) * (params.N) + (global_c_start + c);
+                if (global_idx < device_vec.size()) {
+                  device_vec[global_idx] = core_data_untilized[r * c_len + c];
+                }
               }
             }
           }

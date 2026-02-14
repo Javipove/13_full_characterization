@@ -10,6 +10,7 @@
 NUM_RT_ARGS=255
 CLEAN_MODE=0
 TEST_TYPE=3
+USE_DRAM=0
 
 # Search for arguments to generate correct kernels
 args=("$@")
@@ -25,6 +26,10 @@ for ((i=0; i < ${#args[@]}; i++)); do
     fi
     if [[ "${args[i]}" == "--core-groups" ]]; then
         CORE_GROUPS="${args[i+1]}"
+    fi
+    # Detect --dram flag (no value needed, just presence)
+    if [[ "${args[i]}" == "--dram" ]]; then
+        USE_DRAM=1
     fi
 done
 
@@ -104,11 +109,40 @@ EOF
 
 elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" ]]; then
     # Compute MM (1) or SubDevice MM (2)
-    # Compute MM
+    #
+    # Always needed:
+    #   - Compute kernel (Tensix FPU math engine): same for L1 and DRAM modes
+    #
+    # L1 mode (default):
+    #   - in0_reader_bmm_tile_layout.cpp : reads IN0 from local L1
+    #   - in1_reader_writer_bmm_tile_layout.cpp : reads IN1 from L1, writes output to L1
+    #
+    # DRAM mode (--dram flag):
+    #   - in0_reader_bmm_tile_layout_dram.cpp : reads IN0 from DRAM via InterleavedAddrGenFast
+    #   - in1_reader_writer_bmm_tile_layout_dram.cpp : reads IN1 from DRAM, writes output to DRAM
+    #
     echo "Preparing Compute MM kernels..."
+
+    # Compute kernel — always copied (same for both modes)
     cp $KERNEL_COMMON_DIR/bmm_large_block_zm_fused_bias_activation.cpp $KERNEL_DIR/
-    cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout.cpp $KERNEL_DIR/
-    cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout.cpp $KERNEL_DIR/
+    echo "  Copied compute kernel: bmm_large_block_zm_fused_bias_activation.cpp"
+
+    if [[ "$USE_DRAM" == "1" ]]; then
+        # DRAM mode: copy DRAM-specific reader/writer kernels
+        echo "  DRAM mode enabled — copying DRAM reader/writer kernels..."
+        cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout_dram.cpp $KERNEL_DIR/
+        cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout_dram.cpp $KERNEL_DIR/
+        echo "  Copied: in0_reader_bmm_tile_layout_dram.cpp"
+        echo "  Copied: in1_reader_writer_bmm_tile_layout_dram.cpp"
+    else
+        # L1 mode (default): copy L1-specific reader/writer kernels
+        echo "  L1 mode (default) — copying L1 reader/writer kernels..."
+        cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout.cpp $KERNEL_DIR/
+        cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout.cpp $KERNEL_DIR/
+        echo "  Copied: in0_reader_bmm_tile_layout.cpp"
+        echo "  Copied: in1_reader_writer_bmm_tile_layout.cpp"
+    fi
+
 else
     echo "Unknown or No Kernel Generation needed for Test Type $TEST_TYPE"
 fi
