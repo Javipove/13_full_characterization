@@ -858,6 +858,11 @@ BenchmarkInputs prepare_inputs_compute_mm(
       // Internally, this writes each page (tile) to the correct DRAM bank
       // based on the round-robin interleaving scheme.
       tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
+
+      // Update inputs.in0_vec with effective BFP8 values for validation
+      auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+          in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+      inputs.in0_vec = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
     }
 
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) ----
@@ -869,6 +874,11 @@ BenchmarkInputs prepare_inputs_compute_mm(
       auto in1_packed =
           pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
                              /*row_major_input=*/true, /*is_exp_a=*/false);
+
+      // Update inputs.in1_vec with effective BFP8 values for validation
+      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
 
       uint32_t in1_num_tiles = Kt * Nt;
       uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
