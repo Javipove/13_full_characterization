@@ -330,7 +330,8 @@ get_aligned_input_tile_num(uint32_t M, uint32_t N, uint32_t K) {
 // required buffers. 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
 uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
                          uint32_t Kt, uint32_t single_tile_size,
-                         uint32_t l1_size, uint32_t l1_unreserved_base) {
+                         uint32_t l1_size, uint32_t l1_unreserved_base,
+                         bool use_dram = false) {
   std::vector<uint32_t> in0_block_w_choices = {4, 2, 1};
   uint32_t num_buffer = 2; // double buffering
   uint32_t in0_block_w = 0;
@@ -349,13 +350,18 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t total_cb_size =
         in0_cb_size + in1_cb_size + in2_cb_size + intermediate_cb_size;
 
-    uint32_t per_core_in0_size = per_core_Mt * choice * single_tile_size;
-    uint32_t per_core_in1_size = per_core_Nt * choice * single_tile_size;
-    uint32_t per_core_out_size = per_core_Mt * per_core_Nt * single_tile_size;
+    // In DRAM mode, data tensors live in DRAM, not L1.
+    // Only circular buffers need L1 space.
+    uint32_t total_l1_needed = total_cb_size;
+    if (!use_dram) {
+      uint32_t per_core_in0_size = per_core_Mt * choice * single_tile_size;
+      uint32_t per_core_in1_size = per_core_Nt * choice * single_tile_size;
+      uint32_t per_core_out_size = per_core_Mt * per_core_Nt * single_tile_size;
+      total_l1_needed +=
+          per_core_in0_size + per_core_in1_size + per_core_out_size;
+    }
 
-    uint32_t total_buffer_size =
-        per_core_in0_size + per_core_in1_size + per_core_out_size;
-    if (base_addr + total_cb_size + total_buffer_size <= l1_size) {
+    if (base_addr + total_l1_needed <= l1_size) {
       in0_block_w = choice;
       break;
     }
@@ -466,7 +472,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base);
+                          uint32_t l1_unreserved_base, bool use_dram = false);
 
 //! Phase 2: Sub-Device Parallelism Test
 //! Partitions the device into 2 Sub-Devices and runs independent MM workloads
@@ -581,15 +587,16 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
 }
 
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
+// MODIFIED: FP32 ACCUM TO TRUE -> poor preceision
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch) {
   MathFidelity math_fidelity = MathFidelity::HiFi4;
-  bool fp32_dest_acc_en = false;
+  bool fp32_dest_acc_en = true;
   if (arch == tt::ARCH::WORMHOLE_B0 or arch == tt::ARCH::BLACKHOLE) {
     math_fidelity = MathFidelity::HiFi2;
-    fp32_dest_acc_en = false;
+    fp32_dest_acc_en = true;
   } else if (arch == tt::ARCH::GRAYSKULL) {
     math_fidelity = MathFidelity::HiFi4;
-    fp32_dest_acc_en = false;
+    fp32_dest_acc_en = true;
   }
   return {math_fidelity, fp32_dest_acc_en};
 }
@@ -633,7 +640,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base) {
+                          uint32_t l1_unreserved_base, bool use_dram = false) {
   uint32_t num_buffer = 2; // double buffering
   uint32_t in0_cb_addr = l1_unreserved_base;
   uint32_t in0_cb_size =
@@ -646,11 +653,18 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
   uint32_t out_cb_addr = in2_cb_addr + in2_cb_size;
   uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
 
-  uint32_t per_core_in0_tiles = per_core_Mt * in0_block_w;
-  uint32_t per_core_in1_tiles = per_core_Nt * in0_block_w;
-  uint32_t in0_addr = out_cb_addr + out_cb_size;
-  uint32_t in1_addr = in0_addr + (per_core_in0_tiles * single_tile_size);
-  uint32_t out_addr = in1_addr + (per_core_in1_tiles * single_tile_size);
+  // In DRAM mode, data tensors live in DRAM — don't allocate L1 for them.
+  // Addresses will be overridden by DRAM buffer addresses in test_compute_mm.
+  uint32_t in0_addr = 0;
+  uint32_t in1_addr = 0;
+  uint32_t out_addr = 0;
+  if (!use_dram) {
+    uint32_t per_core_in0_tiles = per_core_Mt * in0_block_w;
+    uint32_t per_core_in1_tiles = per_core_Nt * in0_block_w;
+    in0_addr = out_cb_addr + out_cb_size;
+    in1_addr = in0_addr + (per_core_in0_tiles * single_tile_size);
+    out_addr = in1_addr + (per_core_in1_tiles * single_tile_size);
+  }
 
   return {in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
           in0_addr,    in1_addr,    out_addr};
@@ -1450,10 +1464,18 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
     uint32_t in0_block_w =
         get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
-                        l1_unreserved_base);
+                        l1_unreserved_base, params.use_dram);
     if (in0_block_w == 0) {
-      log_error(LogTest, "Insufficient L1 memory for M={}, N={}, K={}",
-                params.M, params.N, params.K);
+      uint32_t out_cb_tiles = per_core_Mt * per_core_Nt;
+      uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+      uint32_t avail_l1 = l1_size - l1_unreserved_base;
+      log_error(LogTest,
+                "Insufficient L1 memory for M={}, N={}, K={} "
+                "(per_core_Mt={}, per_core_Nt={}, out_CB={}tiles={}KB, "
+                "avail_L1={}KB, dram={})",
+                params.M, params.N, params.K, per_core_Mt, per_core_Nt,
+                out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                params.use_dram ? "yes" : "no");
       return false;
     }
 
@@ -1464,7 +1486,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
     auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
           in1_addr, out_addr] =
         get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
-                                  single_tile_size, l1_unreserved_base);
+                                  single_tile_size, l1_unreserved_base,
+                                  params.use_dram);
 
     // 4. Prepare Inputs (BEFORE program creation for DRAM addr resolution)
     auto inputs = prepare_inputs_compute_mm(
