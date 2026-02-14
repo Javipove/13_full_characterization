@@ -331,7 +331,7 @@ get_aligned_input_tile_num(uint32_t M, uint32_t N, uint32_t K) {
 uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
                          uint32_t Kt, uint32_t single_tile_size,
                          uint32_t l1_size, uint32_t l1_unreserved_base,
-                         bool use_dram) {
+                         bool use_dram = false) {
   std::vector<uint32_t> in0_block_w_choices = {4, 2, 1};
   uint32_t num_buffer = 2; // double buffering
   uint32_t in0_block_w = 0;
@@ -472,7 +472,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base, bool use_dram = false);
+                          uint32_t l1_unreserved_base, bool use_dram);
 
 //! Phase 2: Sub-Device Parallelism Test
 //! Partitions the device into 2 Sub-Devices and runs independent MM workloads
