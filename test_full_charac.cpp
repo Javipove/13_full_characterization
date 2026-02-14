@@ -174,7 +174,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   uint32_t fidel; // 0: low, 1: high
   uint32_t core_x, core_y, core_groups;
   uint32_t num_iters;
-  bool use_dram;
+  bool use_dram = false;
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t cpu_id;
@@ -199,8 +199,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--fidel", 0);
     std::tie(use_dram, input_args) =
-        test_args::has_command_option_and_remaining_args(input_args, "--dram",
-                                                         false);
+        test_args::has_command_option_and_remaining_args(input_args, "--dram");
 
     // Core grid size args
     std::tie(core_x, input_args) =
