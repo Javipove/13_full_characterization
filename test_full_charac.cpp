@@ -567,6 +567,7 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("Sub-Device Parallel Dispatch");
+      ZoneValue(i);
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
       tt_metal::distributed::Finish(device->mesh_command_queue());
@@ -1453,6 +1454,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("Dispatch Overhead"); // Measuring Dispatch Latency
+      ZoneValue(i);
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
       tt_metal::distributed::Finish(device->mesh_command_queue());
