@@ -658,16 +658,18 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
 
 // MODIFIED: Added Tracy ZoneScopedN for profiling.
 // Originally from 1_compute_mm/test_compute_mm.cpp
+// Originally from 1_compute_mm/test_compute_mm.cpp
 std::vector<float> generate_fp32_random(uint32_t num_elems,
-                                        int32_t rand_max_val = 100) {
+                                        float scale = 1.0f) {
   ZoneScopedN("Generate FP32 Random");
   std::vector<float> vec(num_elems);
   unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
-  auto rand_float =
-      std::bind(std::uniform_real_distribution<float>(0, rand_max_val),
-                std::mt19937(seed));
+  // Generate random numbers in range [-scale, scale]
+  // This mimics He/Xavier initialization when scale = 1/sqrt(K)
+  auto rand_float = std::bind(
+      std::uniform_real_distribution<float>(-scale, scale), std::mt19937(seed));
   for (uint32_t i = 0; i < num_elems; ++i) {
-    vec.at(i) = static_cast<float>(rand_float());
+    vec.at(i) = rand_float();
   }
   return vec;
 }
@@ -815,8 +817,10 @@ BenchmarkInputs prepare_inputs_compute_mm(
   // Generate random FP32 matrices. These are kept in the BenchmarkInputs struct
   // for later host-side golden-reference validation (matmul_reference).
   // TILE_HW = 32*32 = 1024 elements per tile.
-  inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW);
-  inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW);
+  // Scale factor for ML-realistic initialization (He Init style: 1/sqrt(K))
+  float scale = 1.0f / std::sqrt(static_cast<float>(Kt * 32));
+  inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, scale);
+  inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, scale);
 
   // Zeros buffer for the "in2" circular buffer (CB index 2).
   // This is written to every core's L1 regardless of L1/DRAM mode.
