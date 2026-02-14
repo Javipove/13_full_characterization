@@ -701,33 +701,43 @@ std::vector<T> get_col_slice(std::vector<T> data, int start_col_index,
 
 // Calculates the Pearson Correlation Coefficient (PCC) between two vectors.
 // Used to validate BFP8/FP16 outputs against FP32 golden reference.
+// Calculates the Pearson Correlation Coefficient (PCC) between two vectors.
+// Uses a numerically stable 2-pass algorithm (centered) to avoid catastrophic
+// cancellation.
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
-  if (x.size() != y.size()) {
+  if (x.size() != y.size() || x.empty()) {
     return 0.0f;
   }
 
+  size_t n = x.size();
   double sum_x = 0.0, sum_y = 0.0;
-  double sum_xx = 0.0, sum_yy = 0.0;
-  double sum_xy = 0.0;
-
-  for (size_t i = 0; i < x.size(); ++i) {
+  for (size_t i = 0; i < n; ++i) {
     sum_x += x[i];
     sum_y += y[i];
-    sum_xx += x[i] * x[i];
-    sum_yy += y[i] * y[i];
-    sum_xy += x[i] * y[i];
+  }
+  double mean_x = sum_x / n;
+  double mean_y = sum_y / n;
+
+  double numerator = 0.0;
+  double sum_sq_diff_x = 0.0;
+  double sum_sq_diff_y = 0.0;
+
+  for (size_t i = 0; i < n; ++i) {
+    double diff_x = x[i] - mean_x;
+    double diff_y = y[i] - mean_y;
+    numerator += diff_x * diff_y;
+    sum_sq_diff_x += diff_x * diff_x;
+    sum_sq_diff_y += diff_y * diff_y;
   }
 
-  size_t n = x.size();
-  double numerator = n * sum_xy - sum_x * sum_y;
-  double denominator = std::sqrt(n * sum_xx - sum_x * sum_x) *
-                       std::sqrt(n * sum_yy - sum_y * sum_y);
+  double denominator = std::sqrt(sum_sq_diff_x) * std::sqrt(sum_sq_diff_y);
 
   if (denominator == 0)
     return 0.0f;
   return static_cast<float>(numerator / denominator);
 }
 
+// Calculates Root Mean Square Error (RMSE)
 // Calculates Root Mean Square Error (RMSE)
 float get_rmse(const std::vector<float> &x, const std::vector<float> &y) {
   if (x.size() != y.size()) {
@@ -736,23 +746,56 @@ float get_rmse(const std::vector<float> &x, const std::vector<float> &y) {
 
   double sum_sq_diff = 0.0;
   for (size_t i = 0; i < x.size(); ++i) {
-    double diff = x[i] - y[i];
+    double diff = static_cast<double>(x[i]) - static_cast<double>(y[i]);
     sum_sq_diff += diff * diff;
   }
   return static_cast<float>(std::sqrt(sum_sq_diff / x.size()));
 }
 
+// Calculates Relative RMSE: ||x - ref||_2 / ||ref||_2
+// Implementation provided by User for academic rigor.
+float get_relative_rmse(const std::vector<float> &x,
+                        const std::vector<float> &ref) {
+  if (x.size() != ref.size()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  const size_t n = x.size();
+  double err_sq_sum = 0.0;
+  double ref_sq_sum = 0.0;
+
+  for (size_t i = 0; i < n; ++i) {
+    double diff = static_cast<double>(x[i]) - ref[i];
+    err_sq_sum += diff * diff;
+    ref_sq_sum += static_cast<double>(ref[i]) * ref[i];
+  }
+
+  if (ref_sq_sum == 0.0) {
+    return std::numeric_limits<float>::quiet_NaN(); // undefined
+  }
+
+  double rrmse = std::sqrt(err_sq_sum / ref_sq_sum);
+  return static_cast<float>(rrmse);
+}
+
 // Reference Matrix Multiplication (row-major)
 // C = A * B. A is (M x K), B is (K x N), C is (M x N)
+// Reference Matrix Multiplication (row-major)
+// C = A * B. A is (M x K), B is (K x N), C is (M x N)
+// Uses double precision for accumulation to serve as a rigorous Golden
+// Reference.
 std::vector<float> matmul_reference(const std::vector<float> &a,
                                     const std::vector<float> &b, uint32_t M,
                                     uint32_t N, uint32_t K) {
   std::vector<float> c(M * N, 0.0f);
   for (uint32_t i = 0; i < M; ++i) {
     for (uint32_t k = 0; k < K; ++k) {
-      float val_a = a[i * K + k];
+      double val_a = static_cast<double>(a[i * K + k]);
       for (uint32_t j = 0; j < N; ++j) {
-        c[i * N + j] += val_a * b[k * N + j];
+        // Accumulate in double to minimize rounding errors
+        double current_val = static_cast<double>(c[i * N + j]);
+        current_val += val_a * static_cast<double>(b[k * N + j]);
+        c[i * N + j] = static_cast<float>(current_val);
       }
     }
   }
@@ -817,8 +860,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
   // Generate random FP32 matrices. These are kept in the BenchmarkInputs struct
   // for later host-side golden-reference validation (matmul_reference).
   // TILE_HW = 32*32 = 1024 elements per tile.
-  // Scale factor for ML-realistic initialization (He Init style: 1/sqrt(K))
-  float scale = 1.0f / std::sqrt(static_cast<float>(Kt * 32));
+  // Scale factor for ML-realistic initialization: range [-5, 5] (User Request)
+  float scale = 5.0f;
   inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, scale);
   inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, scale);
 
@@ -1537,11 +1580,15 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       }
 
       // Comparison
+      // Comparison
       float pcc = get_pcc(golden_vec, device_vec);
       float rmse = get_rmse(golden_vec, device_vec);
+      float relative_rmse = get_relative_rmse(golden_vec, device_vec);
 
-      log_info(LogTest, "Validation Result: PCC = {:.4f}, RMSE = {:.4f}", pcc,
-               rmse);
+      log_info(LogTest,
+               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+               "= {:.4f}",
+               pcc, rmse, relative_rmse);
 
       if (pcc < 0.99f) {
         log_error(LogTest, "Validation FAILED (PCC < 0.99)");
