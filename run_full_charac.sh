@@ -5,11 +5,13 @@
 # 0: Empty Kernel Launch
 # 1: Compute MM
 # 2: SubDevice MM
-# 3: Invalid Test
+# 3: Host Pipeline ComputeMM (no kernels)
+# 4: Host Pipeline Empty Tensor (no kernels)
+# 5: Invalid Test
 
 NUM_RT_ARGS=255
 CLEAN_MODE=0
-TEST_TYPE=3
+TEST_TYPE=5
 USE_DRAM=0
 
 # Search for arguments to generate correct kernels
@@ -143,13 +145,15 @@ elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" ]]; then
         echo "  Copied: in1_reader_writer_bmm_tile_layout.cpp"
     fi
 
+elif [[ "$TEST_TYPE" == "3" || "$TEST_TYPE" == "4" ]]; then
+    echo "Host-only pipeline test selected ($TEST_TYPE): no kernels required"
 else
     echo "Unknown or No Kernel Generation needed for Test Type $TEST_TYPE"
 fi
 
 # Execute the benchmark with all passed arguments
 # Usage example: ./run_full_charac.sh ./build/test/test_full_charac --num-rt-args 512 ...
-if [[ "$TEST_TYPE" != "3" ]]; then
+if [[ "$TEST_TYPE" != "5" ]]; then
 echo "Executing: $@"
 "$@"
 else
