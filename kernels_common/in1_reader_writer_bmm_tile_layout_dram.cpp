@@ -66,6 +66,10 @@ void kernel_main() {
   constexpr uint32_t cb_id_in2 = 2; // Zeros
   constexpr uint32_t cb_id_out0 = 16;
 
+  (void)in2_cb_addr;
+  (void)noc_x;
+  (void)noc_y;
+
   // Use Interleaved DRAM Reading/Writing
   const uint32_t in1_single_tile_size_bytes = get_tile_size(cb_id_in1);
   const DataFormat in1_data_format = get_dataformat(cb_id_in1);
@@ -83,7 +87,13 @@ void kernel_main() {
 
   // Fill tile with zeros
   cb_reserve_back(cb_id_in2, 1);
-  uint64_t l1_zeros_addr_in2_noc = get_noc_addr(get_write_ptr(cb_id_in2));
+  uint32_t l1_zeros_addr_in2 = get_write_ptr(cb_id_in2);
+  uint64_t l1_zeros_addr_in2_noc = get_noc_addr(l1_zeros_addr_in2);
+  const uint32_t in2_single_tile_size_bytes = get_tile_size(cb_id_in2);
+  volatile uint32_t *in2_l1_ptr = reinterpret_cast<volatile uint32_t *>(l1_zeros_addr_in2);
+  for (uint32_t i = 0; i < in2_single_tile_size_bytes / sizeof(uint32_t); i++) {
+    in2_l1_ptr[i] = 0;
+  }
 
   for (uint32_t bh = 0; bh < num_blocks_h_dim; bh++) {
     uint32_t in1_bw_start = in1_tensor_start_tile_id; // B resets for each bh
