@@ -59,9 +59,10 @@ void kernel_main() {
             in0_tensor_current_block_start_tile_id;
         for (uint32_t h = 0; h < in0_block_h; h++) {
           uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
+          bool valid_h = (bh < num_blocks_h_dim - 1) || (h < last_block_h);
 
           for (uint32_t w = 0; w < in0_block_w; w++) {
-            if (h < last_block_h) {
+            if (valid_h) {
               noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr_in0);
             } else {
               noc_async_read(l1_zeros_addr_in2_noc, l1_write_addr_in0,
