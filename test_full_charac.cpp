@@ -138,7 +138,9 @@ enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
   ComputeMM = 1,
   SubDeviceMM = 2,
-  InvalidTest = 3
+  HostPipelineComputeMM = 3,
+  HostPipelineEmpty = 4,
+  InvalidTest = 5
 };
 
 // Definition of test parameters structure
@@ -233,7 +235,10 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
 
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
-                                                                "--test", 3);
+                                                                "--test", 5);
+    if (test_uint > static_cast<uint32_t>(TestType::InvalidTest)) {
+      throw std::runtime_error("Invalid --test value");
+    }
     test = static_cast<TestType>(test_uint);
     test_args::validate_remaining_args(input_args);
 
@@ -721,17 +726,23 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
   }
 }
 
+bool test_host_pipeline_compute_mm(tt_metal::distributed::MeshDevice *device,
+                                   const TestParams &params);
+
+bool test_host_pipeline_empty_tensor(tt_metal::distributed::MeshDevice *device,
+                                     const TestParams &params);
+
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
 // MODIFIED: FP32 ACCUM TO TRUE -> poor preceision
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch) {
   MathFidelity math_fidelity = MathFidelity::HiFi4;
-  bool fp32_dest_acc_en = true;
+  bool fp32_dest_acc_en = false;
   if (arch == tt::ARCH::WORMHOLE_B0 or arch == tt::ARCH::BLACKHOLE) {
     math_fidelity = MathFidelity::HiFi2;
-    fp32_dest_acc_en = true;
+    fp32_dest_acc_en = false;
   } else if (arch == tt::ARCH::GRAYSKULL) {
     math_fidelity = MathFidelity::HiFi4;
-    fp32_dest_acc_en = true;
+    fp32_dest_acc_en = false;
   }
   return {math_fidelity, fp32_dest_acc_en};
 }
@@ -1917,6 +1928,335 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
   return pass;
 }
 
+struct HostPipelineStats {
+  double generate_us = 0.0;
+  double transform_us = 0.0;
+  double write_us = 0.0;
+  double read_us = 0.0;
+  double inverse_transform_us = 0.0;
+  double end_to_end_us = 0.0;
+  uint64_t bytes_written = 0;
+  uint64_t bytes_read = 0;
+};
+
+void log_host_pipeline_stats(const std::string &tag, const HostPipelineStats &s,
+                             uint32_t num_iters) {
+  double iters = static_cast<double>(std::max(1u, num_iters));
+  double avg_generate_us = s.generate_us / iters;
+  double avg_transform_us = s.transform_us / iters;
+  double avg_write_us = s.write_us / iters;
+  double avg_read_us = s.read_us / iters;
+  double avg_inverse_transform_us = s.inverse_transform_us / iters;
+  double avg_end_to_end_us = s.end_to_end_us / iters;
+
+  double write_seconds = s.write_us / 1e6;
+  double read_seconds = s.read_us / 1e6;
+  double write_gbps = (write_seconds > 0.0)
+                          ? (static_cast<double>(s.bytes_written) / write_seconds) / 1e9
+                          : 0.0;
+  double read_gbps = (read_seconds > 0.0)
+                         ? (static_cast<double>(s.bytes_read) / read_seconds) / 1e9
+                         : 0.0;
+
+  log_info(LogTest,
+           "{} host-only pipeline avg(us): gen={:.2f}, xform={:.2f}, write={:.2f}, read={:.2f}, "
+           "inv_xform={:.2f}, e2e={:.2f}",
+           tag, avg_generate_us, avg_transform_us, avg_write_us, avg_read_us,
+           avg_inverse_transform_us, avg_end_to_end_us);
+
+  log_info(LogTest,
+           "{} host-only transfer totals: write_bytes={}, read_bytes={}, write_bw={:.3f} GB/s, "
+           "read_bw={:.3f} GB/s",
+           tag, s.bytes_written, s.bytes_read, write_gbps, read_gbps);
+}
+
+bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
+                                   const TestParams &params) {
+  bool pass = true;
+  try {
+    log_info(LogTest,
+             "Starting Host-Only ComputeMM Pipeline Test (no kernel dispatch)");
+
+    auto [Mt, Nt, Kt] =
+        get_aligned_input_tile_num(params.M, params.N, params.K);
+
+    if (params.num_iters == 0) {
+      log_error(LogTest, "Host-only ComputeMM requires --num-iters > 0");
+      return false;
+    }
+
+    if (params.dtype != 0) {
+      log_error(LogTest,
+                "Host-only ComputeMM currently supports only --dtype 0 "
+                "(BFP8 path), requested dtype={}",
+                params.dtype);
+      return false;
+    }
+
+    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+
+    uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
+    uint32_t in0_num_tiles = Mt * Kt;
+    uint32_t in1_num_tiles = Kt * Nt;
+    uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
+    uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+
+    auto *target_device = device->get_devices()[0];
+
+    auto in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = target_device,
+        .size = in0_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+
+    auto in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = target_device,
+        .size = in1_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+
+    HostPipelineStats stats;
+    uint32_t completed_iters = 0;
+
+    for (uint32_t i = 0; i < params.num_iters; ++i) {
+      auto t_iter_start = std::chrono::steady_clock::now();
+
+      std::vector<float> in0_vec;
+      std::vector<float> in1_vec;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
+        in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.generate_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      std::vector<uint32_t> in0_packed;
+      std::vector<uint32_t> in1_packed;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
+        in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
+                                        /*row_major_input=*/true,
+                                        /*is_exp_a=*/false);
+
+        auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
+        in1_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
+                                        /*row_major_input=*/true,
+                                        /*is_exp_a=*/false);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
+        tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.write_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_written +=
+            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      std::vector<uint32_t> in0_readback;
+      std::vector<uint32_t> in1_readback;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
+        tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.read_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_read += static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      std::vector<float> in0_roundtrip;
+      std::vector<float> in1_roundtrip;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+
+        auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.inverse_transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      if (!params.bypass_check) {
+        float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
+        float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
+        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+          log_error(LogTest,
+                    "Host-only ComputeMM roundtrip check failed at iter {}: "
+                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                    i, in0_pcc, in1_pcc);
+          pass = false;
+          break;
+        }
+      }
+
+      auto t_iter_end = std::chrono::steady_clock::now();
+      stats.end_to_end_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                 t_iter_start)
+              .count();
+      completed_iters++;
+    }
+
+    log_info(LogTest,
+             "Host-only ComputeMM pipeline dims: Mt={}, Nt={}, Kt={}, "
+             "completed_iters={}",
+             Mt, Nt, Kt, completed_iters);
+    log_host_pipeline_stats("ComputeMM", stats, completed_iters);
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
+bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *device,
+                                     const TestParams &params) {
+  bool pass = true;
+  try {
+    log_info(LogTest,
+             "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
+
+    auto [Mt, Nt, Kt] =
+        get_aligned_input_tile_num(params.M, params.N, params.K);
+    (void)Kt;
+
+    if (params.num_iters == 0) {
+      log_error(LogTest, "Host-only Empty requires --num-iters > 0");
+      return false;
+    }
+
+    if (params.dtype != 0) {
+      log_error(LogTest,
+                "Host-only Empty currently supports only --dtype 0 "
+                "(BFP8 path), requested dtype={}",
+                params.dtype);
+      return false;
+    }
+
+    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+
+    uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
+    uint32_t num_tiles = Mt * Nt;
+    uint32_t tensor_size_bytes = num_tiles * single_tile_size;
+
+    auto *target_device = device->get_devices()[0];
+    auto tensor_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = target_device,
+        .size = tensor_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+
+    HostPipelineStats stats;
+    uint32_t completed_iters = 0;
+
+    for (uint32_t i = 0; i < params.num_iters; ++i) {
+      auto t_iter_start = std::chrono::steady_clock::now();
+
+      std::vector<float> tensor_vec;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        tensor_vec = generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.generate_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      std::vector<uint32_t> packed;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
+        packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
+                                    /*row_major_input=*/true,
+                                    /*is_exp_a=*/false);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::WriteToBuffer(tensor_buffer, packed);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.write_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_written += static_cast<uint64_t>(tensor_size_bytes);
+      }
+
+      std::vector<uint32_t> readback;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::ReadFromBuffer(tensor_buffer, readback);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.read_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
+      }
+
+      std::vector<float> roundtrip;
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        auto unpacked = unpack_bfp8_tiles_into_float_vec(
+            readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        roundtrip = untilize_swizzled(unpacked, Mt * 32, Nt * 32);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.inverse_transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      if (!params.bypass_check) {
+        float pcc = get_pcc(tensor_vec, roundtrip);
+        if (pcc < 0.99f) {
+          log_error(LogTest,
+                    "Host-only Empty roundtrip check failed at iter {}: "
+                    "pcc={:.4f}",
+                    i, pcc);
+          pass = false;
+          break;
+        }
+      }
+
+      auto t_iter_end = std::chrono::steady_clock::now();
+      stats.end_to_end_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                 t_iter_start)
+              .count();
+      completed_iters++;
+    }
+
+    log_info(LogTest,
+             "Host-only Empty pipeline dims: Mt={}, Nt={}, completed_iters={}",
+             Mt, Nt, completed_iters);
+    log_host_pipeline_stats("Empty", stats, completed_iters);
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////
 /// Empty Kernel Launch Test
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -2189,6 +2529,12 @@ int main(int argc, char **argv) {
     break;
   case TestType::SubDeviceMM:
     pass = test_sub_device_manager_mm(device_params.device.get(), params);
+    break;
+  case TestType::HostPipelineComputeMM:
+    pass = test_host_pipeline_compute_mm(device_params.device.get(), params);
+    break;
+  case TestType::HostPipelineEmpty:
+    pass = test_host_pipeline_empty_tensor(device_params.device.get(), params);
     break;
   default:
     log_error(tt::LogTest, "Invalid test type selected: {}",

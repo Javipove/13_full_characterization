@@ -1,7 +1,11 @@
 # Porject specific folders
 kernels/
+Python/
 
 # Generic build files
 build/
 *.o
+
+# Other non published/public files
+SoA_Analysis.md
 

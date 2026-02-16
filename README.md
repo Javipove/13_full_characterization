@@ -23,6 +23,68 @@ The benchmark supports the following test types, selected via the `--test` argum
         *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
         *   Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
 
+4.  **Host Pipeline ComputeMM (`--test 3`)**:
+    *   **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
+    *   **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
+    *   **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
+
+5.  **Host Pipeline Empty Tensor (`--test 4`)**:
+    *   **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
+    *   **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
+    *   **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
+
+## Host-Only Tests Deep Dive (`--test 3` vs `--test 4`)
+
+Both tests are **host-only data-path benchmarks**. They do not create a `Program`, do not create kernels, and do not dispatch workloads. They are intended to isolate host preprocessing and host<->device data movement costs.
+
+### Shared Pipeline Stages
+
+Each iteration executes:
+1. Generate FP32 tensor(s) on host.
+2. Transform to device-ready layout (`tilize_swizzled` + `pack_as_bfp8_tiles`).
+3. Write packed tensor(s) to DRAM (`WriteToBuffer`).
+4. Read packed tensor(s) back from DRAM (`ReadFromBuffer`).
+5. Inverse-transform (`unpack_bfp8_tiles_into_float_vec` + `untilize_swizzled`).
+6. Optionally validate roundtrip correlation (disabled with `--bypass-check`).
+
+### What Differentiates Them
+
+| Aspect | `--test 3` HostPipelineComputeMM | `--test 4` HostPipelineEmpty |
+| :--- | :--- | :--- |
+| Tensor count | 2 tensors (`in0`: MxK, `in1`: KxN) | 1 tensor (MxN) |
+| Goal | Emulate full ComputeMM input pipeline overhead | Provide minimal baseline for host data path |
+| Transfer volume per iteration | `bytes(in0) + bytes(in1)` for write/read | `bytes(tensor)` for write/read |
+| Validation | PCC on both roundtrips (`in0`, `in1`) | PCC on single roundtrip |
+| Best use | End-to-end host preprocessing scaling for matmul workloads | Compare against test 3 to estimate second-tensor overhead |
+
+### Reported Metrics
+
+- `generate`: host-side random tensor generation.
+- `transform`: tilize + pack to BFP8 format.
+- `write`: DRAM write time for packed tensor payloads.
+- `read`: DRAM read time for packed tensor payloads.
+- `inverse_transform`: unpack + untilize back to row-major FP32.
+- `end_to_end`: full iteration wall time.
+- Throughput summary: total bytes and effective GB/s for write and read.
+
+Current constraints:
+- Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
+- `--num-iters` must be greater than 0.
+
+## Validation Status (Current Debugging Campaign)
+
+The table below tracks **only configurations explicitly tested in this repository session**.
+
+| Test | Mode | Grid | Status | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `--test 1` (ComputeMM) | `--dram` | `6x6` | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
+| `--test 1` (ComputeMM) | `--dram` | `1x1` | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
+| `--test 1` (ComputeMM) | `--dram` | `2x2` | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
+
+Notes:
+- This section is intentionally conservative and only lists runs that were explicitly reported/tested.
+- Other combinations (`--test 0`, `--test 2`, host-only tests, L1 mode variants, different matrix shapes) are not marked as validated here yet.
+
 ### Partitioning Logic Examples
 The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core-groups`:
 
@@ -59,7 +121,7 @@ Use the provided shell script `run_full_charac.sh` to compile and run the tests.
 
 | Argument | Default | Description |
 | :--- | :--- | :--- |
-| `--test <ID>` | `2` | Test Type ID (0=Empty, 1=ComputeMM, 2=SubDevice). |
+| `--test <ID>` | `5` | Test Type ID (0=Empty, 1=ComputeMM, 2=SubDevice, 3=HostPipelineComputeMM, 4=HostPipelineEmpty). |
 | `--x_size <N>` | `0` (Max) | Number of columns in the core grid. |
 | `--y_size <N>` | `0` (Max) | Number of rows in the core grid. |
 | `--num-iters <N>` | `15` | Number of iterations to run the dispatch loop. |
@@ -96,6 +158,16 @@ Use the provided shell script `run_full_charac.sh` to compile and run the tests.
 **4. Run Sub-Device Parallelism Test (Requires >= 2 rows):**
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 2 --x_size 8 --y_size 4
+```
+
+**5. Run Host-Only ComputeMM Pipeline (no kernels):**
+```bash
+./run_full_charac.sh ./build/test/test_full_charac --test 3 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
+```
+
+**6. Run Host-Only Empty Tensor Pipeline (no kernels):**
+```bash
+./run_full_charac.sh ./build/test/test_full_charac --test 4 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
 ```
 
 ## Profiling
