@@ -729,7 +729,8 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 // This function assumes a contiguous layout starting from `l1_unreserved_base`.
 // Structure: [IN0_CB][IN1_CB][IN2_CB][OUT_CB][...Free Space...]
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
-std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+           uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
                           uint32_t l1_unreserved_base, bool use_dram) {
@@ -742,7 +743,9 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
       per_core_Nt * in0_block_w * num_buffer * single_tile_size;
   uint32_t in2_cb_addr = in1_cb_addr + in1_cb_size;
   uint32_t in2_cb_size = single_tile_size;
-  uint32_t out_cb_addr = in2_cb_addr + in2_cb_size;
+  uint32_t interm_cb_addr = in2_cb_addr + in2_cb_size;
+  uint32_t interm_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
+  uint32_t out_cb_addr = interm_cb_addr + interm_cb_size;
   uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
 
   // In DRAM mode, data tensors live in DRAM — don't allocate L1 for them.
@@ -758,7 +761,7 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
     out_addr = in1_addr + (per_core_in1_tiles * single_tile_size);
   }
 
-  return {in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+  return {in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
           in0_addr,    in1_addr,    out_addr};
 }
 
@@ -1212,8 +1215,8 @@ void create_program_compute_mm(
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t out_block_h, uint32_t out_block_w, uint32_t num_blocks_h,
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
-    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t in0_addr,
-    uint32_t in1_addr, uint32_t out_addr, bool use_dram,
+    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
+    uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
     tt_metal::Program &program, uint32_t start_core_y) {
 
   // ---- Step 1: Define buffer sizes in tiles ----
@@ -1309,8 +1312,8 @@ void create_program_compute_mm(
 
   tt_metal::CircularBufferConfig cb_out =
       tt_metal::CircularBufferConfig(out_CB_size,
-                                     {{tt::CBIndex::c_16, cb_data_format},
-                                      {tt::CBIndex::c_24, cb_data_format}})
+                                     {{tt::CBIndex::c_16, cb_data_format, out_cb_addr},
+                                      {tt::CBIndex::c_24, cb_data_format, interm_cb_addr}})
           .set_page_size(tt::CBIndex::c_16, single_tile_size)
           .set_page_size(tt::CBIndex::c_24, single_tile_size);
   tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_out);
@@ -1622,8 +1625,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         get_out_subblock_params(out_block_h, out_block_w);
 
     // 3. Buffer Addresses (use out_block dims for CB sizing)
-    auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
-          in1_addr, out_addr] =
+    auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
+          in0_addr, in1_addr, out_addr] =
         get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
                                   single_tile_size, l1_unreserved_base,
                                   params.use_dram);
@@ -1654,8 +1657,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h, out_subblock_w,
         per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
         num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
-        effective_in0_addr, effective_in1_addr, effective_out_addr,
-        params.use_dram, program);
+        interm_cb_addr, effective_in0_addr, effective_in1_addr,
+        effective_out_addr, params.use_dram, program);
 
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
     mesh_workload.add_program(
