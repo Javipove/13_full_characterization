@@ -534,8 +534,8 @@ void create_program_compute_mm(
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t out_block_h, uint32_t out_block_w, uint32_t num_blocks_h,
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
-    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t in0_addr,
-    uint32_t in1_addr, uint32_t out_addr, bool use_dram,
+    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
+    uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
     tt_metal::Program &program, uint32_t start_core_y = 0);
 
 // Generates random FP32 input matrices, tilizes/packs them, and transfers
@@ -647,7 +647,7 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
           single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
           out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, per_core_Mt,
           per_core_Nt, 1, 1, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
-          in0_addr, in1_addr, out_addr,
+          interm_cb_addr, in0_addr, in1_addr, out_addr,
           /*use_dram=*/false, program, start_y);
 
       // Prepare Inputs for this split
