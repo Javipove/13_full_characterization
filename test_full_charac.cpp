@@ -1312,23 +1312,17 @@ void create_program_compute_mm(
           .set_page_size(tt::CBIndex::c_2, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
 
-  // Separate allocations for Output (cb_16) and Intermediate (cb_24)
-  // to avoid aliasing and deadlock.
-  std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
-      {(uint8_t)tt::CBIndex::c_16, cb_data_format}};
+    // Output + intermediate CBs are configured together to match upstream
+    // 1_compute_mm behavior for bmm_large_block_zm_fused_bias_activation.
+    std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
+      {(uint8_t)tt::CBIndex::c_16, cb_data_format},
+      {(uint8_t)tt::CBIndex::c_24, cb_data_format}};
   tt_metal::CircularBufferConfig cb_out_config =
       tt_metal::CircularBufferConfig(out_CB_size, cb_out_config_map)
-          .set_page_size(tt::CBIndex::c_16, single_tile_size);
+        .set_page_size(tt::CBIndex::c_16, single_tile_size)
+        .set_page_size(tt::CBIndex::c_24, single_tile_size);
   tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
                                  cb_out_config);
-
-  std::map<uint8_t, tt::DataFormat> cb_interm_config_map = {
-      {(uint8_t)tt::CBIndex::c_24, cb_data_format}};
-  tt_metal::CircularBufferConfig cb_interm_config =
-      tt_metal::CircularBufferConfig(out_CB_size, cb_interm_config_map)
-          .set_page_size(tt::CBIndex::c_24, single_tile_size);
-  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
-                                 cb_interm_config);
 
   // ---- Step 4: Create Data Movement and Compute Kernels ----
   // The kernel binary path determines whether data is read from L1 or DRAM.
