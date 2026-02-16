@@ -63,12 +63,7 @@ void kernel_main() {
       get_arg_val<uint32_t>(35); // out_block_w for output column advance
 
   constexpr uint32_t cb_id_in1 = 1;
-  constexpr uint32_t cb_id_in2 = 2; // Zeros
   constexpr uint32_t cb_id_out0 = 16;
-
-  (void)in2_cb_addr;
-  (void)noc_x;
-  (void)noc_y;
 
   // Use Interleaved DRAM Reading/Writing
   const uint32_t in1_single_tile_size_bytes = get_tile_size(cb_id_in1);
@@ -85,15 +80,8 @@ void kernel_main() {
       .page_size = out_single_tile_size_bytes,
       .data_format = out_data_format};
 
-  // Fill tile with zeros
-  cb_reserve_back(cb_id_in2, 1);
-  uint32_t l1_zeros_addr_in2 = get_write_ptr(cb_id_in2);
-  uint64_t l1_zeros_addr_in2_noc = get_noc_addr(l1_zeros_addr_in2);
-  const uint32_t in2_single_tile_size_bytes = get_tile_size(cb_id_in2);
-  volatile uint32_t *in2_l1_ptr = reinterpret_cast<volatile uint32_t *>(l1_zeros_addr_in2);
-  for (uint32_t i = 0; i < in2_single_tile_size_bytes / sizeof(uint32_t); i++) {
-    in2_l1_ptr[i] = 0;
-  }
+  // Zeros source tile provided by host at in2_cb_addr in local L1
+  uint64_t l1_zeros_addr_in2_noc = get_noc_addr(noc_x, noc_y, in2_cb_addr);
 
   for (uint32_t bh = 0; bh < num_blocks_h_dim; bh++) {
     uint32_t in1_bw_start = in1_tensor_start_tile_id; // B resets for each bh
