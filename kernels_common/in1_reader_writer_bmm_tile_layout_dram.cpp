@@ -52,6 +52,16 @@ void kernel_main() {
   uint32_t padded_subblock_tiles_addr_skip = get_arg_val<uint32_t>(29);
   uint32_t padded_block_tiles_w_skip = get_arg_val<uint32_t>(30);
 
+  // Multi-block args (TTNN-aligned)
+  uint32_t num_blocks_h_dim = get_arg_val<uint32_t>(31);
+  uint32_t num_blocks_w_dim = get_arg_val<uint32_t>(32);
+  uint32_t in1_w_dim_stride =
+      get_arg_val<uint32_t>(33); // out_block_w for IN1 column advance
+  uint32_t out_h_dim_stride =
+      get_arg_val<uint32_t>(34); // out_block_h * Nt for output row advance
+  uint32_t out_w_dim_stride =
+      get_arg_val<uint32_t>(35); // out_block_w for output column advance
+
   constexpr uint32_t cb_id_in1 = 1;
   constexpr uint32_t cb_id_in2 = 2; // Zeros
   constexpr uint32_t cb_id_out0 = 16;
@@ -75,79 +85,92 @@ void kernel_main() {
   cb_reserve_back(cb_id_in2, 1);
   uint64_t l1_zeros_addr_in2_noc = get_noc_addr(get_write_ptr(cb_id_in2));
 
-  // in1 reader
-  uint32_t l1_write_addr_in1;
-  uint32_t in1_tensor_current_block_start_tile_id = in1_tensor_start_tile_id;
-  for (uint32_t block = 0; block < num_blocks; block++) {
-    cb_reserve_back(cb_id_in1, in1_block_num_tiles);
-    l1_write_addr_in1 = get_write_ptr(cb_id_in1);
+  for (uint32_t bh = 0; bh < num_blocks_h_dim; bh++) {
+    uint32_t in1_bw_start = in1_tensor_start_tile_id; // B resets for each bh
+    uint32_t out_bw_start = out_tensor_start_tile_id;
 
-    uint32_t in1_tensor_row_start_tile_id =
-        in1_tensor_current_block_start_tile_id;
-    for (uint32_t h = 0; h < in1_block_h; h++) {
-      uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
-      for (uint32_t w = 0; w < in1_block_w; w++) {
-        if (w < last_block_w) {
-          noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
-        } else {
-          noc_async_read(l1_zeros_addr_in2_noc, l1_write_addr_in1,
-                         in1_single_tile_size_bytes);
+    for (uint32_t bw = 0; bw < num_blocks_w_dim; bw++) {
+
+      // ===== IN1 READER =====
+      uint32_t l1_write_addr_in1;
+      uint32_t in1_tensor_current_block_start_tile_id = in1_bw_start;
+      for (uint32_t block = 0; block < num_blocks; block++) {
+        cb_reserve_back(cb_id_in1, in1_block_num_tiles);
+        l1_write_addr_in1 = get_write_ptr(cb_id_in1);
+
+        uint32_t in1_tensor_row_start_tile_id =
+            in1_tensor_current_block_start_tile_id;
+        for (uint32_t h = 0; h < in1_block_h; h++) {
+          uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
+          for (uint32_t w = 0; w < in1_block_w; w++) {
+            if (w < last_block_w) {
+              noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
+            } else {
+              noc_async_read(l1_zeros_addr_in2_noc, l1_write_addr_in1,
+                             in1_single_tile_size_bytes);
+            }
+            l1_write_addr_in1 += in1_single_tile_size_bytes;
+            in1_tensor_tile_id += in1_tensor_stride_w;
+          }
+          in1_tensor_row_start_tile_id += in1_tensor_stride_h;
         }
-        l1_write_addr_in1 += in1_single_tile_size_bytes;
-        in1_tensor_tile_id += in1_tensor_stride_w;
-      }
-      in1_tensor_row_start_tile_id += in1_tensor_stride_h;
-    }
-    // Critical Fix: Update block stride for DRAM
-    in1_tensor_current_block_start_tile_id += in1_tensor_next_block_stride;
+        in1_tensor_current_block_start_tile_id += in1_tensor_next_block_stride;
 
-    noc_async_read_barrier();
-    cb_push_back(cb_id_in1, in1_block_num_tiles);
-  }
-
-  // writer
-  uint32_t out_tensor_sbh_start_tile_id = out_tensor_start_tile_id;
-  for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h; sbh++) {
-    uint32_t out_tensor_sbw_start_tile_id = out_tensor_sbh_start_tile_id;
-    for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w; sbw++) {
-      uint32_t out_tensor_sb_row_start_tile_id = out_tensor_sbw_start_tile_id;
-
-      uint32_t out_subblock_h_ = out_subblock_h;
-      uint32_t out_subblock_w_ = out_subblock_w;
-      uint32_t subblock_tiles_addr_skip = 0;
-      if (sbh == out_num_nonzero_subblocks_h - 1) {
-        out_subblock_h_ = out_last_subblock_h;
-      }
-      if (sbw == out_num_nonzero_subblocks_w - 1) {
-        out_subblock_w_ = out_last_subblock_w;
-        subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
+        noc_async_read_barrier();
+        cb_push_back(cb_id_in1, in1_block_num_tiles);
       }
 
-      cb_wait_front(cb_id_out0, out_subblock_tile_count);
-      uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
+      // ===== OUTPUT WRITER =====
+      uint32_t out_tensor_sbh_start_tile_id = out_bw_start;
+      for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h; sbh++) {
+        uint32_t out_tensor_sbw_start_tile_id = out_tensor_sbh_start_tile_id;
+        for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w; sbw++) {
+          uint32_t out_tensor_sb_row_start_tile_id =
+              out_tensor_sbw_start_tile_id;
 
-      for (uint32_t h = 0; h < out_subblock_h_; h++) {
-        uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
-        for (uint32_t w = 0; w < out_subblock_w_; w++) {
-          noc_async_write_tile(out_tensor_tile_id, s_out, l1_read_addr);
-          l1_read_addr += out_single_tile_size_bytes;
-          out_tensor_tile_id += out_tensor_stride_w;
+          uint32_t out_subblock_h_ = out_subblock_h;
+          uint32_t out_subblock_w_ = out_subblock_w;
+          uint32_t subblock_tiles_addr_skip = 0;
+          if (sbh == out_num_nonzero_subblocks_h - 1) {
+            out_subblock_h_ = out_last_subblock_h;
+          }
+          if (sbw == out_num_nonzero_subblocks_w - 1) {
+            out_subblock_w_ = out_last_subblock_w;
+            subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
+          }
+
+          cb_wait_front(cb_id_out0, out_subblock_tile_count);
+          uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
+
+          for (uint32_t h = 0; h < out_subblock_h_; h++) {
+            uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
+            for (uint32_t w = 0; w < out_subblock_w_; w++) {
+              noc_async_write_tile(out_tensor_tile_id, s_out, l1_read_addr);
+              l1_read_addr += out_single_tile_size_bytes;
+              out_tensor_tile_id += out_tensor_stride_w;
+            }
+            // Skip padded tiles in subblock along row
+            l1_read_addr += subblock_tiles_addr_skip;
+            out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
+          }
+
+          noc_async_write_barrier();
+          cb_pop_front(cb_id_out0, out_subblock_tile_count);
+          out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
         }
-        // Skip padded tiles in subblock along row
-        l1_read_addr += subblock_tiles_addr_skip;
-        out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
+        // Pop fully padded subblocks along the row
+        cb_wait_front(cb_id_out0, padded_block_tiles_w_skip);
+        cb_pop_front(cb_id_out0, padded_block_tiles_w_skip);
+        out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
       }
+      // Pop row(s) of fully padded subblocks
+      cb_wait_front(cb_id_out0, padded_block_tiles_h_skip);
+      cb_pop_front(cb_id_out0, padded_block_tiles_h_skip);
 
-      noc_async_write_barrier();
-      cb_pop_front(cb_id_out0, out_subblock_tile_count);
-      out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
-    }
-    // Pop fully padded subblocks along the row
-    cb_wait_front(cb_id_out0, padded_block_tiles_w_skip);
-    cb_pop_front(cb_id_out0, padded_block_tiles_w_skip);
-    out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
-  }
-  // Pop row(s) of fully padded subblocks
-  cb_wait_front(cb_id_out0, padded_block_tiles_h_skip);
-  cb_pop_front(cb_id_out0, padded_block_tiles_h_skip);
+      in1_bw_start += in1_w_dim_stride; // B columns advance with bw
+      out_bw_start += out_w_dim_stride; // output columns advance with bw
+    } // bw
+    out_tensor_start_tile_id += out_h_dim_stride; // output rows advance with bh
+    // IN1 start does NOT advance with bh — B is reused across M-blocks
+  } // bh
 }
