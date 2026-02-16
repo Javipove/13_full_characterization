@@ -1106,11 +1106,21 @@ BenchmarkInputs prepare_inputs_compute_mm(
               .buffer_type = tt_metal::BufferType::DRAM});
     }
 
-    // ---- DRAM Step 4: No host-side L1 write for in2 ----
-    // DRAM reader/writer kernels reserve/use cb_id_in2 directly via
-    // get_write_ptr(cb_id_in2). Writing to host-computed in2_cb_addr here is
-    // redundant and may be unsafe on versions where CB addresses are
-    // allocator-assigned rather than host-fixed.
+    // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
+    // DRAM writer kernel uses in2_cb_addr as zero source (same contract as
+    // L1 writer path), so each participating core receives one zero tile.
+    {
+      ZoneScopedN("Initialize DRAM in2 zero tile");
+      uint32_t num_cores_y = core_range.y;
+      uint32_t num_cores_x = core_range.x;
+      for (uint32_t y = 0; y < num_cores_y; y++) {
+        for (uint32_t x = 0; x < num_cores_x; x++) {
+          CoreCoord core = {(std::size_t)x, (std::size_t)(y + start_core_y)};
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
+                                            in2);
+        }
+      }
+    }
 
   } else {
     // ===========================================================================
@@ -1504,7 +1514,7 @@ void create_program_compute_mm(
       std::vector<uint32_t> writer_args;
 
       if (use_dram) {
-        // === DRAM Reader Args (15 args) ===
+        // === DRAM Reader Args (16 args) ===
         // Matches in0_reader_bmm_tile_layout_dram.cpp get_arg_val indices
         uint32_t in0_start_tile_id = y * per_core_Mt * Kt; // global row * Kt
         reader_args = {
@@ -1523,6 +1533,7 @@ void create_program_compute_mm(
             num_blocks_h,              // 12: num_blocks_h_dim
             num_blocks_w,              // 13: num_blocks_w_dim
             out_block_h * Kt,          // 14: in0_h_dim_stride
+            in2_cb_addr,               // 15: in2_cb_addr (zeros source)
         };
 
         // === DRAM Writer Args (36 args) ===
