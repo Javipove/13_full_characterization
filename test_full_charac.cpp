@@ -132,6 +132,7 @@ constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 // constexpr uint32_t DEFAULT_KERNEL_SIZE_K = 1;
 // constexpr uint32_t MAX_CBS = 32;
 constexpr uint32_t MAX_ARGS = 255;
+constexpr uint32_t L1_SAFETY_MARGIN_BYTES = 64 * 1024;
 
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
@@ -362,7 +363,7 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
           per_core_in0_size + per_core_in1_size + per_core_out_size;
     }
 
-    if (base_addr + total_l1_needed <= l1_size) {
+    if (base_addr + total_l1_needed + L1_SAFETY_MARGIN_BYTES <= l1_size) {
       in0_block_w = choice;
       break;
     }
@@ -392,7 +393,11 @@ std::tuple<uint32_t, uint32_t, uint32_t>
 get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
                               uint32_t Kt, uint32_t single_tile_size,
                               uint32_t l1_size, uint32_t l1_unreserved_base) {
-  uint32_t avail_l1 = l1_size - l1_unreserved_base;
+  uint32_t raw_avail_l1 = l1_size - l1_unreserved_base;
+  uint32_t avail_l1 =
+      (raw_avail_l1 > L1_SAFETY_MARGIN_BYTES)
+          ? (raw_avail_l1 - L1_SAFETY_MARGIN_BYTES)
+          : raw_avail_l1;
 
   // Helper: check if a given (obh, obw, bw) fits in L1
   auto fits_l1 = [&](uint32_t obh, uint32_t obw, uint32_t bw) -> bool {
@@ -1065,16 +1070,11 @@ BenchmarkInputs prepare_inputs_compute_mm(
               .buffer_type = tt_metal::BufferType::DRAM});
     }
 
-    // ---- DRAM Step 4: Write zeros to each core's L1 at in2_cb_addr ----
-    // Even in DRAM mode, the compute kernel still needs the bias/padding tile
-    // to be present in L1. We write zeros since we don't use bias.
-    for (int r = 0; r < (int)core_range.y; r++) {
-      for (int c = 0; c < (int)core_range.x; c++) {
-        CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
-        tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
-                                          in2);
-      }
-    }
+    // ---- DRAM Step 4: No host-side L1 write for in2 ----
+    // DRAM reader/writer kernels reserve/use cb_id_in2 directly via
+    // get_write_ptr(cb_id_in2). Writing to host-computed in2_cb_addr here is
+    // redundant and may be unsafe on versions where CB addresses are
+    // allocator-assigned rather than host-fixed.
 
   } else {
     // ===========================================================================
@@ -1659,9 +1659,9 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
       log_info(LogTest,
                "DRAM blocking: per_core={}x{}, out_block={}x{}, "
-               "num_blocks={}x{}, in0_block_w={}",
+               "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
                per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
-               num_blocks_w, in0_block_w);
+               num_blocks_w, in0_block_w, L1_SAFETY_MARGIN_BYTES / 1024);
     } else {
       // L1 mode: full per-core dims fit (no multi-block needed)
       out_block_h = per_core_Mt;
