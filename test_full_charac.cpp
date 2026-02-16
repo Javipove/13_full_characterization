@@ -346,9 +346,10 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in2_cb_size = single_tile_size;
     uint32_t intermediate_cb_size =
         per_core_Mt * per_core_Nt * single_tile_size;
+    uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
 
-    uint32_t total_cb_size =
-        in0_cb_size + in1_cb_size + in2_cb_size + intermediate_cb_size;
+    uint32_t total_cb_size = in0_cb_size + in1_cb_size + in2_cb_size +
+                             intermediate_cb_size + out_cb_size;
 
     // In DRAM mode, data tensors live in DRAM, not L1.
     // Only circular buffers need L1 space.
@@ -559,7 +560,8 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
                                                        uint32_t per_core_Nt,
                                                        uint32_t choice = 0);
 
-std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+           uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
                           uint32_t l1_unreserved_base, bool use_dram = false);
@@ -633,8 +635,8 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
       auto [out_subblock_h, out_subblock_w] =
           get_out_subblock_params(per_core_Mt, per_core_Nt);
 
-      auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
-            in1_addr, out_addr] =
+      auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
+            in0_addr, in1_addr, out_addr] =
           get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
                                     single_tile_size, l1_unreserved_base);
 
@@ -729,8 +731,8 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 // This function assumes a contiguous layout starting from `l1_unreserved_base`.
 // Structure: [IN0_CB][IN1_CB][IN2_CB][OUT_CB][...Free Space...]
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
-std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-           uint32_t, uint32_t>
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+           uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
                           uint32_t l1_unreserved_base, bool use_dram) {
@@ -761,8 +763,8 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
     out_addr = in1_addr + (per_core_in1_tiles * single_tile_size);
   }
 
-  return {in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
-          in0_addr,    in1_addr,    out_addr};
+  return {in0_cb_addr,    in1_cb_addr, in2_cb_addr, out_cb_addr,
+          interm_cb_addr, in0_addr,    in1_addr,    out_addr};
 }
 
 // MODIFIED: Added Tracy ZoneScopedN for profiling.
@@ -1310,13 +1312,23 @@ void create_program_compute_mm(
           .set_page_size(tt::CBIndex::c_2, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
 
-  tt_metal::CircularBufferConfig cb_out =
-      tt_metal::CircularBufferConfig(out_CB_size,
-                                     {{tt::CBIndex::c_16, cb_data_format, out_cb_addr},
-                                      {tt::CBIndex::c_24, cb_data_format, interm_cb_addr}})
-          .set_page_size(tt::CBIndex::c_16, single_tile_size)
+  // Separate allocations for Output (cb_16) and Intermediate (cb_24)
+  // to avoid aliasing and deadlock.
+  std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
+      {(uint8_t)tt::CBIndex::c_16, cb_data_format}};
+  tt_metal::CircularBufferConfig cb_out_config =
+      tt_metal::CircularBufferConfig(out_CB_size, cb_out_config_map)
+          .set_page_size(tt::CBIndex::c_16, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
+                                 cb_out_config);
+
+  std::map<uint8_t, tt::DataFormat> cb_interm_config_map = {
+      {(uint8_t)tt::CBIndex::c_24, cb_data_format}};
+  tt_metal::CircularBufferConfig cb_interm_config =
+      tt_metal::CircularBufferConfig(out_CB_size, cb_interm_config_map)
           .set_page_size(tt::CBIndex::c_24, single_tile_size);
-  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_out);
+  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
+                                 cb_interm_config);
 
   // ---- Step 4: Create Data Movement and Compute Kernels ----
   // The kernel binary path determines whether data is read from L1 or DRAM.
