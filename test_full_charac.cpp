@@ -369,6 +369,95 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
   return in0_block_w;
 }
 
+// TTNN-aligned L1 fitting for DRAM mode.
+// Finds the largest (out_block_h, out_block_w, in0_block_w) such that the
+// circular buffers fit within available L1.
+//
+// Algorithm (matching TTNN's get_multi_dim_per_core_factor):
+//   1. Enumerate all divisor pairs of per_core_M and per_core_N
+//   2. Sort by product (largest first), then by squareness
+//   3. For each (obh, obw), try in0_block_w from Kt down to 1
+//   4. Return the first combination where CBs fit L1
+//
+// CB budget: in0_CB + in1_CB + in2_CB + out_CB + interm_CB <= avail_L1
+//   in0_CB = out_block_h * in0_block_w * 2 * tile_size  (double-buffered)
+//   in1_CB = out_block_w * in0_block_w * 2 * tile_size  (double-buffered)
+//   in2_CB = tile_size                                    (zeros tile)
+//   out_CB = out_block_h * out_block_w * tile_size        (output block)
+//   interm = out_block_h * out_block_w * tile_size        (FP32 partials)
+//
+// Returns {out_block_h, out_block_w, in0_block_w}
+std::tuple<uint32_t, uint32_t, uint32_t>
+get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
+                              uint32_t Kt, uint32_t single_tile_size,
+                              uint32_t l1_size, uint32_t l1_unreserved_base) {
+  uint32_t avail_l1 = l1_size - l1_unreserved_base;
+
+  // Helper: check if a given (obh, obw, bw) fits in L1
+  auto fits_l1 = [&](uint32_t obh, uint32_t obw, uint32_t bw) -> bool {
+    uint32_t in0_cb = obh * bw * 2 * single_tile_size; // double-buffered
+    uint32_t in1_cb = obw * bw * 2 * single_tile_size; // double-buffered
+    uint32_t in2_cb = single_tile_size;                // zeros
+    uint32_t out_cb = obh * obw * single_tile_size;    // output
+    uint32_t interm = obh * obw * single_tile_size;    // FP32 partials
+    return (in0_cb + in1_cb + in2_cb + out_cb + interm) <= avail_l1;
+  };
+
+  // Try full dimensions first
+  if (fits_l1(per_core_M, per_core_N, Kt)) {
+    return {per_core_M, per_core_N, Kt};
+  }
+
+  // Enumerate divisors
+  auto get_divisors = [](uint32_t n) -> std::vector<uint32_t> {
+    std::vector<uint32_t> divs;
+    for (uint32_t i = 1; i <= n; i++) {
+      if (n % i == 0)
+        divs.push_back(i);
+    }
+    return divs;
+  };
+
+  auto m_factors = get_divisors(per_core_M);
+  auto n_factors = get_divisors(per_core_N);
+
+  // Build (m, n) pairs sorted by product descending, then squareness
+  struct Pair {
+    uint32_t m, n;
+    uint32_t product;
+    float ratio;
+  };
+  std::vector<Pair> pairs;
+  for (auto mf : m_factors) {
+    for (auto nf : n_factors) {
+      float mx = (float)std::max(mf, nf);
+      float mn = (float)std::min(mf, nf);
+      pairs.push_back({mf, nf, mf * nf, mx / mn});
+    }
+  }
+  // Sort: largest product first, then most square
+  std::sort(pairs.begin(), pairs.end(), [](const Pair &a, const Pair &b) {
+    if (a.product != b.product)
+      return a.product > b.product;
+    return a.ratio < b.ratio;
+  });
+
+  // Try each (m, n) pair with decreasing in0_block_w
+  for (auto &p : pairs) {
+    // Try in0_block_w from largest possible down to 1
+    // Must be a divisor of Kt (or at least work with integer K-blocks)
+    for (uint32_t bw = Kt; bw >= 1; bw--) {
+      if (Kt % bw != 0)
+        continue;
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
+  // Fallback: 1x1 with bw=1 should always fit
+  return {1, 1, 1};
+}
 ////////////////////////////////////////////////////////////////////////////////
 // Helper Struct for Benchmark I/O
 //
@@ -442,10 +531,11 @@ void create_program_compute_mm(
     uint32_t single_tile_size, CoreCoord core_range, uint32_t Mt, uint32_t Nt,
     uint32_t Kt, uint32_t in0_block_w, uint32_t out_subblock_h,
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
-    uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
-    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_addr, bool use_dram, tt_metal::Program &program,
-    uint32_t start_core_y = 0);
+    uint32_t out_block_h, uint32_t out_block_w, uint32_t num_blocks_h,
+    uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
+    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t in0_addr,
+    uint32_t in1_addr, uint32_t out_addr, bool use_dram,
+    tt_metal::Program &program, uint32_t start_core_y = 0);
 
 // Generates random FP32 input matrices, tilizes/packs them, and transfers
 // them to the device. Returns a BenchmarkInputs struct.
@@ -472,7 +562,7 @@ std::tuple<uint32_t, uint32_t> get_out_subblock_params(uint32_t per_core_Mt,
 std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>
 get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
                           uint32_t in0_block_w, uint32_t single_tile_size,
-                          uint32_t l1_unreserved_base, bool use_dram);
+                          uint32_t l1_unreserved_base, bool use_dram = false);
 
 //! Phase 2: Sub-Device Parallelism Test
 //! Partitions the device into 2 Sub-Devices and runs independent MM workloads
@@ -549,11 +639,13 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
                                     single_tile_size, l1_unreserved_base);
 
       // Create Kernels/Buffers (Appends to program using strict CoreRange)
+      // L1 mode: out_block_h/w == per_core_Mt/Nt, num_blocks = 1
       create_program_compute_mm(
           device, data_format, math_fidelity, fp32_dest_acc_en,
           single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
-          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, in0_cb_addr,
-          in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr, in1_addr, out_addr,
+          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, per_core_Mt,
+          per_core_Nt, 1, 1, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+          in0_addr, in1_addr, out_addr,
           /*use_dram=*/false, program, start_y);
 
       // Prepare Inputs for this split
@@ -1118,22 +1210,25 @@ void create_program_compute_mm(
     uint32_t single_tile_size, CoreCoord core_range, uint32_t Mt, uint32_t Nt,
     uint32_t Kt, uint32_t in0_block_w, uint32_t out_subblock_h,
     uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
-    uint32_t in0_cb_addr, uint32_t in1_cb_addr, uint32_t in2_cb_addr,
-    uint32_t out_cb_addr, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_addr, bool use_dram, tt_metal::Program &program,
-    uint32_t start_core_y) {
+    uint32_t out_block_h, uint32_t out_block_w, uint32_t num_blocks_h,
+    uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
+    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t in0_addr,
+    uint32_t in1_addr, uint32_t out_addr, bool use_dram,
+    tt_metal::Program &program, uint32_t start_core_y) {
 
   // ---- Step 1: Define buffer sizes in tiles ----
   // Double buffering (num_buffer=2) allows the reader/writer to fill one
   // buffer while the compute engine processes the other, hiding data
   // movement latency behind compute.
+  // CB sizes use out_block_h/w (reduced dims for DRAM multi-block)
+  // In L1 mode, out_block_h == per_core_Mt and out_block_w == per_core_Nt.
   uint32_t num_buffer = 2;
-  uint32_t in0_block_tiles = per_core_Mt * in0_block_w;
+  uint32_t in0_block_tiles = out_block_h * in0_block_w;
   uint32_t in0_CB_tiles = in0_block_tiles * num_buffer;
-  uint32_t in1_block_tiles = per_core_Nt * in0_block_w;
+  uint32_t in1_block_tiles = out_block_w * in0_block_w;
   uint32_t in1_CB_tiles = in1_block_tiles * num_buffer;
-  uint32_t out_block_tiles = per_core_Mt * per_core_Nt;
-  uint32_t out_CB_tiles = out_block_tiles;
+  uint32_t out_block_tiles_count = out_block_h * out_block_w;
+  uint32_t out_CB_tiles = out_block_tiles_count;
   uint32_t out_CB_size = out_CB_tiles * single_tile_size;
 
   // ---- Step 2: Compute kernel compile-time arguments ----
@@ -1147,30 +1242,36 @@ void create_program_compute_mm(
   // in0_subblock_num_tiles: tiles in one subblock of IN0
   // out_subblock_h/w:       subblock dimensions for register accumulation
   // out_subblock_num_tiles: tiles in one output subblock (must fit in DST)
+  // Subblocks are computed from out_block_h/w (NOT per_core_Mt/Nt)
   uint32_t num_blocks = (Kt / in0_block_w);
-  uint32_t in0_num_subblocks = (per_core_Mt / out_subblock_h);
+  uint32_t in0_num_subblocks = (out_block_h / out_subblock_h);
   uint32_t in0_block_num_tiles =
       out_subblock_h * in0_block_w * in0_num_subblocks;
   uint32_t in0_subblock_num_tiles = out_subblock_h * in0_block_w;
-  uint32_t in1_num_subblocks = (per_core_Nt / out_subblock_w);
+  uint32_t in1_num_subblocks = (out_block_w / out_subblock_w);
   uint32_t in1_block_num_tiles =
       out_subblock_w * in0_block_w * in1_num_subblocks;
   uint32_t in1_per_core_w = out_subblock_w * in1_num_subblocks;
   uint32_t out_subblock_num_tiles = out_subblock_h * out_subblock_w;
 
-  std::vector<uint32_t> compute_kernel_args = {in0_block_w,
-                                               in0_num_subblocks,
-                                               in0_block_num_tiles,
-                                               in0_subblock_num_tiles,
-                                               in1_num_subblocks,
-                                               in1_block_num_tiles,
-                                               in1_per_core_w,
-                                               num_blocks,
-                                               out_subblock_h,
-                                               out_subblock_w,
-                                               out_subblock_num_tiles,
-                                               1,
-                                               per_core_Mt * per_core_Nt};
+  // Compute kernel args: 14 args (0-13)
+  // Args 12-13 are the TTNN-aligned outer block loop dimensions.
+  // When num_blocks_h/w == 1, the kernel behaves identically to before.
+  std::vector<uint32_t> compute_kernel_args = {
+      in0_block_w,            // 0
+      in0_num_subblocks,      // 1
+      in0_block_num_tiles,    // 2
+      in0_subblock_num_tiles, // 3
+      in1_num_subblocks,      // 4
+      in1_block_num_tiles,    // 5
+      in1_per_core_w,         // 6
+      num_blocks,             // 7
+      out_subblock_h,         // 8
+      out_subblock_w,         // 9
+      out_subblock_num_tiles, // 10
+      1,                      // 11: batch
+      num_blocks_w,           // 12: out_num_blocks_x
+      num_blocks_h};          // 13: out_num_blocks_y
 
   CoreRange all_cores({(std::size_t)0, (std::size_t)start_core_y},
                       {(std::size_t)core_range.x - 1,
@@ -1320,7 +1421,7 @@ void create_program_compute_mm(
       std::vector<uint32_t> writer_args;
 
       if (use_dram) {
-        // === DRAM Reader Args (12 args) ===
+        // === DRAM Reader Args (15 args) ===
         // Matches in0_reader_bmm_tile_layout_dram.cpp get_arg_val indices
         uint32_t in0_start_tile_id = y * per_core_Mt * Kt; // global row * Kt
         reader_args = {
@@ -1330,15 +1431,18 @@ void create_program_compute_mm(
             Kt,                        // 3: in0_tensor_stride_h (full K width)
             in0_block_w,               // 4: in0_tensor_next_block_stride
             in0_block_w,               // 5: in0_block_w
-            per_core_Mt,               // 6: in0_block_h
-            in0_block_w * per_core_Mt, // 7: in0_block_num_tiles
+            out_block_h,               // 6: in0_block_h (uses out_block_h)
+            in0_block_w * out_block_h, // 7: in0_block_num_tiles
             num_blocks,                // 8: num_blocks
             (uint32_t)phy_core.x,      // 9: noc_x
             (uint32_t)phy_core.y,      // 10: noc_y
             cur_last_block_h,          // 11: last_block_h
+            num_blocks_h,              // 12: num_blocks_h_dim
+            num_blocks_w,              // 13: num_blocks_w_dim
+            out_block_h * Kt,          // 14: in0_h_dim_stride
         };
 
-        // === DRAM Writer Args (31 args) ===
+        // === DRAM Writer Args (36 args) ===
         // Matches in1_reader_writer_bmm_tile_layout_dram.cpp get_arg_val
         // indices
         uint32_t in1_start_tile_id = x * per_core_Nt; // global col
@@ -1354,9 +1458,9 @@ void create_program_compute_mm(
             1,                         // 2: in1_tensor_stride_w
             Nt,                        // 3: in1_tensor_stride_h (full N width)
             in0_block_w * Nt,          // 4: in1_tensor_next_block_stride
-            per_core_Nt,               // 5: in1_block_w
+            out_block_w,               // 5: in1_block_w (uses out_block_w)
             in0_block_w,               // 6: in1_block_h
-            per_core_Nt * in0_block_w, // 7: in1_block_num_tiles
+            out_block_w * in0_block_w, // 7: in1_block_num_tiles
             num_blocks,                // 8: num_blocks
             in2_cb_addr,               // 9: in2_cb_addr
             (uint32_t)phy_core.x,      // 10: noc_x
@@ -1380,6 +1484,11 @@ void create_program_compute_mm(
             out_subblock_w,            // 28: out_last_subblock_w
             0,                         // 29: padded_subblock_tiles_addr_skip
             0,                         // 30: padded_block_tiles_w_skip
+            num_blocks_h,              // 31: num_blocks_h_dim
+            num_blocks_w,              // 32: num_blocks_w_dim
+            out_block_w,               // 33: in1_w_dim_stride
+            out_block_h * Nt,          // 34: out_h_dim_stride
+            out_block_w,               // 35: out_w_dim_stride
         };
 
       } else {
@@ -1462,34 +1571,64 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                                      : tt::DataFormat::Float16_b;
     uint32_t single_tile_size = tt::tile_size(data_format);
 
-    uint32_t in0_block_w =
-        get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
-                        l1_unreserved_base, params.use_dram);
+    // ---- TTNN-aligned L1 fitting for DRAM mode ----
+    // Use get_multi_dim_per_core_factor to find optimal (out_block_h,
+    // out_block_w, in0_block_w). The kernel-internal bh × bw loops handle the
+    // iteration over output blocks, so the host only creates a single program.
+    uint32_t out_block_h, out_block_w, in0_block_w;
+    uint32_t num_blocks_h = 1, num_blocks_w = 1;
+
+    if (params.use_dram) {
+      // DRAM mode: CBs sized by out_block_h × out_block_w (may be < per_core)
+      auto [obh, obw, bw] = get_multi_dim_per_core_factor(
+          per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+          l1_unreserved_base);
+      out_block_h = obh;
+      out_block_w = obw;
+      in0_block_w = bw;
+      num_blocks_h = per_core_Mt / out_block_h;
+      num_blocks_w = per_core_Nt / out_block_w;
+
+      log_info(LogTest,
+               "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+               "num_blocks={}x{}, in0_block_w={}",
+               per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
+               num_blocks_w, in0_block_w);
+    } else {
+      // L1 mode: full per-core dims fit (no multi-block needed)
+      out_block_h = per_core_Mt;
+      out_block_w = per_core_Nt;
+      in0_block_w =
+          get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                          l1_size, l1_unreserved_base, false);
+    }
+
     if (in0_block_w == 0) {
-      uint32_t out_cb_tiles = per_core_Mt * per_core_Nt;
+      uint32_t out_cb_tiles = out_block_h * out_block_w;
       uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
       uint32_t avail_l1 = l1_size - l1_unreserved_base;
       log_error(LogTest,
                 "Insufficient L1 memory for M={}, N={}, K={} "
-                "(per_core_Mt={}, per_core_Nt={}, out_CB={}tiles={}KB, "
+                "(out_block={}x{}, out_CB={}tiles={}KB, "
                 "avail_L1={}KB, dram={})",
-                params.M, params.N, params.K, per_core_Mt, per_core_Nt,
+                params.M, params.N, params.K, out_block_h, out_block_w,
                 out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
                 params.use_dram ? "yes" : "no");
       return false;
     }
 
+    // Subblock params based on out_block_h/w
     auto [out_subblock_h, out_subblock_w] =
-        get_out_subblock_params(per_core_Mt, per_core_Nt);
+        get_out_subblock_params(out_block_h, out_block_w);
 
-    // 3. Buffer Addresses
+    // 3. Buffer Addresses (use out_block dims for CB sizing)
     auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, in0_addr,
           in1_addr, out_addr] =
-        get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
+        get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
                                   single_tile_size, l1_unreserved_base,
                                   params.use_dram);
 
-    // 4. Prepare Inputs (BEFORE program creation for DRAM addr resolution)
+    // 4. Prepare Inputs — always use FULL per_core dims for DRAM buffer sizing
     auto inputs = prepare_inputs_compute_mm(
         device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt, in0_block_w,
         single_tile_size, in0_addr, in1_addr, in2_cb_addr, params.use_dram);
@@ -1506,24 +1645,25 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                effective_in0_addr, effective_in1_addr, effective_out_addr);
     }
 
-    // 6. Create Program and Kernels (Device)
+    // 6. Create Program and Run (single program — kernel handles multi-block)
+    log_info(LogTest, "Num tests {}", params.num_iters);
+
     tt_metal::Program program;
     create_program_compute_mm(
         device, data_format, math_fidelity, fp32_dest_acc_en, single_tile_size,
         core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h, out_subblock_w,
-        per_core_Mt, per_core_Nt, in0_cb_addr, in1_cb_addr, in2_cb_addr,
-        out_cb_addr, effective_in0_addr, effective_in1_addr, effective_out_addr,
+        per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
+        num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+        effective_in0_addr, effective_in1_addr, effective_out_addr,
         params.use_dram, program);
 
-    // 7. Profiling loop
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
     mesh_workload.add_program(
         tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
         std::move(program));
 
-    log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScopedN("Dispatch Overhead"); // Measuring Dispatch Latency
+      ZoneScopedN("Dispatch Overhead");
       ZoneValue(i);
       tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
                                                  mesh_workload, false);
