@@ -344,7 +344,7 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
 
     uint32_t in0_cb_size = per_core_Mt * choice * num_buffer * single_tile_size;
     uint32_t in1_cb_size = per_core_Nt * choice * num_buffer * single_tile_size;
-    uint32_t in2_cb_size = single_tile_size;
+    uint32_t in2_cb_size = 2 * single_tile_size;
     uint32_t intermediate_cb_size =
         per_core_Mt * per_core_Nt * single_tile_size;
     uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
@@ -378,13 +378,14 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
 // Algorithm (matching TTNN's get_multi_dim_per_core_factor):
 //   1. Enumerate all divisor pairs of per_core_M and per_core_N
 //   2. Sort by product (largest first), then by squareness
-//   3. For each (obh, obw), try in0_block_w from Kt down to 1
-//   4. Return the first combination where CBs fit L1
+//   3. Prefer candidates with num_blocks_w_dim == 1 (full per-core N)
+//   4. Prefer bounded K-loop depth (Kt / in0_block_w <= threshold)
+//   5. Fall back to generic first-fit search over all factors
 //
 // CB budget: in0_CB + in1_CB + in2_CB + out_CB + interm_CB <= avail_L1
 //   in0_CB = out_block_h * in0_block_w * 2 * tile_size  (double-buffered)
 //   in1_CB = out_block_w * in0_block_w * 2 * tile_size  (double-buffered)
-//   in2_CB = tile_size                                    (zeros tile)
+//   in2_CB = 2 * tile_size                                (zeros tile, shared)
 //   out_CB = out_block_h * out_block_w * tile_size        (output block)
 //   interm = out_block_h * out_block_w * tile_size        (FP32 partials)
 //
@@ -393,6 +394,8 @@ std::tuple<uint32_t, uint32_t, uint32_t>
 get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
                               uint32_t Kt, uint32_t single_tile_size,
                               uint32_t l1_size, uint32_t l1_unreserved_base) {
+  constexpr uint32_t MAX_K_BLOCKS_PREFERRED = 16;
+
   uint32_t raw_avail_l1 = l1_size - l1_unreserved_base;
   uint32_t avail_l1 =
       (raw_avail_l1 > L1_SAFETY_MARGIN_BYTES)
@@ -403,7 +406,7 @@ get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
   auto fits_l1 = [&](uint32_t obh, uint32_t obw, uint32_t bw) -> bool {
     uint32_t in0_cb = obh * bw * 2 * single_tile_size; // double-buffered
     uint32_t in1_cb = obw * bw * 2 * single_tile_size; // double-buffered
-    uint32_t in2_cb = single_tile_size;                // zeros
+    uint32_t in2_cb = 2 * single_tile_size;            // zeros (reader+writer)
     uint32_t out_cb = obh * obw * single_tile_size;    // output
     uint32_t interm = obh * obw * single_tile_size;    // FP32 partials
     return (in0_cb + in1_cb + in2_cb + out_cb + interm) <= avail_l1;
@@ -448,13 +451,46 @@ get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
     return a.ratio < b.ratio;
   });
 
+  std::vector<uint32_t> k_block_w_candidates;
+  for (uint32_t bw = Kt; bw >= 1; bw--) {
+    if (Kt % bw == 0) {
+      k_block_w_candidates.push_back(bw);
+    }
+  }
+
+  // Prefer single outer W block when possible (num_blocks_w_dim == 1).
+  // This keeps DRAM writer progression simpler on large per-core N shapes,
+  // while preserving the generic multi-block fallback below.
+  for (auto bw : k_block_w_candidates) {
+    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
+      continue;
+    }
+    for (auto &p : pairs) {
+      if (p.n != per_core_N) {
+        continue;
+      }
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
+  // Prefer bounded K-loop depth for DRAM stability on large per-core tiles.
+  // Search by larger in0_block_w first, then largest output block factors.
+  for (auto bw : k_block_w_candidates) {
+    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
+      continue;
+    }
+    for (auto &p : pairs) {
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
   // Try each (m, n) pair with decreasing in0_block_w
   for (auto &p : pairs) {
-    // Try in0_block_w from largest possible down to 1
-    // Must be a divisor of Kt (or at least work with integer K-blocks)
-    for (uint32_t bw = Kt; bw >= 1; bw--) {
-      if (Kt % bw != 0)
-        continue;
+    for (auto bw : k_block_w_candidates) {
       if (fits_l1(p.m, p.n, bw)) {
         return {p.m, p.n, bw};
       }
@@ -541,7 +577,7 @@ void create_program_compute_mm(
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
     uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
-    tt_metal::Program &program, uint32_t start_core_y = 0);
+  tt_metal::Program &program, uint32_t start_core_y = 0);
 
 // Generates random FP32 input matrices, tilizes/packs them, and transfers
 // them to the device. Returns a BenchmarkInputs struct.
@@ -749,7 +785,7 @@ get_all_buffers_addresses(uint32_t per_core_Mt, uint32_t per_core_Nt,
   uint32_t in1_cb_size =
       per_core_Nt * in0_block_w * num_buffer * single_tile_size;
   uint32_t in2_cb_addr = in1_cb_addr + in1_cb_size;
-  uint32_t in2_cb_size = single_tile_size;
+  uint32_t in2_cb_size = 2 * single_tile_size;
   uint32_t interm_cb_addr = in2_cb_addr + in2_cb_size;
   uint32_t interm_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
   uint32_t out_cb_addr = interm_cb_addr + interm_cb_size;
@@ -1219,7 +1255,7 @@ void create_program_compute_mm(
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
     uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
-    tt_metal::Program &program, uint32_t start_core_y) {
+  tt_metal::Program &program, uint32_t start_core_y) {
 
   // ---- Step 1: Define buffer sizes in tiles ----
   // Double buffering (num_buffer=2) allows the reader/writer to fill one
@@ -1287,7 +1323,7 @@ void create_program_compute_mm(
   // reader/writer kernels and the compute kernel.
   //   CB0 (c_0):  IN0 block (Matrix A)   — double-buffered
   //   CB1 (c_1):  IN1 block (Matrix B)   — double-buffered
-  //   CB2 (c_2):  Bias/padding tile      — single tile (zeros)
+  //   CB2 (c_2):  Bias/padding tiles     — 2 tiles (shared zeros)
   //   CB16 (c_16): Output accumulation   — compute writes here
   //   CB24 (c_24): Output staging        — same memory as CB16 (aliased)
   //
@@ -1307,7 +1343,7 @@ void create_program_compute_mm(
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src1);
 
   tt_metal::CircularBufferConfig cb_src2 =
-      tt_metal::CircularBufferConfig(single_tile_size,
+      tt_metal::CircularBufferConfig(2 * single_tile_size,
                                      {{tt::CBIndex::c_2, cb_data_format}})
           .set_page_size(tt::CBIndex::c_2, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
@@ -1521,8 +1557,8 @@ void create_program_compute_mm(
             in0_num_subblocks,         // 22: out_num_subblocks_h
             last_outer_block_w,        // 23: last_block_w for boundary bw
             last_outer_num_nonzero_subblocks_h, // 24: last bh nonzero sbh
-            last_outer_subblock_h,              // 25: last bh tail sbh height
-            last_outer_padded_block_tiles_h_skip, // 26: last bh padded rows
+            last_outer_subblock_h,            // 25: last bh tail sbh height
+            last_outer_padded_block_tiles_h_skip,  // 26: last bh padded rows
             last_outer_num_nonzero_subblocks_w, // 27: last bw nonzero sbw
             last_outer_subblock_w,              // 28: last bw tail sbw width
             last_outer_padded_subblock_tiles_addr_skip, // 29: tail sbw skip
@@ -1533,6 +1569,46 @@ void create_program_compute_mm(
             out_block_h * Nt,          // 34: out_h_dim_stride
             out_block_w,               // 35: out_w_dim_stride
         };
+
+          if (x == 0 && y == 0) {
+            uint32_t in0_total_tiles = Mt * Kt;
+            uint32_t in1_total_tiles = Kt * Nt;
+            uint32_t out_total_tiles = Mt * Nt;
+
+            uint32_t in0_last_tile_est =
+              in0_start_tile_id +
+              ((num_blocks_h - 1) * out_block_h * Kt) +
+              ((num_blocks - 1) * in0_block_w) +
+              ((out_block_h - 1) * Kt) +
+              (in0_block_w - 1);
+
+            uint32_t in1_last_tile_est =
+              in1_start_tile_id +
+              ((num_blocks_w - 1) * out_block_w) +
+              ((num_blocks - 1) * (in0_block_w * Nt)) +
+              ((in0_block_w - 1) * Nt) +
+              (out_block_w - 1);
+
+            uint32_t out_last_tile_est =
+              out_start_tile_id +
+              ((num_blocks_h - 1) * (out_block_h * Nt)) +
+              ((num_blocks_w - 1) * out_block_w) +
+              ((out_block_h - 1) * Nt) +
+              (out_block_w - 1);
+
+            log_info(LogTest,
+                 "DRAM core(0,0) ranges: in0_start={}, in0_last_est={}, "
+                 "in1_start={}, in1_last_est={}, out_start={}, "
+                 "out_last_est={}",
+                 in0_start_tile_id, in0_last_tile_est, in1_start_tile_id,
+                 in1_last_tile_est, out_start_tile_id, out_last_tile_est);
+
+            log_info(LogTest,
+                 "DRAM core(0,0) totals: in0_total={}, in1_total={}, "
+                 "out_total={}, num_blocks={}x{} outer, K_blocks={}",
+                 in0_total_tiles, in1_total_tiles, out_total_tiles,
+                 num_blocks_h, num_blocks_w, num_blocks);
+          }
 
       } else {
         // === L1 Reader Args (12 args — upstream 1_compute_mm layout) ===
