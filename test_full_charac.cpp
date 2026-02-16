@@ -1429,8 +1429,46 @@ void create_program_compute_mm(
       CoreCoord core = {(std::size_t)x, (std::size_t)(y + start_core_y)};
       auto phy_core = device->worker_core_from_logical_core(core);
 
-      uint32_t cur_last_block_h =
-          (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
+      uint32_t cur_core_valid_Mt =
+        (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
+      uint32_t cur_core_valid_Nt =
+        (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
+
+      // Per-core boundary metadata (aligned with upstream 1_compute_mm)
+      // For DRAM multi-block mode, these describe ONLY the last outer block
+      // in each dimension. Interior outer blocks remain full-sized.
+      uint32_t last_outer_block_h =
+        (cur_core_valid_Mt % out_block_h == 0) ? out_block_h
+                           : (cur_core_valid_Mt % out_block_h);
+      uint32_t last_outer_block_w =
+        (cur_core_valid_Nt % out_block_w == 0) ? out_block_w
+                           : (cur_core_valid_Nt % out_block_w);
+
+      uint32_t out_num_subblocks_h = out_block_h / out_subblock_h;
+      uint32_t out_num_subblocks_w = out_block_w / out_subblock_w;
+
+      uint32_t last_outer_num_nonzero_subblocks_h =
+        ((last_outer_block_h - 1) / out_subblock_h) + 1;
+      uint32_t last_outer_num_nonzero_subblocks_w =
+        ((last_outer_block_w - 1) / out_subblock_w) + 1;
+
+      uint32_t last_outer_subblock_h =
+        (last_outer_block_h % out_subblock_h == 0)
+          ? out_subblock_h
+          : (last_outer_block_h % out_subblock_h);
+      uint32_t last_outer_subblock_w =
+        (last_outer_block_w % out_subblock_w == 0)
+          ? out_subblock_w
+          : (last_outer_block_w % out_subblock_w);
+
+      uint32_t last_outer_padded_subblock_tiles_addr_skip =
+        single_tile_size * (out_subblock_w - last_outer_subblock_w);
+      uint32_t last_outer_padded_block_tiles_w_skip =
+        out_subblock_num_tiles *
+        (out_num_subblocks_w - last_outer_num_nonzero_subblocks_w);
+      uint32_t last_outer_padded_block_tiles_h_skip =
+        (out_num_subblocks_h - last_outer_num_nonzero_subblocks_h) *
+        (out_block_w * out_subblock_h);
 
       std::vector<uint32_t> reader_args;
       std::vector<uint32_t> writer_args;
@@ -1451,7 +1489,7 @@ void create_program_compute_mm(
             num_blocks,                // 8: num_blocks
             (uint32_t)phy_core.x,      // 9: noc_x
             (uint32_t)phy_core.y,      // 10: noc_y
-            cur_last_block_h,          // 11: last_block_h
+            last_outer_block_h,        // 11: last_block_h for boundary bh
             num_blocks_h,              // 12: num_blocks_h_dim
             num_blocks_w,              // 13: num_blocks_w_dim
             out_block_h * Kt,          // 14: in0_h_dim_stride
@@ -1462,10 +1500,6 @@ void create_program_compute_mm(
         // indices
         uint32_t in1_start_tile_id = x * per_core_Nt; // global col
         uint32_t out_start_tile_id = y * per_core_Mt * Nt + x * per_core_Nt;
-
-        // Padding calculations for writer
-        uint32_t cur_last_block_w =
-            (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
 
         writer_args = {
             in1_addr,                  // 0: in1_tensor_addr
@@ -1491,14 +1525,14 @@ void create_program_compute_mm(
             out_subblock_num_tiles,    // 20: out_subblock_tile_count
             in1_num_subblocks,         // 21: out_num_subblocks_w
             in0_num_subblocks,         // 22: out_num_subblocks_h
-            cur_last_block_w,          // 23: last_block_w (padding)
-            in0_num_subblocks,         // 24: out_num_nonzero_subblocks_h
-            out_subblock_h,            // 25: out_last_subblock_h
-            0,                         // 26: padded_block_tiles_h_skip
-            in1_num_subblocks,         // 27: out_num_nonzero_subblocks_w
-            out_subblock_w,            // 28: out_last_subblock_w
-            0,                         // 29: padded_subblock_tiles_addr_skip
-            0,                         // 30: padded_block_tiles_w_skip
+            last_outer_block_w,        // 23: last_block_w for boundary bw
+            last_outer_num_nonzero_subblocks_h, // 24: last bh nonzero sbh
+            last_outer_subblock_h,              // 25: last bh tail sbh height
+            last_outer_padded_block_tiles_h_skip, // 26: last bh padded rows
+            last_outer_num_nonzero_subblocks_w, // 27: last bw nonzero sbw
+            last_outer_subblock_w,              // 28: last bw tail sbw width
+            last_outer_padded_subblock_tiles_addr_skip, // 29: tail sbw skip
+            last_outer_padded_block_tiles_w_skip,       // 30: last bw pad skip
             num_blocks_h,              // 31: num_blocks_h_dim
             num_blocks_w,              // 32: num_blocks_w_dim
             out_block_w,               // 33: in1_w_dim_stride
@@ -1507,7 +1541,7 @@ void create_program_compute_mm(
         };
 
       } else {
-        // === L1 Reader Args (11 args — original) ===
+        // === L1 Reader Args (12 args — upstream 1_compute_mm layout) ===
         reader_args = {in0_addr,
                        0,           // start_tile_id (local buffer)
                        1,           // stride_w
@@ -1518,15 +1552,14 @@ void create_program_compute_mm(
                        in0_block_w * per_core_Mt, // block_num_tiles
                        num_blocks,
                        (uint32_t)phy_core.x,
-                       (uint32_t)phy_core.y};
-        if (y == (int)core_range.y - 1)
-          reader_args.back() = last_block_h;
+                       (uint32_t)phy_core.y,
+                       cur_core_valid_Mt};
 
-        // === L1 Writer Args (23 args — original) ===
+        // === L1 Writer Args (31 args — upstream 1_compute_mm layout) ===
         writer_args = {in1_addr,
                        0,
                        1,
-                       per_core_Nt,
+                       cur_core_valid_Nt,
                        in0_block_w * per_core_Nt,
                        per_core_Nt,
                        in0_block_w,
@@ -1538,14 +1571,34 @@ void create_program_compute_mm(
                        out_addr,
                        0,
                        1,
-                       per_core_Nt,
+                         cur_core_valid_Nt,
                        out_subblock_w,
-                       out_subblock_h * per_core_Nt,
+                         out_subblock_h * cur_core_valid_Nt,
                        out_subblock_w,
                        out_subblock_h,
                        out_subblock_w * out_subblock_h,
                        per_core_Nt / out_subblock_w,
-                       per_core_Mt / out_subblock_h};
+                         per_core_Mt / out_subblock_h,
+                         cur_core_valid_Nt,
+                         (y == (int)core_range.y - 1)
+                           ? last_outer_num_nonzero_subblocks_h
+                           : (per_core_Mt / out_subblock_h),
+                         (y == (int)core_range.y - 1) ? last_outer_subblock_h
+                                      : out_subblock_h,
+                         (y == (int)core_range.y - 1)
+                           ? last_outer_padded_block_tiles_h_skip
+                           : 0,
+                         (x == (int)core_range.x - 1)
+                           ? last_outer_num_nonzero_subblocks_w
+                           : (per_core_Nt / out_subblock_w),
+                         (x == (int)core_range.x - 1) ? last_outer_subblock_w
+                                      : out_subblock_w,
+                         (x == (int)core_range.x - 1)
+                           ? last_outer_padded_subblock_tiles_addr_skip
+                           : 0,
+                         (x == (int)core_range.x - 1)
+                           ? last_outer_padded_block_tiles_w_skip
+                           : 0};
       }
 
       tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);

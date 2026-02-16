@@ -89,7 +89,27 @@ void kernel_main() {
     uint32_t in1_bw_start = in1_tensor_start_tile_id; // B resets for each bh
     uint32_t out_bw_start = out_tensor_start_tile_id;
 
+    uint32_t out_num_nonzero_subblocks_h_ =
+      (bh == num_blocks_h_dim - 1) ? out_num_nonzero_subblocks_h
+                     : out_num_subblocks_h;
+    uint32_t out_last_subblock_h_ =
+      (bh == num_blocks_h_dim - 1) ? out_last_subblock_h : out_subblock_h;
+    uint32_t padded_block_tiles_h_skip_ =
+      (bh == num_blocks_h_dim - 1) ? padded_block_tiles_h_skip : 0;
+
     for (uint32_t bw = 0; bw < num_blocks_w_dim; bw++) {
+
+      uint32_t out_num_nonzero_subblocks_w_ =
+        (bw == num_blocks_w_dim - 1) ? out_num_nonzero_subblocks_w
+                       : out_num_subblocks_w;
+      uint32_t out_last_subblock_w_ =
+        (bw == num_blocks_w_dim - 1) ? out_last_subblock_w : out_subblock_w;
+      uint32_t padded_subblock_tiles_addr_skip_ =
+        (bw == num_blocks_w_dim - 1) ? padded_subblock_tiles_addr_skip : 0;
+      uint32_t padded_block_tiles_w_skip_ =
+        (bw == num_blocks_w_dim - 1) ? padded_block_tiles_w_skip : 0;
+      uint32_t last_block_w_ =
+        (bw == num_blocks_w_dim - 1) ? last_block_w : in1_block_w;
 
       // ===== IN1 READER =====
       uint32_t l1_write_addr_in1;
@@ -103,7 +123,7 @@ void kernel_main() {
         for (uint32_t h = 0; h < in1_block_h; h++) {
           uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
           for (uint32_t w = 0; w < in1_block_w; w++) {
-            if (w < last_block_w) {
+            if (w < last_block_w_) {
               noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
             } else {
               noc_async_read(l1_zeros_addr_in2_noc, l1_write_addr_in1,
@@ -122,21 +142,21 @@ void kernel_main() {
 
       // ===== OUTPUT WRITER =====
       uint32_t out_tensor_sbh_start_tile_id = out_bw_start;
-      for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h; sbh++) {
+      for (uint32_t sbh = 0; sbh < out_num_nonzero_subblocks_h_; sbh++) {
         uint32_t out_tensor_sbw_start_tile_id = out_tensor_sbh_start_tile_id;
-        for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w; sbw++) {
+        for (uint32_t sbw = 0; sbw < out_num_nonzero_subblocks_w_; sbw++) {
           uint32_t out_tensor_sb_row_start_tile_id =
               out_tensor_sbw_start_tile_id;
 
           uint32_t out_subblock_h_ = out_subblock_h;
           uint32_t out_subblock_w_ = out_subblock_w;
           uint32_t subblock_tiles_addr_skip = 0;
-          if (sbh == out_num_nonzero_subblocks_h - 1) {
-            out_subblock_h_ = out_last_subblock_h;
+          if (sbh == out_num_nonzero_subblocks_h_ - 1) {
+            out_subblock_h_ = out_last_subblock_h_;
           }
-          if (sbw == out_num_nonzero_subblocks_w - 1) {
-            out_subblock_w_ = out_last_subblock_w;
-            subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
+          if (sbw == out_num_nonzero_subblocks_w_ - 1) {
+            out_subblock_w_ = out_last_subblock_w_;
+            subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip_;
           }
 
           cb_wait_front(cb_id_out0, out_subblock_tile_count);
@@ -159,13 +179,13 @@ void kernel_main() {
           out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
         }
         // Pop fully padded subblocks along the row
-        cb_wait_front(cb_id_out0, padded_block_tiles_w_skip);
-        cb_pop_front(cb_id_out0, padded_block_tiles_w_skip);
+        cb_wait_front(cb_id_out0, padded_block_tiles_w_skip_);
+        cb_pop_front(cb_id_out0, padded_block_tiles_w_skip_);
         out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
       }
       // Pop row(s) of fully padded subblocks
-      cb_wait_front(cb_id_out0, padded_block_tiles_h_skip);
-      cb_pop_front(cb_id_out0, padded_block_tiles_h_skip);
+      cb_wait_front(cb_id_out0, padded_block_tiles_h_skip_);
+      cb_pop_front(cb_id_out0, padded_block_tiles_h_skip_);
 
       in1_bw_start += in1_w_dim_stride; // B columns advance with bw
       out_bw_start += out_w_dim_stride; // output columns advance with bw
