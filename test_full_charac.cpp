@@ -151,6 +151,7 @@ struct TestParams {
   uint32_t dtype; // 0: BFP8, 1: FP16
   uint32_t fidel; // 0: low, 1: high
   bool use_dram;  // Enable DRAM input buffers
+  bool use_cache; // Enable program cache
   uint32_t core_x;
   uint32_t core_y;
   uint32_t core_groups;
@@ -178,6 +179,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   uint32_t core_x, core_y, core_groups;
   uint32_t num_iters;
   bool use_dram = false;
+  bool use_cache = false;
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t cpu_id;
@@ -203,6 +205,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                                                                 "--fidel", 0);
     std::tie(use_dram, input_args) =
         test_args::has_command_option_and_remaining_args(input_args, "--dram");
+    std::tie(use_cache, input_args) =
+        test_args::has_command_option_and_remaining_args(input_args,
+                                                         "--cache");
 
     // Core grid size args
     std::tie(core_x, input_args) =
@@ -273,6 +278,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .dtype = dtype,
                     .fidel = fidel,
                     .use_dram = use_dram,
+                    .use_cache = use_cache,
                     .core_x = core_x,
                     .core_y = core_y,
                     .core_groups = core_groups,
@@ -2506,10 +2512,11 @@ int main(int argc, char **argv) {
   log_info(LogTest, "Selectec Test: {}", static_cast<uint32_t>(params.test));
   log_info(LogTest,
            "Starting with parameters: M={}, N={}, K={}, dtype={}, fidel={}, "
-           "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}",
+           "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}, "
+           "cache={}",
            params.M, params.N, params.K, params.dtype, params.fidel,
            params.core_x, params.core_y, params.core_groups, params.num_iters,
-           params.clean_mode);
+           params.clean_mode, params.use_cache);
 
   if (params.core_x > max_x || params.core_y > max_y) {
     log_error(
@@ -2520,6 +2527,11 @@ int main(int argc, char **argv) {
   }
 
   bool pass = false;
+  if (params.use_cache) {
+    device_params.device->enable_program_cache();
+    log_info(LogTest, "Program cache enabled (--cache)");
+  }
+
   switch (params.test) {
   case TestType::EmptyKernelLaunch:
     pass = test_empty_kernel_launch(device_params.device.get(), params);
@@ -2539,7 +2551,16 @@ int main(int argc, char **argv) {
   default:
     log_error(tt::LogTest, "Invalid test type selected: {}",
               static_cast<uint32_t>(params.test));
+    if (params.use_cache) {
+      device_params.device->disable_and_clear_program_cache();
+      log_info(LogTest, "Program cache disabled and cleared");
+    }
     return -1;
+  }
+
+  if (params.use_cache) {
+    device_params.device->disable_and_clear_program_cache();
+    log_info(LogTest, "Program cache disabled and cleared");
   }
 
   // We finalize the device
