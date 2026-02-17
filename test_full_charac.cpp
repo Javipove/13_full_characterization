@@ -2366,19 +2366,18 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
         std::move(program));
 
-    // Explicitly compile the program to measure compile overhead WITH TRACY
-    // THIS IS NOT NEEDED
-    /*
+    // Explicitly compile the program to measure compile overhead.
     auto t_compile_begin = std::chrono::steady_clock::now();
-    for (auto& [range, prog] : mesh_workload.get_programs()) {
+    for (auto &[range, prog] : mesh_workload.get_programs()) {
         tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
     }
     auto t_compile_end = std::chrono::steady_clock::now();
     auto compile_time =
-    std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
-    t_compile_begin).count(); log_info(LogTest, "Time elapsed for
-    compilation: {}us", compile_time);
-    */
+      std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
+                                   t_compile_begin)
+        .count();
+    log_info(LogTest, "Time elapsed for compilation: {}us", compile_time);
+
     // Now we should have a cache hit
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
@@ -2528,8 +2527,10 @@ int main(int argc, char **argv) {
 
   bool pass = false;
   if (params.use_cache) {
+    tt_metal::detail::EnablePersistentKernelCache();
     device_params.device->enable_program_cache();
-    log_info(LogTest, "Program cache enabled (--cache)");
+    log_info(LogTest,
+             "Persistent kernel cache + program cache enabled (--cache)");
   }
 
   switch (params.test) {
@@ -2553,14 +2554,20 @@ int main(int argc, char **argv) {
               static_cast<uint32_t>(params.test));
     if (params.use_cache) {
       device_params.device->disable_and_clear_program_cache();
-      log_info(LogTest, "Program cache disabled and cleared");
+      tt_metal::detail::DisablePersistentKernelCache();
+      log_info(LogTest,
+               "Program cache disabled/cleared and persistent kernel cache "
+               "disabled");
     }
     return -1;
   }
 
   if (params.use_cache) {
     device_params.device->disable_and_clear_program_cache();
-    log_info(LogTest, "Program cache disabled and cleared");
+    tt_metal::detail::DisablePersistentKernelCache();
+    log_info(LogTest,
+             "Program cache disabled/cleared and persistent kernel cache "
+             "disabled");
   }
 
   // We finalize the device
