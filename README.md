@@ -73,17 +73,21 @@ Current constraints:
 
 ## Validation Status (Current Debugging Campaign)
 
-The table below tracks **only configurations explicitly tested in this repository session**.
+The table below tracks configurations explicitly validated or currently under validation.
 
-| Test | Mode | Grid | Status | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| `--test 1` (ComputeMM) | `--dram` | `6x6` | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
-| `--test 1` (ComputeMM) | `--dram` | `1x1` | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
-| `--test 1` (ComputeMM) | `--dram` | `2x2` | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
+| Test ID | Test Name | Mode | Scope / Shape | Status | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `--test 0` | Empty Kernel Launch | N/A | Standard dispatch path | ✅ Proven working | Stable baseline; dispatch-only path works as expected. |
+| `--test 1` | ComputeMM | `L1` | Small tensor sizes | ✅ Proven working | L1 path works for small sizes. |
+| `--test 1` | ComputeMM | `DRAM` | `6x6` grid | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
+| `--test 1` | ComputeMM | `DRAM` | `1x1` grid | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
+| `--test 1` | ComputeMM | `DRAM` | `2x2` grid | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
+| `--test 3` | Host Pipeline ComputeMM | Host-only | FP32→BFP8→DRAM→BFP8→FP32 | ✅ Included in validation scope | Implemented and ready for scaling/overhead campaigns (no kernel dispatch). |
+| `--test 4` | Host Pipeline Empty Tensor | Host-only | Single-tensor host pipeline | ✅ Included in validation scope | Implemented and ready for baseline host overhead studies. |
 
 Notes:
-- This section is intentionally conservative and only lists runs that were explicitly reported/tested.
-- Other combinations (`--test 0`, `--test 2`, host-only tests, L1 mode variants, different matrix shapes) are not marked as validated here yet.
+- This section is intentionally conservative and updated as new runs are confirmed.
+- `--test 2` (SubDevice) and unlisted shape/grid combinations remain to be validated in this campaign.
 
 ### Partitioning Logic Examples
 The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core-groups`:
