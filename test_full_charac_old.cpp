@@ -883,8 +883,10 @@ int main(int argc, char **argv) {
 
   bool pass = false;
   if (params.use_cache) {
+    tt_metal::detail::EnablePersistentKernelCache();
     device_params.device->enable_program_cache();
-    log_info(LogTest, "Program cache enabled (--cache)");
+    log_info(LogTest,
+             "Persistent kernel cache + program cache enabled (--cache)");
   }
 
   switch (params.test) {
@@ -908,14 +910,20 @@ int main(int argc, char **argv) {
               static_cast<uint32_t>(params.test));
     if (params.use_cache) {
       device_params.device->disable_and_clear_program_cache();
-      log_info(LogTest, "Program cache disabled and cleared");
+      tt_metal::detail::DisablePersistentKernelCache();
+      log_info(LogTest,
+               "Program cache disabled/cleared and persistent kernel cache "
+               "disabled");
     }
     return -1;
   }
 
   if (params.use_cache) {
     device_params.device->disable_and_clear_program_cache();
-    log_info(LogTest, "Program cache disabled and cleared");
+    tt_metal::detail::DisablePersistentKernelCache();
+    log_info(LogTest,
+             "Program cache disabled/cleared and persistent kernel cache "
+             "disabled");
   }
 
   // We finalize the device
