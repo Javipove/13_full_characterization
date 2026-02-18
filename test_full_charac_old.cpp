@@ -681,7 +681,7 @@ bool test_empty_kernel_launch(tt::tt_metal::IDevice *device,
     ////////////////////////////////////////////////////////////////////////////
     tt_metal::Program program = tt_metal::Program();
     uint32_t single_tile_size = 2 * 1024;
-    std::vector<unsigned long> elapsed_us;
+    // std::vector<unsigned long> elapsed_us;
 
     for (int core_group_idx = 0; core_group_idx < params.core_groups;
          ++core_group_idx) {
@@ -769,59 +769,59 @@ bool test_empty_kernel_launch(tt::tt_metal::IDevice *device,
     ////////////////////////////////////////////////////////////////////////////
 
     // Explicitly compile the program to measure compile overhead
-    auto t_compile_begin = std::chrono::steady_clock::now();
-    tt_metal::detail::CompileProgram(device, program);
-    auto t_compile_end = std::chrono::steady_clock::now();
-    auto compile_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_compile_end - t_compile_begin)
-                            .count();
-    log_info(LogTest, "Time elapsed for compilation: {}us", compile_time);
+    // auto t_compile_begin = std::chrono::steady_clock::now();
+    // tt_metal::detail::CompileProgram(device, program);
+    // auto t_compile_end = std::chrono::steady_clock::now();
+    // auto compile_time = std::chrono::duration_cast<std::chrono::microseconds>(
+    //                         t_compile_end - t_compile_begin)
+    //                         .count();
+    // log_info(LogTest, "Time elapsed for compilation: {}us", compile_time);
 
     // Now we should have a cache hit
     log_info(LogTest, "Num tests {}", params.num_iters);
     for (uint32_t i = 0; i < params.num_iters; ++i) {
-      auto t_begin = std::chrono::steady_clock::now();
+      // auto t_begin = std::chrono::steady_clock::now();
       EnqueueProgram(device->command_queue(), program, false);
       Finish(device->command_queue());
-      auto t_end = std::chrono::steady_clock::now();
-      elapsed_us.push_back(
-          std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_begin)
-              .count());
-
-      log_info(LogTest, "Time elapsed for executing empty kernels: {}us",
-               elapsed_us[i]);
+      // auto t_end = std::chrono::steady_clock::now();
+      // elapsed_us.push_back(
+      //     std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_begin)
+      //         .count());
+      //
+      // log_info(LogTest, "Time elapsed for executing empty kernels: {}us",
+      //          elapsed_us[i]);
     }
 
     // Calculate stats
-    std::sort(elapsed_us.begin(), elapsed_us.end());
+    // std::sort(elapsed_us.begin(), elapsed_us.end());
 
     // Filter outliers if we have enough data (e.g. > 2 samples)
-    std::vector<unsigned long> filtered_elapsed_us;
-    if (elapsed_us.size() > 2) {
-      // Exclude min and max
-      filtered_elapsed_us.assign(elapsed_us.begin() + 1, elapsed_us.end() - 1);
-    } else {
-      filtered_elapsed_us = elapsed_us;
-    }
+    // std::vector<unsigned long> filtered_elapsed_us;
+    // if (elapsed_us.size() > 2) {
+    //   // Exclude min and max
+    //   filtered_elapsed_us.assign(elapsed_us.begin() + 1, elapsed_us.end() - 1);
+    // } else {
+    //   filtered_elapsed_us = elapsed_us;
+    // }
 
-    auto min_val = *std::min_element(filtered_elapsed_us.begin(),
-                                     filtered_elapsed_us.end());
-    auto max_val = *std::max_element(filtered_elapsed_us.begin(),
-                                     filtered_elapsed_us.end());
-    auto sum_val = std::accumulate(filtered_elapsed_us.begin(),
-                                   filtered_elapsed_us.end(), 0.0);
-    auto avg_val = sum_val / filtered_elapsed_us.size();
+    // auto min_val = *std::min_element(filtered_elapsed_us.begin(),
+    //                                  filtered_elapsed_us.end());
+    // auto max_val = *std::max_element(filtered_elapsed_us.begin(),
+    //                                  filtered_elapsed_us.end());
+    // auto sum_val = std::accumulate(filtered_elapsed_us.begin(),
+    //                                filtered_elapsed_us.end(), 0.0);
+    // auto avg_val = sum_val / filtered_elapsed_us.size();
 
-    double sum_sq_diff = 0.0;
-    for (const auto &val : filtered_elapsed_us) {
-      double diff = val - avg_val;
-      sum_sq_diff += diff * diff;
-    }
-    auto std_dev = std::sqrt(sum_sq_diff / filtered_elapsed_us.size());
-    log_info(LogTest,
-             "Execution Stats (us) [Trimmed]: Min={}, Max={}, Avg={:.2f}, "
-             "StdDev={:.2f}",
-             min_val, max_val, avg_val, std_dev);
+    // double sum_sq_diff = 0.0;
+    // for (const auto &val : filtered_elapsed_us) {
+    //   double diff = val - avg_val;
+    //   sum_sq_diff += diff * diff;
+    // }
+    // auto std_dev = std::sqrt(sum_sq_diff / filtered_elapsed_us.size());
+    // log_info(LogTest,
+    //          "Execution Stats (us) [Trimmed]: Min={}, Max={}, Avg={:.2f}, "
+    //          "StdDev={:.2f}",
+    //          min_val, max_val, avg_val, std_dev);
 
   } catch (const std::exception &e) {
     pass = false;

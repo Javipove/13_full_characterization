@@ -2288,7 +2288,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
     ////////////////////////////////////////////////////////////////////////////
     tt_metal::Program program = tt_metal::Program();
     uint32_t single_tile_size = 2 * 1024;
-    std::vector<unsigned long> elapsed_us;
+    // std::vector<unsigned long> elapsed_us;
 
     for (int core_group_idx = 0; core_group_idx < params.core_groups;
          ++core_group_idx) {
@@ -2380,16 +2380,16 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         std::move(program));
 
     // Explicitly compile the program to measure compile overhead.
-    auto t_compile_begin = std::chrono::steady_clock::now();
-    for (auto &[range, prog] : mesh_workload.get_programs()) {
-        tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
-    }
-    auto t_compile_end = std::chrono::steady_clock::now();
-    auto compile_time =
-      std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
-                                   t_compile_begin)
-        .count();
-    log_info(LogTest, "Time elapsed for compilation: {}us", compile_time);
+    //auto t_compile_begin = std::chrono::steady_clock::now();
+    //for (auto &[range, prog] : mesh_workload.get_programs()) {
+    //    tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
+    //}
+    //auto t_compile_end = std::chrono::steady_clock::now();
+    //auto compile_time =
+    //  std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
+    //                               t_compile_begin)
+    //    .count();
+    // log_info(LogTest, "Time elapsed for compilation: {}us", compile_time);
 
     // Now we should have a cache hit
     log_info(LogTest, "Num tests {}", params.num_iters);
