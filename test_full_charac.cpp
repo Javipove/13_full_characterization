@@ -93,6 +93,7 @@
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/tt_metal_profiler.hpp>
 #include <tt-metalium/work_split.hpp>
+#include <tt-metalium/persistent_kernel_cache.hpp>
 
 // Utility / test helpers
 #include "hostdevcommon/common_values.hpp"
@@ -121,6 +122,18 @@
 
 using namespace tt;
 using namespace tt::tt_metal;
+
+namespace {
+
+void enable_persistent_kernel_cache_if_available() {
+  tt::tt_metal::detail::EnablePersistentKernelCache();
+}
+
+void disable_persistent_kernel_cache_if_available() {
+  tt::tt_metal::detail::DisablePersistentKernelCache();
+}
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Default values for benchmark parameters
@@ -2483,10 +2496,22 @@ int main(int argc, char **argv) {
       }
   */
 
+  // Parse input arguments
+  DeviceParams device_params;
+  std::vector<std::string> input_args(argv, argv + argc);
+  TestParams params = parse_input_arguments(input_args, device_params);
+
+  if (params.use_cache) {
+    if (params.clean_mode == 1) {
+      log_warning(LogTest,
+                  "--cache with --clean-mode 1 will invalidate disk cache "
+                  "benefits for this run.");
+    }
+    enable_persistent_kernel_cache_if_available();
+  }
+
   // Create mesh device
   int device_id = 0;
-  DeviceParams device_params;
-
   device_params.device =
       tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
   device_params.grid_coord =
@@ -2496,10 +2521,6 @@ int main(int argc, char **argv) {
   // tested
   uint32_t max_x = device_params.grid_coord.x;
   uint32_t max_y = device_params.grid_coord.y;
-
-  // Parse input arguments
-  std::vector<std::string> input_args(argv, argv + argc);
-  TestParams params = parse_input_arguments(input_args, device_params);
 
   if (params.cpu_id != 0xFFFFFFFF) {
     pin_to_cpu(params.cpu_id);
@@ -2522,12 +2543,15 @@ int main(int argc, char **argv) {
         tt::LogTest,
         "Requested core size ({},{}) exceeds max for architecture ({},{})",
         params.core_x, params.core_y, max_x, max_y);
+    if (params.use_cache) {
+      disable_persistent_kernel_cache_if_available();
+    }
+    device_params.device->close();
     return -1;
   }
 
   bool pass = false;
   if (params.use_cache) {
-    tt_metal::detail::EnablePersistentKernelCache();
     device_params.device->enable_program_cache();
     log_info(LogTest,
              "Persistent kernel cache + program cache enabled (--cache)");
@@ -2554,7 +2578,7 @@ int main(int argc, char **argv) {
               static_cast<uint32_t>(params.test));
     if (params.use_cache) {
       device_params.device->disable_and_clear_program_cache();
-      tt_metal::detail::DisablePersistentKernelCache();
+      disable_persistent_kernel_cache_if_available();
       log_info(LogTest,
                "Program cache disabled/cleared and persistent kernel cache "
                "disabled");
@@ -2564,7 +2588,7 @@ int main(int argc, char **argv) {
 
   if (params.use_cache) {
     device_params.device->disable_and_clear_program_cache();
-    tt_metal::detail::DisablePersistentKernelCache();
+    disable_persistent_kernel_cache_if_available();
     log_info(LogTest,
              "Program cache disabled/cleared and persistent kernel cache "
              "disabled");
