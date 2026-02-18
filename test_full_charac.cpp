@@ -2175,6 +2175,9 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
     uint32_t tensor_size_bytes = num_tiles * single_tile_size;
+    uint64_t expected_tensor_elems =
+      static_cast<uint64_t>(Mt) * static_cast<uint64_t>(Nt) *
+      static_cast<uint64_t>(constants::TILE_HW);
 
     auto *target_device = device->get_devices()[0];
     auto tensor_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
@@ -2184,6 +2187,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
         .buffer_type = tt_metal::BufferType::DRAM});
 
     HostPipelineStats stats;
+    double transfer_window_us = 0.0;
+    uint64_t transfer_window_bytes = 0;
     uint32_t completed_iters = 0;
 
     for (uint32_t i = 0; i < params.num_iters; ++i) {
@@ -2198,6 +2203,14 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
       }
+      if (tensor_vec.size() != expected_tensor_elems) {
+        log_error(LogTest,
+                  "Host-only Empty tensor element count mismatch: got={}, "
+                  "expected={} (Mt={}, Nt={}, TILE_HW={})",
+                  tensor_vec.size(), expected_tensor_elems, Mt, Nt,
+                  constants::TILE_HW);
+        return false;
+      }
 
       std::vector<uint32_t> packed;
       {
@@ -2211,7 +2224,18 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
       }
+      uint64_t packed_bytes =
+          static_cast<uint64_t>(packed.size()) * sizeof(uint32_t);
+      if (packed_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
+        log_error(LogTest,
+                  "Host-only Empty packed byte size mismatch: got={} B, "
+                  "expected={} B (tiles={}, tile_size={})",
+                  packed_bytes, tensor_size_bytes, num_tiles,
+                  single_tile_size);
+        return false;
+      }
 
+      auto t_transfer_start = std::chrono::steady_clock::now();
       {
         auto t0 = std::chrono::steady_clock::now();
         tt_metal::detail::WriteToBuffer(tensor_buffer, packed);
@@ -2232,6 +2256,21 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
                 .count();
         stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
       }
+      uint64_t readback_bytes =
+          static_cast<uint64_t>(readback.size()) * sizeof(uint32_t);
+      if (readback_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
+        log_error(LogTest,
+                  "Host-only Empty readback byte size mismatch: got={} B, "
+                  "expected={} B",
+                  readback_bytes, tensor_size_bytes);
+        return false;
+      }
+      auto t_transfer_end = std::chrono::steady_clock::now();
+      transfer_window_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_transfer_end -
+                                                                 t_transfer_start)
+              .count();
+      transfer_window_bytes += static_cast<uint64_t>(tensor_size_bytes) * 2;
 
       std::vector<float> roundtrip;
       {
@@ -2268,6 +2307,16 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
     log_info(LogTest,
              "Host-only Empty pipeline dims: Mt={}, Nt={}, completed_iters={}",
              Mt, Nt, completed_iters);
+    double transfer_seconds = transfer_window_us / 1e6;
+    double effective_bw_mb_s =
+      (transfer_seconds > 0.0)
+        ? (static_cast<double>(transfer_window_bytes) / transfer_seconds) /
+            1e6
+        : 0.0;
+    log_info(LogTest,
+         "Host-only Empty effective transfer BW: total_bytes={}, "
+         "transfer_time={:.2f}us, bw={:.3f} MB/s",
+         transfer_window_bytes, transfer_window_us, effective_bw_mb_s);
     log_host_pipeline_stats("Empty", stats, completed_iters);
   } catch (const std::exception &e) {
     pass = false;
