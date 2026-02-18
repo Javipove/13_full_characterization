@@ -1725,195 +1725,236 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                      const TestParams &params) {
   bool pass = true;
   try {
+    ZoneScopedN("ComputeMM Functional Blocks");
     log_info(LogTest, "Starting Compute MM Test");
     log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
 
-    // 1. Get L1 size and arch params
     auto arch = device->arch();
-    uint32_t l1_size = get_l1_size(arch);
-    uint32_t l1_unreserved_base =
-        device->allocator()->get_base_allocator_addr(HalMemType::L1);
-    auto [math_fidelity, fp32_dest_acc_en] = get_compute_params(arch);
-
-    // 2. Calculate blocking parameters
-    auto [Mt, Nt, Kt] =
-        get_aligned_input_tile_num(params.M, params.N, params.K);
+    uint32_t l1_size = 0;
+    uint32_t l1_unreserved_base = 0;
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
     uint32_t num_cores_x = params.core_x;
     uint32_t num_cores_y = params.core_y;
     CoreCoord core_range(num_cores_x, num_cores_y);
-
-    uint32_t per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
-    uint32_t per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
-
-    tt::DataFormat data_format = (params.dtype == 0)
-                                     ? tt::DataFormat::Bfp8_b
-                                     : tt::DataFormat::Float16_b;
-    uint32_t single_tile_size = tt::tile_size(data_format);
-
-    // ---- TTNN-aligned L1 fitting for DRAM mode ----
-    // Use get_multi_dim_per_core_factor to find optimal (out_block_h,
-    // out_block_w, in0_block_w). The kernel-internal bh × bw loops handle the
-    // iteration over output blocks, so the host only creates a single program.
-    uint32_t out_block_h, out_block_w, in0_block_w;
+    uint32_t per_core_Mt = 0;
+    uint32_t per_core_Nt = 0;
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b;
+    uint32_t single_tile_size = 0;
+    uint32_t out_block_h = 0, out_block_w = 0, in0_block_w = 0;
     uint32_t num_blocks_h = 1, num_blocks_w = 1;
+    uint32_t out_subblock_h = 0, out_subblock_w = 0;
+    uint32_t in0_cb_addr = 0, in1_cb_addr = 0, in2_cb_addr = 0, out_cb_addr = 0,
+             interm_cb_addr = 0, in0_addr = 0, in1_addr = 0, out_addr = 0;
+    BenchmarkInputs inputs;
+    uint32_t effective_in0_addr = 0;
+    uint32_t effective_in1_addr = 0;
+    uint32_t effective_out_addr = 0;
 
-    if (params.use_dram) {
-      // DRAM mode: CBs sized by out_block_h × out_block_w (may be < per_core)
-      auto [obh, obw, bw] = get_multi_dim_per_core_factor(
-          per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
-          l1_unreserved_base);
-      out_block_h = obh;
-      out_block_w = obw;
-      in0_block_w = bw;
-      num_blocks_h = per_core_Mt / out_block_h;
-      num_blocks_w = per_core_Nt / out_block_w;
+    {
+      ZoneScopedN("ComputeMM Input Data Processing");
 
-      log_info(LogTest,
-               "DRAM blocking: per_core={}x{}, out_block={}x{}, "
-               "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
-               per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
-               num_blocks_w, in0_block_w, L1_SAFETY_MARGIN_BYTES / 1024);
-    } else {
-      // L1 mode: full per-core dims fit (no multi-block needed)
-      out_block_h = per_core_Mt;
-      out_block_w = per_core_Nt;
-      in0_block_w =
-          get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
-                          l1_size, l1_unreserved_base, false);
-    }
+      {
+        ZoneScopedN("ComputeMM Host Setup and Blocking");
+        l1_size = get_l1_size(arch);
+        l1_unreserved_base =
+            device->allocator()->get_base_allocator_addr(HalMemType::L1);
+        std::tie(math_fidelity, fp32_dest_acc_en) = get_compute_params(arch);
 
-    if (in0_block_w == 0) {
-      uint32_t out_cb_tiles = out_block_h * out_block_w;
-      uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
-      uint32_t avail_l1 = l1_size - l1_unreserved_base;
-      log_error(LogTest,
-                "Insufficient L1 memory for M={}, N={}, K={} "
-                "(out_block={}x{}, out_CB={}tiles={}KB, "
-                "avail_L1={}KB, dram={})",
-                params.M, params.N, params.K, out_block_h, out_block_w,
-                out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
-                params.use_dram ? "yes" : "no");
-      return false;
-    }
+        std::tie(Mt, Nt, Kt) =
+            get_aligned_input_tile_num(params.M, params.N, params.K);
 
-    // Subblock params based on out_block_h/w
-    auto [out_subblock_h, out_subblock_w] =
-        get_out_subblock_params(out_block_h, out_block_w);
+        per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+        per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
 
-    // 3. Buffer Addresses (use out_block dims for CB sizing)
-    auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
-          in0_addr, in1_addr, out_addr] =
-        get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
-                                  single_tile_size, l1_unreserved_base,
-                                  params.use_dram);
+        data_format = (params.dtype == 0) ? tt::DataFormat::Bfp8_b
+                                          : tt::DataFormat::Float16_b;
+        single_tile_size = tt::tile_size(data_format);
 
-    // 4. Prepare Inputs — always use FULL per_core dims for DRAM buffer sizing
-    auto inputs = prepare_inputs_compute_mm(
-        device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt, in0_block_w,
-        single_tile_size, in0_addr, in1_addr, in2_cb_addr, params.use_dram);
+        if (params.use_dram) {
+          auto [obh, obw, bw] = get_multi_dim_per_core_factor(
+              per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+              l1_unreserved_base);
+          out_block_h = obh;
+          out_block_w = obw;
+          in0_block_w = bw;
+          num_blocks_h = per_core_Mt / out_block_h;
+          num_blocks_w = per_core_Nt / out_block_w;
 
-    // 5. Resolve addresses: DRAM buffers override L1 addresses
-    uint32_t effective_in0_addr = in0_addr;
-    uint32_t effective_in1_addr = in1_addr;
-    uint32_t effective_out_addr = out_addr;
-    if (params.use_dram) {
-      effective_in0_addr = inputs.in0_buffer->address();
-      effective_in1_addr = inputs.in1_buffer->address();
-      effective_out_addr = inputs.out_buffer->address();
-      log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
-               effective_in0_addr, effective_in1_addr, effective_out_addr);
+          log_info(LogTest,
+                   "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+                   "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
+                   per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+                   num_blocks_h, num_blocks_w, in0_block_w,
+                   L1_SAFETY_MARGIN_BYTES / 1024);
+        } else {
+          out_block_h = per_core_Mt;
+          out_block_w = per_core_Nt;
+          in0_block_w =
+              get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                              l1_size, l1_unreserved_base, false);
+        }
+
+        if (in0_block_w == 0) {
+          uint32_t out_cb_tiles = out_block_h * out_block_w;
+          uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+          uint32_t avail_l1 = l1_size - l1_unreserved_base;
+          log_error(LogTest,
+                    "Insufficient L1 memory for M={}, N={}, K={} "
+                    "(out_block={}x{}, out_CB={}tiles={}KB, "
+                    "avail_L1={}KB, dram={})",
+                    params.M, params.N, params.K, out_block_h, out_block_w,
+                    out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                    params.use_dram ? "yes" : "no");
+          return false;
+        }
+
+        std::tie(out_subblock_h, out_subblock_w) =
+            get_out_subblock_params(out_block_h, out_block_w);
+
+        std::tie(in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+                 interm_cb_addr, in0_addr, in1_addr, out_addr) =
+            get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
+                                      single_tile_size, l1_unreserved_base,
+                                      params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMM Host Prepare Inputs");
+        inputs = prepare_inputs_compute_mm(
+            device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+            in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+            params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMM Host Resolve Buffer Addresses");
+        effective_in0_addr = in0_addr;
+        effective_in1_addr = in1_addr;
+        effective_out_addr = out_addr;
+        if (params.use_dram) {
+          effective_in0_addr = inputs.in0_buffer->address();
+          effective_in1_addr = inputs.in1_buffer->address();
+          effective_out_addr = inputs.out_buffer->address();
+          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+                   effective_in0_addr, effective_in1_addr,
+                   effective_out_addr);
+        }
+      }
     }
 
     // 6. Create Program and Run (single program — kernel handles multi-block)
     log_info(LogTest, "Num tests {}", params.num_iters);
 
     tt_metal::Program program;
-    create_program_compute_mm(
-        device, data_format, math_fidelity, fp32_dest_acc_en, single_tile_size,
-        core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h, out_subblock_w,
-        per_core_Mt, per_core_Nt, out_block_h, out_block_w, num_blocks_h,
-        num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
-        interm_cb_addr, effective_in0_addr, effective_in1_addr,
-        effective_out_addr, params.use_dram, program);
+    {
+      ZoneScopedN("ComputeMM Host Program Build");
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w,
+          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt,
+          out_block_h, out_block_w, num_blocks_h, num_blocks_w, in0_cb_addr,
+          in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
+          effective_in0_addr, effective_in1_addr, effective_out_addr,
+          params.use_dram, program);
+    }
 
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
     mesh_workload.add_program(
         tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
         std::move(program));
 
-    for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScopedN("Dispatch Overhead");
-      ZoneValue(i);
-      tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
-                                                 mesh_workload, false);
-      tt_metal::distributed::Finish(device->mesh_command_queue());
+    {
+      ZoneScopedN("ComputeMM Host Dispatch");
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("ComputeMM Host Dispatch Iteration");
+        ZoneValue(i);
+        {
+          ZoneScopedN("ComputeMM Host Enqueue");
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+        {
+          ZoneScopedN("ComputeMM Host FinishWait");
+          tt_metal::distributed::Finish(device->mesh_command_queue());
+        }
+      }
     }
 
     if (!params.bypass_check) {
+      ZoneScopedN("ComputeMM Host Post Processing");
       log_info(LogTest, "Validation Started...");
 
       // Compute Golden Reference
-      log_info(LogTest, "Computing Golden Reference (FP32)...");
-      auto golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
-                                         params.M, params.N, params.K);
+      std::vector<float> golden_vec;
+      {
+        ZoneScopedN("ComputeMM Host Golden Reference");
+        log_info(LogTest, "Computing Golden Reference (FP32)...");
+        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
+                                      params.N, params.K);
+      }
 
       // Read Back Results
       log_info(LogTest, "Reading Device Results...");
       std::vector<float> device_vec(params.M * params.N, 0.0f);
       auto *target_device = device->get_devices()[0];
 
-      if (params.use_dram) {
-        // === DRAM Readback ===
-        // Read entire output buffer from DRAM
-        std::vector<uint32_t> out_data;
-        tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
+      {
+        ZoneScopedN("ComputeMM Host Device Readback and Decode");
+        if (params.use_dram) {
+          // === DRAM Readback ===
+          // Read entire output buffer from DRAM
+          std::vector<uint32_t> out_data;
+          tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
 
-        // Unpack and untilize the full output
-        auto out_float = unpack_bfp8_tiles_into_float_vec(
-            out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-        // out_float is in tilized layout (Mt*32 rows x Nt*32 cols)
-        device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
-        // Trim to actual M x N if needed
-        if (device_vec.size() > (size_t)(params.M * params.N)) {
-          std::vector<float> trimmed(params.M * params.N, 0.0f);
-          for (uint32_t r = 0; r < params.M; ++r) {
-            for (uint32_t c = 0; c < params.N; ++c) {
-              trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+          // Unpack and untilize the full output
+          auto out_float = unpack_bfp8_tiles_into_float_vec(
+              out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
+          // out_float is in tilized layout (Mt*32 rows x Nt*32 cols)
+          device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
+          // Trim to actual M x N if needed
+          if (device_vec.size() > (size_t)(params.M * params.N)) {
+            std::vector<float> trimmed(params.M * params.N, 0.0f);
+            for (uint32_t r = 0; r < params.M; ++r) {
+              for (uint32_t c = 0; c < params.N; ++c) {
+                trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+              }
             }
+            device_vec = trimmed;
           }
-          device_vec = trimmed;
-        }
-      } else {
-        // === L1 Readback (per-core stitching) ===
-        for (int y = 0; y < (int)num_cores_y; y++) {
-          for (int x = 0; x < (int)num_cores_x; x++) {
-            CoreCoord core = {(std::size_t)x, (std::size_t)y};
-            uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
-            uint32_t read_size = core_n_tiles * single_tile_size;
+        } else {
+          // === L1 Readback (per-core stitching) ===
+          for (int y = 0; y < (int)num_cores_y; y++) {
+            for (int x = 0; x < (int)num_cores_x; x++) {
+              CoreCoord core = {(std::size_t)x, (std::size_t)y};
+              uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+              uint32_t read_size = core_n_tiles * single_tile_size;
 
-            std::vector<uint32_t> core_data_tiles;
-            tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
-                                               read_size, core_data_tiles);
+              std::vector<uint32_t> core_data_tiles;
+              tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
+                                                 read_size, core_data_tiles);
 
-            // Unpack and Untilize
-            auto core_data_float = unpack_bfp8_tiles_into_float_vec(
-                core_data_tiles, /*row_major_output=*/true,
-                /*is_exp_a=*/false);
-            auto core_data_untilized = untilize_swizzled(
-                core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+              // Unpack and Untilize
+              auto core_data_float = unpack_bfp8_tiles_into_float_vec(
+                  core_data_tiles, /*row_major_output=*/true,
+                  /*is_exp_a=*/false);
+              auto core_data_untilized = untilize_swizzled(
+                  core_data_float, per_core_Mt * 32, per_core_Nt * 32);
 
-            // Copy into global device_vec
-            uint32_t global_r_start = y * per_core_Mt * 32;
-            uint32_t global_c_start = x * per_core_Nt * 32;
-            uint32_t r_len = per_core_Mt * 32;
-            uint32_t c_len = per_core_Nt * 32;
+              // Copy into global device_vec
+              uint32_t global_r_start = y * per_core_Mt * 32;
+              uint32_t global_c_start = x * per_core_Nt * 32;
+              uint32_t r_len = per_core_Mt * 32;
+              uint32_t c_len = per_core_Nt * 32;
 
-            for (uint32_t r = 0; r < r_len; ++r) {
-              for (uint32_t c = 0; c < c_len; ++c) {
-                uint32_t global_idx =
-                    (global_r_start + r) * (params.N) + (global_c_start + c);
-                if (global_idx < device_vec.size()) {
-                  device_vec[global_idx] = core_data_untilized[r * c_len + c];
+              for (uint32_t r = 0; r < r_len; ++r) {
+                for (uint32_t c = 0; c < c_len; ++c) {
+                  uint32_t global_idx =
+                      (global_r_start + r) * (params.N) + (global_c_start + c);
+                  if (global_idx < device_vec.size()) {
+                    device_vec[global_idx] = core_data_untilized[r * c_len + c];
+                  }
                 }
               }
             }
@@ -1923,9 +1964,15 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
       // Comparison
       // Comparison
-      float pcc = get_pcc(golden_vec, device_vec);
-      float rmse = get_rmse(golden_vec, device_vec);
-      float relative_rmse = get_relative_rmse(golden_vec, device_vec);
+      float pcc = 0.0f;
+      float rmse = 0.0f;
+      float relative_rmse = 0.0f;
+      {
+        ZoneScopedN("ComputeMM Host Validation Metrics");
+        pcc = get_pcc(golden_vec, device_vec);
+        rmse = get_rmse(golden_vec, device_vec);
+        relative_rmse = get_relative_rmse(golden_vec, device_vec);
+      }
 
       log_info(LogTest,
                "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "

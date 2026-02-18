@@ -398,6 +398,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
                                    const TestParams &params) {
   bool pass = true;
   try {
+    ZoneScopedN("ComputeMM Functional Blocks");
     if (params.num_iters == 0) {
       log_error(LogTest, "Host-only ComputeMM requires --num-iters > 0");
       return false;
@@ -410,37 +411,50 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       return false;
     }
 
-    auto [Mt, Nt, Kt] =
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    uint32_t single_tile_size = 0;
+    uint32_t in0_size_bytes = 0;
+    uint32_t in1_size_bytes = 0;
+    std::shared_ptr<tt_metal::Buffer> in0_buffer;
+    std::shared_ptr<tt_metal::Buffer> in1_buffer;
+
+    {
+      ZoneScopedN("ComputeMM Input Data Processing");
+      std::tie(Mt, Nt, Kt) =
         get_aligned_input_tile_num(params.M, params.N, params.K);
 
-    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
-    uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
-    uint32_t in0_num_tiles = Mt * Kt;
-    uint32_t in1_num_tiles = Kt * Nt;
-    uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
-    uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+      tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+      single_tile_size = tt::tile_size(pipeline_data_format);
+      uint32_t in0_num_tiles = Mt * Kt;
+      uint32_t in1_num_tiles = Kt * Nt;
+      in0_size_bytes = in0_num_tiles * single_tile_size;
+      in1_size_bytes = in1_num_tiles * single_tile_size;
 
-    auto in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+      in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
         .device = device,
         .size = in0_size_bytes,
         .page_size = single_tile_size,
         .buffer_type = tt_metal::BufferType::DRAM});
 
-    auto in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+      in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
         .device = device,
         .size = in1_size_bytes,
         .page_size = single_tile_size,
         .buffer_type = tt_metal::BufferType::DRAM});
+    }
 
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
 
     for (uint32_t i = 0; i < params.num_iters; ++i) {
+      ZoneScopedN("ComputeMM Host Dispatch Iteration");
+      ZoneValue(i);
       auto t_iter_start = std::chrono::steady_clock::now();
 
       std::vector<float> in0_vec;
       std::vector<float> in1_vec;
       {
+        ZoneScopedN("ComputeMM Host Prepare Inputs");
         auto t0 = std::chrono::steady_clock::now();
         in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
         in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
@@ -453,6 +467,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       std::vector<uint32_t> in0_packed;
       std::vector<uint32_t> in1_packed;
       {
+        ZoneScopedN("ComputeMM Host Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
         auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
         in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
@@ -470,59 +485,73 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       }
 
       {
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
-        tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.write_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_written +=
-            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
-
-      std::vector<uint32_t> in0_readback;
-      std::vector<uint32_t> in1_readback;
-      {
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
-        tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.read_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_read +=
-            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
-
-      std::vector<float> in0_roundtrip;
-      std::vector<float> in1_roundtrip;
-      {
-        auto t0 = std::chrono::steady_clock::now();
-        auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
-
-        auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-
-      if (!params.bypass_check) {
-        float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
-        float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
-        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
-          log_error(LogTest,
-                    "Host-only ComputeMM roundtrip check failed at iter {}: "
-                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
-                    i, in0_pcc, in1_pcc);
-          pass = false;
-          break;
+        ZoneScopedN("ComputeMM Host Dispatch");
+        {
+          ZoneScopedN("ComputeMM Host Enqueue");
+          auto t0 = std::chrono::steady_clock::now();
+          tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
+          tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.write_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_written +=
+              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
         }
+
+        std::vector<uint32_t> in0_readback;
+        std::vector<uint32_t> in1_readback;
+        {
+          ZoneScopedN("ComputeMM Host FinishWait");
+          auto t0 = std::chrono::steady_clock::now();
+          tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
+          tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.read_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_read +=
+              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+        }
+
+        std::vector<float> in0_roundtrip;
+        std::vector<float> in1_roundtrip;
+        {
+          ZoneScopedN("ComputeMM Host Post Processing");
+          {
+            ZoneScopedN("ComputeMM Host Device Readback and Decode");
+            auto t0 = std::chrono::steady_clock::now();
+            auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+                in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+            in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+
+            auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+                in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+            in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+            auto t1 = std::chrono::steady_clock::now();
+            stats.inverse_transform_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                    .count();
+          }
+
+          if (!params.bypass_check) {
+            ZoneScopedN("ComputeMM Host Validation Metrics");
+            float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
+            float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
+            if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+              log_error(LogTest,
+                        "Host-only ComputeMM roundtrip check failed at iter {}: "
+                        "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                        i, in0_pcc, in1_pcc);
+              pass = false;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!pass) {
+        break;
       }
 
       auto t_iter_end = std::chrono::steady_clock::now();
