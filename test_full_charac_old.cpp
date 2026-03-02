@@ -107,6 +107,23 @@ void disable_persistent_kernel_cache_if_available() {
   tt::tt_metal::detail::DisablePersistentKernelCache();
 }
 
+void log_validation_sample_pairs(const std::string &tag,
+                                 const std::vector<float> &reference,
+                                 const std::vector<float> &observed,
+                                 size_t sample_count = 12) {
+  size_t common_size = std::min(reference.size(), observed.size());
+  size_t num_samples = std::min(sample_count, common_size);
+  log_info(LogTest,
+           "{} visual sample check (showing {} of {} aligned elements)",
+           tag, num_samples, common_size);
+
+  for (size_t i = 0; i < num_samples; ++i) {
+    float abs_err = std::fabs(reference[i] - observed[i]);
+    log_info(LogTest, "{} [{}] ref={:.6f}, obs={:.6f}, abs_err={:.6f}", tag,
+             i, reference[i], observed[i], abs_err);
+  }
+}
+
 } // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -538,6 +555,12 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
             ZoneScopedN("ComputeMM Host Validation Metrics");
             float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
             float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
+            if (i == 0) {
+              log_validation_sample_pairs("HostPipeline ComputeMM IN0",
+                                          in0_vec, in0_roundtrip, 12);
+              log_validation_sample_pairs("HostPipeline ComputeMM IN1",
+                                          in1_vec, in1_roundtrip, 12);
+            }
             if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
               log_error(LogTest,
                         "Host-only ComputeMM roundtrip check failed at iter {}: "
@@ -709,6 +732,10 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       if (!params.bypass_check) {
         ZoneScopedN("HostPipeline Empty Validation Metrics");
         float pcc = get_pcc(tensor_vec, roundtrip);
+        if (i == 0) {
+          log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
+                                      roundtrip, 12);
+        }
         if (pcc < 0.99f) {
           log_error(LogTest,
                     "Host-only Empty roundtrip check failed at iter {}: "
