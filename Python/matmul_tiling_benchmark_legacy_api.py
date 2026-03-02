@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import ttnn
 
+from memory_budget import detect_dram_capacity_bytes, estimate_and_account_path_usage, log_memory_report
 from benchmark_verification import verify_and_log
 
 
@@ -48,6 +49,14 @@ def to_layout_legacy_compatible(device_tensor, layout):
     raise RuntimeError("This TTNN build does not expose to_layout; cannot run device tiling path.")
 
 
+def resolve_dtype(dtype_name: str):
+    if dtype_name == "bfloat16":
+        return ttnn.bfloat16
+    if dtype_name == "bfloat8_b":
+        return ttnn.bfloat8_b
+    raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
 def make_host_inputs(m: int, k: int, n: int):
     a = torch.randn((1, 1, m, k), dtype=torch.bfloat16)
     b = torch.randn((1, 1, k, n), dtype=torch.bfloat16)
@@ -63,9 +72,8 @@ def run_host_tiling_path(
     memory_config,
     enable_verify: bool,
     visual_count: int,
+    dtype,
 ):
-    dtype = ttnn.bfloat16
-
     totals, prepares, matmuls, posts = [], [], [], []
 
     for iter_idx in range(iterations):
@@ -79,7 +87,7 @@ def run_host_tiling_path(
         p1 = time.perf_counter()
 
         m0 = time.perf_counter()
-        out_dev = ttnn.matmul(a_dev, b_dev)
+        out_dev = ttnn.matmul(a_dev, b_dev, dtype=dtype)
         synchronize(device)
         m1 = time.perf_counter()
 
@@ -123,8 +131,8 @@ def run_device_tiling_path(
     memory_config,
     enable_verify: bool,
     visual_count: int,
+    dtype,
 ):
-    dtype = ttnn.bfloat16
     row_major = ttnn.ROW_MAJOR_LAYOUT
     tile = ttnn.TILE_LAYOUT
 
@@ -143,7 +151,7 @@ def run_device_tiling_path(
         p1 = time.perf_counter()
 
         m0 = time.perf_counter()
-        out_dev = ttnn.matmul(a_dev, b_dev)
+        out_dev = ttnn.matmul(a_dev, b_dev, dtype=dtype)
         synchronize(device)
         m1 = time.perf_counter()
 
@@ -200,8 +208,13 @@ def parse_args():
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--memory-config", choices=["dram", "l1"], default="dram")
     parser.add_argument("--tiling-path", choices=["host", "accelerator", "both"], default="both")
+    parser.add_argument("--dtype", choices=["bfloat16", "bfloat8_b"], default="bfloat16")
     parser.add_argument("--verify", action="store_true", help="Enable correctness checks (PCC/relative error + visual sample)")
     parser.add_argument("--visual-count", type=int, default=12)
+    parser.add_argument("--dram-capacity-gb", type=float, default=None, help="Optional override; default is dynamic device query")
+    parser.add_argument("--dram-fallback-gb", type=float, default=12.0, help="Fallback if dynamic query is unavailable")
+    parser.add_argument("--usable-threshold-ratio", type=float, default=0.90, help="Used for informational usage percentages only")
+    parser.add_argument("--runtime-overhead-ratio", type=float, default=0.15, help="Safety factor applied to estimated memory")
     return parser.parse_args()
 
 
@@ -219,21 +232,43 @@ def parse_shape(spec: str):
 def main():
     args = parse_args()
     memory_config = ttnn.DRAM_MEMORY_CONFIG if args.memory_config == "dram" else ttnn.L1_MEMORY_CONFIG
+    dtype = resolve_dtype(args.dtype)
 
     print("[Init] Opening device")
     device = ttnn.open_device(device_id=args.device_id)
+    capacity_bytes, capacity_source = detect_dram_capacity_bytes(
+        device,
+        override_gb=args.dram_capacity_gb,
+        fallback_gb=args.dram_fallback_gb,
+    )
+    print(f"[Init] DRAM capacity source: {capacity_source}, total={capacity_bytes} bytes")
 
     try:
         for shape in args.shapes:
             m, k, n = parse_shape(shape)
             if args.memory_config == "l1" and max(m, k, n) >= 2048:
-                raise ValueError("Large shapes require DRAM memory config to avoid L1 OOM. Use --memory-config dram.")
+                print("[Warn] Large shapes in L1 may cause OOM. Recommended: --memory-config dram")
 
-            print(f"\n[Run] Shape MxKxN = {m}x{k}x{n}, iterations={args.iterations}")
+            if args.dtype == "bfloat8_b" and args.tiling_path in ("accelerator", "both"):
+                print("[Warn] bfloat8_b is TILE-layout oriented and not compatible with ROW_MAJOR staging path. Skipping accelerator path.")
+
+            print(f"\n[Run] Shape MxKxN = {m}x{k}x{n}, iterations={args.iterations}, dtype={args.dtype}")
             host_path = None
             dev_path = None
 
             if args.tiling_path in ("host", "both"):
+                host_memory_report = estimate_and_account_path_usage(
+                    path_name="host_tiling_host_untiling",
+                    m=m,
+                    k=k,
+                    n=n,
+                    dtype_name=args.dtype,
+                    capacity_bytes=capacity_bytes,
+                    usable_threshold_ratio=args.usable_threshold_ratio,
+                    runtime_overhead_ratio=args.runtime_overhead_ratio,
+                )
+                host_memory_report.capacity_source = capacity_source
+                log_memory_report(host_memory_report, f"{m}x{k}x{n}")
                 host_path = run_host_tiling_path(
                     device,
                     m,
@@ -243,10 +278,23 @@ def main():
                     memory_config,
                     args.verify,
                     args.visual_count,
+                    dtype,
                 )
                 print_result(host_path)
 
-            if args.tiling_path in ("accelerator", "both"):
+            if args.tiling_path in ("accelerator", "both") and args.dtype != "bfloat8_b":
+                device_memory_report = estimate_and_account_path_usage(
+                    path_name="device_tiling_device_untiling",
+                    m=m,
+                    k=k,
+                    n=n,
+                    dtype_name=args.dtype,
+                    capacity_bytes=capacity_bytes,
+                    usable_threshold_ratio=args.usable_threshold_ratio,
+                    runtime_overhead_ratio=args.runtime_overhead_ratio,
+                )
+                device_memory_report.capacity_source = capacity_source
+                log_memory_report(device_memory_report, f"{m}x{k}x{n}")
                 dev_path = run_device_tiling_path(
                     device,
                     m,
@@ -256,6 +304,7 @@ def main():
                     memory_config,
                     args.verify,
                     args.visual_count,
+                    dtype,
                 )
                 print_result(dev_path)
 
