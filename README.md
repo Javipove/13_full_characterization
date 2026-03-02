@@ -311,6 +311,7 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 Validation-zone policy currently enforced:
 - PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
 - This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
+- Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
 
 ### Dispatch Mode Requirement (Critical)
 
