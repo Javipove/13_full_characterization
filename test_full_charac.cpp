@@ -2379,6 +2379,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
                               const TestParams &params) {
   bool pass = true;
   try {
+    ZoneScopedN("EmptyKernel Functional Blocks");
     ////////////////////////////////////////////////////////////////////////////
     //                      Application Setup
     ////////////////////////////////////////////////////////////////////////////
@@ -2386,17 +2387,20 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
     uint32_t single_tile_size = 2 * 1024;
     // std::vector<unsigned long> elapsed_us;
 
-    for (int core_group_idx = 0; core_group_idx < params.core_groups;
-         ++core_group_idx) {
-      CoreCoord start_core = {0, (params.core_y / params.core_groups) *
-                                     core_group_idx};
-      CoreCoord end_core = {
-          (std::size_t)params.core_x - 1,
-          (core_group_idx == params.core_groups - 1)
-              ? (std::size_t)params.core_y - 1
-              : ((params.core_y / params.core_groups) * (core_group_idx + 1)) -
-                    1};
-      CoreRange group_of_cores(start_core, end_core);
+    {
+      ZoneScopedN("EmptyKernel Host Setup");
+      for (int core_group_idx = 0; core_group_idx < params.core_groups;
+           ++core_group_idx) {
+        CoreCoord start_core = {0, (params.core_y / params.core_groups) *
+                                       core_group_idx};
+        CoreCoord end_core = {
+            (std::size_t)params.core_x - 1,
+            (core_group_idx == params.core_groups - 1)
+                ? (std::size_t)params.core_y - 1
+                : ((params.core_y / params.core_groups) *
+                   (core_group_idx + 1)) -
+                      1};
+        CoreRange group_of_cores(start_core, end_core);
 
       log_info(
           LogTest, "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
@@ -2489,13 +2493,20 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
 
     // Now we should have a cache hit
     log_info(LogTest, "Num tests {}", params.num_iters);
-    for (uint32_t i = 0; i < params.num_iters; ++i) {
-      // auto t_begin = std::chrono::steady_clock::now();
-      ZoneScopedN("Empty Kernel Launch Execution");
-      ZoneValue(i);
-      tt_metal::distributed::EnqueueMeshWorkload(device->mesh_command_queue(),
-                                                 mesh_workload, false);
-      tt_metal::distributed::Finish(device->mesh_command_queue());
+    {
+      ZoneScopedN("EmptyKernel Host Dispatch");
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("EmptyKernel Host Dispatch Iteration");
+        ZoneValue(i);
+        {
+          ZoneScopedN("EmptyKernel Host Enqueue");
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+        {
+          ZoneScopedN("EmptyKernel Host FinishWait");
+          tt_metal::distributed::Finish(device->mesh_command_queue());
+        }
 
       // auto t_end = std::chrono::steady_clock::now();
       // elapsed_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t_end
