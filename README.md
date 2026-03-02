@@ -113,6 +113,46 @@ The current logic uses integer division (`rows / groups`) to assign rows. Any re
 *   **Result**:
     *   **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
 
+## API Translation: New vs Legacy
+
+This section summarizes the concrete translations needed when porting between:
+- **New API path**: `test_full_charac.cpp` (`MeshDevice` / `distributed::*`)
+- **Legacy API path**: `test_full_charac_old.cpp` (`IDevice` / single-device enqueue)
+
+| Functional Area | New API (`test_full_charac.cpp`) | Legacy API (`test_full_charac_old.cpp`) | Translation / Required Change |
+| :--- | :--- | :--- | :--- |
+| Device handle type | `std::shared_ptr<tt::tt_metal::distributed::MeshDevice>` | `tt::tt_metal::IDevice*` | Replace mesh pointer ownership with raw `IDevice*` lifecycle (`CreateDevice` / `CloseDevice`). |
+| Device creation | `MeshDevice::create_unit_mesh(device_id)` | `tt_metal::CreateDevice(device_id)` | Use legacy creator and explicit close in `main`. |
+| Device close | `device->close()` | `tt_metal::CloseDevice(device)` | Convert from method-close to free-function close. |
+| Command queue access | `device->mesh_command_queue()` | `device->command_queue()` | Replace mesh queue getter with legacy queue getter. |
+| Program container for dispatch | `distributed::MeshWorkload` + `add_program(...)` | `tt_metal::Program` directly | Remove workload wrapper and enqueue the program directly. |
+| Program enqueue | `distributed::EnqueueMeshWorkload(queue, mesh_workload, false)` | `EnqueueProgram(queue, program, false)` | One-to-one replacement in dispatch loops. |
+| Host/device synchronization | `distributed::Finish(queue)` | `Finish(queue)` | Namespace/function variant differs; behavior intent is the same. |
+| Program cache toggle | `device->enable_program_cache()` / `disable_and_clear_program_cache()` | same methods on `IDevice*` | No semantic change required. |
+| Persistent kernel cache | `detail::EnablePersistentKernelCache()` / disable | same detail APIs | No API translation needed; keep placement consistent in `main`. |
+| Host-only DRAM buffer path | `CreateBuffer`, `detail::WriteToBuffer`, `detail::ReadFromBuffer` | same calls | No translation needed for host-only tests (`--test 3`, `--test 4`). |
+| Empty-kernel dispatch tracing | `MeshWorkload` + enqueue/finish split zones | `EnqueueProgram` + `Finish` split zones | Keep identical Tracy zone names so traces are directly comparable. |
+| Sub-device model | Implemented via `CoreRange` splits inside mesh-based flow | **Not yet implemented** | Requires new legacy implementation; currently reported as known gap. |
+| ComputeMM full kernel path | Implemented in modern file | **Not yet implemented** (stub) | Legacy file currently uses host-pipeline coverage instead; full MM kernel parity still pending. |
+
+### Rationale & Limitations (From API Docs)
+
+- **Do not mix models within one flow**: avoid interleaving `MeshDevice`-style dispatch and legacy single-device dispatch in the same execution path.
+- **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
+- **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
+- **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
+- **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, full `ComputeMM` and `SubDevice` in old file are still gaps).
+
+### Tracy Zone Unification Rules
+
+When adding or porting code, preserve the same functional hierarchy in both files:
+- Top-level function block (for example `ComputeMM Functional Blocks`, `EmptyKernel Functional Blocks`)
+- Input/setup block
+- Dispatch block with per-iteration + enqueue/wait sub-zones
+- Post-processing/validation block
+
+This ensures old/new traces remain diffable with minimal manual interpretation.
+
 ## Build and Run
 
 Use the provided shell script `run_full_charac.sh` to compile and run the tests. This script handles kernel generation and copying based on the selected test type.
