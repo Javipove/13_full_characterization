@@ -219,13 +219,98 @@ Use the provided shell script `run_full_charac.sh` to compile and run the tests.
 This benchmark is instrumented with **Tracy**. To verify performance:
 1.  Compile with Tracy enabled (`-DTRACY_ENABLE=ON`).
 2.  Run the benchmark with the Tracy server (`Tracy-release`) open.
-3.  Look for zones like:
-    *   `Host->Device Transfer (L1 Write)`
-    *   `Dispatch Overhead`
-    *   `Sub-Device Parallel Dispatch`
-    *   `Prepare Inputs Compute MM`
+3.  Inspect the complete zone inventory below (exact names as present in code).
 
 Use the Tracy GUI to measure the duration of these zones.
+
+### Complete Tracy Zone Inventory (Exact Names)
+
+Inventory is grouped by test area using collapsible sections to keep this document compact.
+
+<details>
+<summary><strong>Shared Utility Zones</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `Generate FP32 Random` | new | FP32 host random tensor generation helper body. |
+
+</details>
+
+<details>
+<summary><strong>Test 1: ComputeMM</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `Prepare Inputs Compute MM` | new | Full input-preparation function for ComputeMM. |
+| `Prepare DRAM Inputs` | new | DRAM-specific branch inside ComputeMM input preparation. |
+| `Tilize and Pack IN0 (DRAM)` | new | IN0 tilize + BFP8 pack + buffer write path setup. |
+| `Tilize and Pack IN1 (DRAM)` | new | IN1 tilize + BFP8 pack + buffer write path setup. |
+| `Initialize DRAM in2 zero tile` | new | Writes per-core zero tile for DRAM mode auxiliary CB input. |
+| `Slicing and Tilizing IN0` | new | L1-mode per-core IN0 slicing + tilize + pack. |
+| `Generating and Tilizing IN1` | new | L1-mode identity-like IN1 generation + tilize + pack. |
+| `Host->Device Transfer (L1 Write)` | new | Per-core L1 writes for IN0/IN1/in2 in L1 mode. |
+| `ComputeMM Functional Blocks` | new, old | Top-level ComputeMM benchmark functional block. |
+| `ComputeMM Input Data Processing` | new, old | ComputeMM input/setup-oriented phase. |
+| `ComputeMM Host Setup and Blocking` | new | Arch/tile/blocking/address derivation phase. |
+| `ComputeMM Host Prepare Inputs` | new, old | Host-side tensor/data preparation before dispatch/readback. |
+| `ComputeMM Host Transform Inputs` | old | Host-only transform (tilize/pack) stage in legacy host-pipeline ComputeMM. |
+| `ComputeMM Host Resolve Buffer Addresses` | new | DRAM-vs-L1 effective address resolution step. |
+| `ComputeMM Host Program Build` | new | Program/kernel/cb build call for ComputeMM execution path. |
+| `ComputeMM Host Dispatch` | new, old | Dispatch phase wrapper for enqueue/wait operations. |
+| `ComputeMM Host Dispatch Iteration` | new, old | Per-iteration dispatch scope (includes iteration `ZoneValue`). |
+| `ComputeMM Host Enqueue` | new, old | Enqueue call itself (mesh enqueue or program enqueue). |
+| `ComputeMM Host FinishWait` | new, old | Queue/device finish synchronization wait. |
+| `ComputeMM Host Post Processing` | new, old | Post-dispatch validation/readback wrapper scope. |
+| `ComputeMM Host Golden Reference` | new | FP32 golden matmul reference computation. |
+| `ComputeMM Host Device Readback and Decode` | new, old | Device output readback + unpack/untilize/decode path. |
+| `ComputeMM Host Validation Metrics` | new, old | PCC/RMSE validation metric computation/checking block. |
+
+</details>
+
+<details>
+<summary><strong>Test 2: Sub-Device</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `Sub-Device Parallel Dispatch` | new | Iteration-level enqueue + finish for sub-device benchmark test. |
+
+</details>
+
+<details>
+<summary><strong>Test 3: Host Pipeline ComputeMM</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `HostPipeline ComputeMM Validation Metrics` | new | PCC checks for host-only ComputeMM pipeline roundtrip. |
+
+</details>
+
+<details>
+<summary><strong>Test 4: Host Pipeline Empty Tensor</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `HostPipeline Empty Validation Metrics` | new, old | PCC checks for host-only empty-tensor pipeline roundtrip. |
+
+</details>
+
+<details>
+<summary><strong>Test 0: Empty Kernel Launch</strong></summary>
+
+| Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
+| :--- | :--- | :--- |
+| `EmptyKernel Functional Blocks` | new, old | Top-level EmptyKernel benchmark functional block. |
+| `EmptyKernel Host Setup` | new, old | Program setup: CB creation, kernel creation, runtime args. |
+| `EmptyKernel Host Dispatch` | new, old | Empty-kernel dispatch loop wrapper. |
+| `EmptyKernel Host Dispatch Iteration` | new, old | Per-iteration empty-kernel dispatch scope. |
+| `EmptyKernel Host Enqueue` | new, old | Empty-kernel enqueue call only. |
+| `EmptyKernel Host FinishWait` | new, old | Empty-kernel finish/synchronization wait. |
+
+</details>
+
+Validation-zone policy currently enforced:
+- PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
+- This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
 
 ### Dispatch Mode Requirement (Critical)
 

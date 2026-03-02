@@ -2161,6 +2161,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
       }
 
       if (!params.bypass_check) {
+        ZoneScopedN("HostPipeline ComputeMM Validation Metrics");
         float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
         float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
         if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
@@ -2332,6 +2333,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
       }
 
       if (!params.bypass_check) {
+        ZoneScopedN("HostPipeline Empty Validation Metrics");
         float pcc = get_pcc(tensor_vec, roundtrip);
         if (pcc < 0.99f) {
           log_error(LogTest,
