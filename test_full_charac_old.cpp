@@ -707,6 +707,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       }
 
       if (!params.bypass_check) {
+        ZoneScopedN("HostPipeline Empty Validation Metrics");
         float pcc = get_pcc(tensor_vec, roundtrip);
         if (pcc < 0.99f) {
           log_error(LogTest,
