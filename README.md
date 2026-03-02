@@ -227,6 +227,30 @@ This benchmark is instrumented with **Tracy**. To verify performance:
 
 Use the Tracy GUI to measure the duration of these zones.
 
+### Dispatch Mode Requirement (Critical)
+
+This benchmark suite is intended to run in **fast dispatch** mode.
+
+- `TT_METAL_SLOW_DISPATCH_MODE` **must be unset** when running characterization tests.
+- Both binaries explicitly reject slow dispatch at startup because it changes execution semantics of host dispatch timing.
+
+Why this matters:
+- In fast dispatch, host enqueue is asynchronous and `Finish(...)` is the synchronization boundary.
+- In slow dispatch, host flow is more synchronous/direct, so measured dispatch and wait costs are not comparable to fast-dispatch data.
+- Tracy zones such as `Host Enqueue` and `Host FinishWait` lose their intended interpretation under slow dispatch.
+
+Quick check before running:
+
+```bash
+echo $TT_METAL_SLOW_DISPATCH_MODE
+```
+
+If set, clear it in your shell session:
+
+```bash
+unset TT_METAL_SLOW_DISPATCH_MODE
+```
+
 ## Architecture Specifications & Constraints
 
 It is critical to set `--x_size` and `--y_size` within the bounds of your specific device's available compute grid. The table below lists the **Logical Compute Grids** (the grid of Tensix cores exposed to the program).
