@@ -369,6 +369,8 @@ void log_host_pipeline_stats(const std::string &tag, const HostPipelineStats &s,
   double avg_read_us = s.read_us / iters;
   double avg_inverse_transform_us = s.inverse_transform_us / iters;
   double avg_end_to_end_us = s.end_to_end_us / iters;
+  double avg_write_bytes_per_iter = static_cast<double>(s.bytes_written) / iters;
+  double avg_read_bytes_per_iter = static_cast<double>(s.bytes_read) / iters;
 
   double write_seconds = s.write_us / 1e6;
   double read_seconds = s.read_us / 1e6;
@@ -382,15 +384,18 @@ void log_host_pipeline_stats(const std::string &tag, const HostPipelineStats &s,
           : 0.0;
 
   log_info(LogTest,
-           "{} host-only pipeline avg(us): gen={:.2f}, xform={:.2f}, "
-           "write={:.2f}, read={:.2f}, inv_xform={:.2f}, e2e={:.2f}",
+           "{} host-only pipeline timing (avg per iteration, us): "
+           "input_generation={:.2f}, tilize_pack_transform={:.2f}, h2d_write={:.2f}, "
+           "d2h_read={:.2f}, unpack_untilize_inverse_transform={:.2f}, host_end_to_end={:.2f}",
            tag, avg_generate_us, avg_transform_us, avg_write_us, avg_read_us,
            avg_inverse_transform_us, avg_end_to_end_us);
 
   log_info(LogTest,
-           "{} host-only transfer totals: write_bytes={}, read_bytes={}, "
-           "write_bw={:.3f} GB/s, read_bw={:.3f} GB/s",
-           tag, s.bytes_written, s.bytes_read, write_gbps, read_gbps);
+           "{} host-only transfer summary (all iterations): "
+           "total_h2d_bytes={}, total_d2h_bytes={}, avg_h2d_bytes_per_iter={:.0f}, "
+           "avg_d2h_bytes_per_iter={:.0f}, effective_h2d_bw={:.3f} GB/s, effective_d2h_bw={:.3f} GB/s",
+           tag, s.bytes_written, s.bytes_read, avg_write_bytes_per_iter,
+           avg_read_bytes_per_iter, write_gbps, read_gbps);
 }
 
 bool test_compute_mm(tt::tt_metal::IDevice * /*device*/,
@@ -415,7 +420,9 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
                                    const TestParams &params) {
   bool pass = true;
   try {
-    ZoneScopedN("ComputeMM Functional Blocks");
+    ZoneScopedN("HostPipeline ComputeMM Functional Blocks");
+    log_info(LogTest,
+             "Starting Host-Only ComputeMM Pipeline Test (no kernel dispatch)");
     if (params.num_iters == 0) {
       log_error(LogTest, "Host-only ComputeMM requires --num-iters > 0");
       return false;
@@ -436,7 +443,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     std::shared_ptr<tt_metal::Buffer> in1_buffer;
 
     {
-      ZoneScopedN("ComputeMM Input Data Processing");
+      ZoneScopedN("HostPipeline ComputeMM Input Data Processing");
       std::tie(Mt, Nt, Kt) =
         get_aligned_input_tile_num(params.M, params.N, params.K);
 
@@ -463,15 +470,16 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
 
+    ZoneScopedN("HostPipeline ComputeMM Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScopedN("ComputeMM Host Dispatch Iteration");
+      ZoneScopedN("HostPipeline ComputeMM Iteration");
       ZoneValue(i);
       auto t_iter_start = std::chrono::steady_clock::now();
 
       std::vector<float> in0_vec;
       std::vector<float> in1_vec;
       {
-        ZoneScopedN("ComputeMM Host Prepare Inputs");
+        ZoneScopedN("HostPipeline ComputeMM Prepare Inputs");
         auto t0 = std::chrono::steady_clock::now();
         in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
         in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
@@ -484,7 +492,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       std::vector<uint32_t> in0_packed;
       std::vector<uint32_t> in1_packed;
       {
-        ZoneScopedN("ComputeMM Host Transform Inputs");
+        ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
         auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
         in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
@@ -502,74 +510,68 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       }
 
       {
-        ZoneScopedN("ComputeMM Host Dispatch");
-        {
-          ZoneScopedN("ComputeMM Host Enqueue");
-          auto t0 = std::chrono::steady_clock::now();
-          tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
-          tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
-          auto t1 = std::chrono::steady_clock::now();
-          stats.write_us +=
-              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                  .count();
-          stats.bytes_written +=
-              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+        ZoneScopedN("HostPipeline ComputeMM Host Enqueue");
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
+        tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.write_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_written +=
+            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      std::vector<uint32_t> in0_readback;
+      std::vector<uint32_t> in1_readback;
+      {
+        ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
+        tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.read_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_read +=
+            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      std::vector<float> in0_roundtrip;
+      std::vector<float> in1_roundtrip;
+      {
+        ZoneScopedN("HostPipeline ComputeMM Host Post Processing");
+        auto t0 = std::chrono::steady_clock::now();
+        auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+
+        auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.inverse_transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+      }
+
+      if (!params.bypass_check) {
+        ZoneScopedN("HostPipeline ComputeMM Validation Metrics");
+        float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
+        float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
+        if (i == 0) {
+          log_validation_sample_pairs("HostPipeline ComputeMM IN0",
+                                      in0_vec, in0_roundtrip, 12);
+          log_validation_sample_pairs("HostPipeline ComputeMM IN1",
+                                      in1_vec, in1_roundtrip, 12);
         }
-
-        std::vector<uint32_t> in0_readback;
-        std::vector<uint32_t> in1_readback;
-        {
-          ZoneScopedN("ComputeMM Host FinishWait");
-          auto t0 = std::chrono::steady_clock::now();
-          tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
-          tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
-          auto t1 = std::chrono::steady_clock::now();
-          stats.read_us +=
-              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                  .count();
-          stats.bytes_read +=
-              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-        }
-
-        std::vector<float> in0_roundtrip;
-        std::vector<float> in1_roundtrip;
-        {
-          ZoneScopedN("ComputeMM Host Post Processing");
-          {
-            ZoneScopedN("ComputeMM Host Device Readback and Decode");
-            auto t0 = std::chrono::steady_clock::now();
-            auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-                in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-            in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
-
-            auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-                in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-            in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
-            auto t1 = std::chrono::steady_clock::now();
-            stats.inverse_transform_us +=
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                    .count();
-          }
-
-          if (!params.bypass_check) {
-            ZoneScopedN("ComputeMM Host Validation Metrics");
-            float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
-            float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
-            if (i == 0) {
-              log_validation_sample_pairs("HostPipeline ComputeMM IN0",
-                                          in0_vec, in0_roundtrip, 12);
-              log_validation_sample_pairs("HostPipeline ComputeMM IN1",
-                                          in1_vec, in1_roundtrip, 12);
-            }
-            if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
-              log_error(LogTest,
-                        "Host-only ComputeMM roundtrip check failed at iter {}: "
-                        "in0_pcc={:.4f}, in1_pcc={:.4f}",
-                        i, in0_pcc, in1_pcc);
-              pass = false;
-              break;
-            }
-          }
+        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+          log_error(LogTest,
+                    "Host-only ComputeMM roundtrip check failed at iter {}: "
+                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                    i, in0_pcc, in1_pcc);
+          pass = false;
+          break;
         }
       }
 
@@ -589,7 +591,8 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
              "Host-only ComputeMM pipeline dims: Mt={}, Nt={}, Kt={}, "
              "completed_iters={}",
              Mt, Nt, Kt, completed_iters);
-    log_host_pipeline_stats("ComputeMM", stats, completed_iters);
+    log_host_pipeline_stats("Test 3 (Host-Only ComputeMM Pipeline)", stats,
+                completed_iters);
   } catch (const std::exception &e) {
     pass = false;
     log_error(LogTest, "{}", e.what());
@@ -601,6 +604,9 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
                                      const TestParams &params) {
   bool pass = true;
   try {
+  ZoneScopedN("HostPipeline Empty Functional Blocks");
+  log_info(LogTest,
+       "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
     if (params.num_iters == 0) {
       log_error(LogTest, "Host-only Empty requires --num-iters > 0");
       return false;
@@ -636,11 +642,15 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
     uint64_t transfer_window_bytes = 0;
     uint32_t completed_iters = 0;
 
+    ZoneScopedN("HostPipeline Empty Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
+      ZoneScopedN("HostPipeline Empty Iteration");
+      ZoneValue(i);
       auto t_iter_start = std::chrono::steady_clock::now();
 
       std::vector<float> tensor_vec;
       {
+        ZoneScopedN("HostPipeline Empty Prepare Inputs");
         auto t0 = std::chrono::steady_clock::now();
         tensor_vec = generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
         auto t1 = std::chrono::steady_clock::now();
@@ -659,6 +669,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
 
       std::vector<uint32_t> packed;
       {
+        ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
         auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
         packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
@@ -682,6 +693,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
 
       auto t_transfer_start = std::chrono::steady_clock::now();
       {
+        ZoneScopedN("HostPipeline Empty Host Enqueue");
         auto t0 = std::chrono::steady_clock::now();
         tt_metal::detail::WriteToBuffer(tensor_buffer, packed);
         auto t1 = std::chrono::steady_clock::now();
@@ -693,6 +705,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
 
       std::vector<uint32_t> readback;
       {
+        ZoneScopedN("HostPipeline Empty Host FinishWait");
         auto t0 = std::chrono::steady_clock::now();
         tt_metal::detail::ReadFromBuffer(tensor_buffer, readback);
         auto t1 = std::chrono::steady_clock::now();
@@ -719,6 +732,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
 
       std::vector<float> roundtrip;
       {
+        ZoneScopedN("HostPipeline Empty Host Post Processing");
         auto t0 = std::chrono::steady_clock::now();
         auto unpacked = unpack_bfp8_tiles_into_float_vec(
             readback, /*row_major_output=*/true, /*is_exp_a=*/false);
@@ -767,7 +781,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
          "Host-only Empty effective transfer BW: total_bytes={}, "
          "transfer_time={:.2f}us, bw={:.3f} MB/s",
          transfer_window_bytes, transfer_window_us, effective_bw_mb_s);
-    log_host_pipeline_stats("Empty", stats, completed_iters);
+    log_host_pipeline_stats("Test 4 (Host-Only Empty Tensor Pipeline)", stats,
+                completed_iters);
   } catch (const std::exception &e) {
     pass = false;
     log_error(LogTest, "{}", e.what());

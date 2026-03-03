@@ -308,7 +308,15 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 
 | Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
 | :--- | :--- | :--- |
-| `HostPipeline ComputeMM Validation Metrics` | new | PCC checks for host-only ComputeMM pipeline roundtrip. |
+| `HostPipeline ComputeMM Functional Blocks` | new, old | Top-level host-pipeline ComputeMM benchmark block. |
+| `HostPipeline ComputeMM Host Dispatch` | new, old | Iteration loop wrapper for host-only pipeline operations. |
+| `HostPipeline ComputeMM Iteration` | new, old | Per-iteration wrapper (includes iteration `ZoneValue`). |
+| `HostPipeline ComputeMM Prepare Inputs` | new, old | FP32 input tensor generation stage. |
+| `HostPipeline ComputeMM Transform Inputs` | new, old | Tilize + BFP8 pack stage for both input tensors. |
+| `HostPipeline ComputeMM Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for both tensors. |
+| `HostPipeline ComputeMM Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for both tensors. |
+| `HostPipeline ComputeMM Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
+| `HostPipeline ComputeMM Validation Metrics` | new, old | PCC checks for host-only ComputeMM pipeline roundtrip. |
 
 </details>
 
@@ -317,6 +325,14 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 
 | Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
 | :--- | :--- | :--- |
+| `HostPipeline Empty Functional Blocks` | new, old | Top-level host-pipeline empty-tensor benchmark block. |
+| `HostPipeline Empty Host Dispatch` | new, old | Iteration loop wrapper for host-only pipeline operations. |
+| `HostPipeline Empty Iteration` | new, old | Per-iteration wrapper (includes iteration `ZoneValue`). |
+| `HostPipeline Empty Prepare Inputs` | new, old | FP32 tensor generation stage. |
+| `HostPipeline Empty Transform Inputs` | new, old | Tilize + BFP8 pack stage for single tensor. |
+| `HostPipeline Empty Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for tensor. |
+| `HostPipeline Empty Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for tensor. |
+| `HostPipeline Empty Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
 | `HostPipeline Empty Validation Metrics` | new, old | PCC checks for host-only empty-tensor pipeline roundtrip. |
 
 </details>
