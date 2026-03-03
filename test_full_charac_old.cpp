@@ -483,6 +483,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
 
+    {
     ZoneScopedN("HostPipeline ComputeMM Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("HostPipeline ComputeMM Iteration");
@@ -507,15 +508,15 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
-        in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
-                                        /*row_major_input=*/true,
-                                        /*is_exp_a=*/false);
+        auto in0_tilized = tilize(in0_vec, Mt * 32, Kt * 32);
+        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_tilized,
+                                                 /*row_major_input=*/true,
+                                                 /*is_exp_a=*/false);
 
-        auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
-        in1_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
-                                        /*row_major_input=*/true,
-                                        /*is_exp_a=*/false);
+        auto in1_tilized = tilize(in1_vec, Kt * 32, Nt * 32);
+        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_tilized,
+                                                 /*row_major_input=*/true,
+                                                 /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
         stats.transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -557,11 +558,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
             in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+        in0_roundtrip = untilize(in0_unpacked, Mt * 32, Kt * 32);
 
         auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
             in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+        in1_roundtrip = untilize(in1_unpacked, Kt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -598,6 +599,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
                                                                  t_iter_start)
               .count();
       completed_iters++;
+    }
     }
 
     log_info(LogTest,
@@ -655,6 +657,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
     uint64_t transfer_window_bytes = 0;
     uint32_t completed_iters = 0;
 
+    {
     ZoneScopedN("HostPipeline Empty Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("HostPipeline Empty Iteration");
@@ -684,10 +687,10 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
-        packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
-                                    /*row_major_input=*/true,
-                                    /*is_exp_a=*/false);
+        auto tilized = tilize(tensor_vec, Mt * 32, Nt * 32);
+        packed = pack_fp32_vec_as_bfp8_tiles(tilized,
+                                             /*row_major_input=*/true,
+                                             /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
         stats.transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -749,7 +752,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         auto unpacked = unpack_bfp8_tiles_into_float_vec(
             readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        roundtrip = untilize_swizzled(unpacked, Mt * 32, Nt * 32);
+        roundtrip = untilize(unpacked, Mt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -779,6 +782,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
                                                                  t_iter_start)
               .count();
       completed_iters++;
+    }
     }
 
     log_info(LogTest,
@@ -900,6 +904,8 @@ bool test_empty_kernel_launch(tt::tt_metal::IDevice *device,
           SetRuntimeArgs(program, reader_kernel, core, reader_runtime_args);
         }
       }
+    }
+
     }
 
     ////////////////////////////////////////////////////////////////////////////

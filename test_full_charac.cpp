@@ -2109,6 +2109,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
 
+    {
     ZoneScopedN("HostPipeline ComputeMM Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("HostPipeline ComputeMM Iteration");
@@ -2220,6 +2221,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
               .count();
       completed_iters++;
     }
+    }
 
     log_info(LogTest,
              "Host-only ComputeMM pipeline dims: Mt={}, Nt={}, Kt={}, "
@@ -2280,6 +2282,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
     uint64_t transfer_window_bytes = 0;
     uint32_t completed_iters = 0;
 
+    {
     ZoneScopedN("HostPipeline Empty Host Dispatch");
     for (uint32_t i = 0; i < params.num_iters; ++i) {
       ZoneScopedN("HostPipeline Empty Iteration");
@@ -2404,6 +2407,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
                                                                  t_iter_start)
               .count();
       completed_iters++;
+    }
     }
 
     log_info(LogTest,
