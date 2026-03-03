@@ -2433,71 +2433,75 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
                       1};
         CoreRange group_of_cores(start_core, end_core);
 
-      log_info(
-          LogTest, "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
-          core_group_idx, start_core.x, start_core.y, end_core.x, end_core.y);
+        log_info(
+            LogTest,
+            "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
+            core_group_idx, start_core.x, start_core.y, end_core.x,
+            end_core.y);
 
-      for (int i = start_core.y; i <= end_core.y; i++) {
-        for (int j = start_core.x; j <= end_core.x; j++) {
-          CoreCoord core = {(std::size_t)j, (std::size_t)i};
-          uint32_t cb_index = 0;
-          uint32_t cb_tiles = 8;
-          tt_metal::CircularBufferConfig cb_config =
-              tt_metal::CircularBufferConfig(
-                  cb_tiles * single_tile_size,
-                  {{cb_index, tt::DataFormat::Float16_b}})
-                  .set_page_size(cb_index, single_tile_size);
-          tt_metal::CreateCircularBuffer(program, core, cb_config);
-        }
-      }
-
-      std::vector<uint32_t> reader_compile_args = {uint32_t(core_group_idx)};
-      auto reader_kernel = tt_metal::CreateKernel(
-          program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-          "kernels/"
-          "empty_reader.cpp",
-          group_of_cores,
-          tt_metal::DataMovementConfig{
-              .processor = tt_metal::DataMovementProcessor::RISCV_1,
-              .noc = tt_metal::NOC::RISCV_1_default,
-              .compile_args = reader_compile_args});
-
-      std::vector<uint32_t> writer_compile_args = {uint32_t(core_group_idx)};
-      auto writer_kernel = tt_metal::CreateKernel(
-          program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-          "kernels/"
-          "empty_writer.cpp",
-          group_of_cores,
-          tt_metal::DataMovementConfig{
-              .processor = tt_metal::DataMovementProcessor::RISCV_0,
-              .noc = tt_metal::NOC::RISCV_0_default,
-              .compile_args = writer_compile_args});
-
-      std::vector<uint32_t> compute_compile_args = {uint32_t(core_group_idx)};
-      tt_metal::CreateKernel(
-          program,
-          "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-          "kernels/"
-          "empty_compute.cpp",
-          group_of_cores,
-          tt_metal::ComputeConfig{.compile_args = compute_compile_args});
-
-      for (int i = start_core.y; i <= end_core.y; i++) {
-        for (int j = start_core.x; j <= end_core.x; j++) {
-          CoreCoord core = {(std::size_t)j, (std::size_t)i};
-          int core_index = (i * params.core_x) + j;
-
-          std::vector<uint32_t> reader_runtime_args(params.num_rt_args);
-          std::vector<uint32_t> writer_runtime_args(params.num_rt_args);
-          for (uint32_t k = 0; k < params.num_rt_args; ++k) {
-            reader_runtime_args[k] = core_index + k;
-            writer_runtime_args[k] = core_index + k;
+        for (int i = start_core.y; i <= end_core.y; i++) {
+          for (int j = start_core.x; j <= end_core.x; j++) {
+            CoreCoord core = {(std::size_t)j, (std::size_t)i};
+            uint32_t cb_index = 0;
+            uint32_t cb_tiles = 8;
+            tt_metal::CircularBufferConfig cb_config =
+                tt_metal::CircularBufferConfig(
+                    cb_tiles * single_tile_size,
+                    {{cb_index, tt::DataFormat::Float16_b}})
+                    .set_page_size(cb_index, single_tile_size);
+            tt_metal::CreateCircularBuffer(program, core, cb_config);
           }
+        }
 
-          SetRuntimeArgs(program, writer_kernel, core, writer_runtime_args);
-          SetRuntimeArgs(program, reader_kernel, core, reader_runtime_args);
+        std::vector<uint32_t> reader_compile_args = {uint32_t(core_group_idx)};
+        auto reader_kernel = tt_metal::CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+            "kernels/"
+            "empty_reader.cpp",
+            group_of_cores,
+            tt_metal::DataMovementConfig{
+                .processor = tt_metal::DataMovementProcessor::RISCV_1,
+                .noc = tt_metal::NOC::RISCV_1_default,
+                .compile_args = reader_compile_args});
+
+        std::vector<uint32_t> writer_compile_args = {uint32_t(core_group_idx)};
+        auto writer_kernel = tt_metal::CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+            "kernels/"
+            "empty_writer.cpp",
+            group_of_cores,
+            tt_metal::DataMovementConfig{
+                .processor = tt_metal::DataMovementProcessor::RISCV_0,
+                .noc = tt_metal::NOC::RISCV_0_default,
+                .compile_args = writer_compile_args});
+
+        std::vector<uint32_t> compute_compile_args = {
+            uint32_t(core_group_idx)};
+        tt_metal::CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
+            "kernels/"
+            "empty_compute.cpp",
+            group_of_cores,
+            tt_metal::ComputeConfig{.compile_args = compute_compile_args});
+
+        for (int i = start_core.y; i <= end_core.y; i++) {
+          for (int j = start_core.x; j <= end_core.x; j++) {
+            CoreCoord core = {(std::size_t)j, (std::size_t)i};
+            int core_index = (i * params.core_x) + j;
+
+            std::vector<uint32_t> reader_runtime_args(params.num_rt_args);
+            std::vector<uint32_t> writer_runtime_args(params.num_rt_args);
+            for (uint32_t k = 0; k < params.num_rt_args; ++k) {
+              reader_runtime_args[k] = core_index + k;
+              writer_runtime_args[k] = core_index + k;
+            }
+
+            SetRuntimeArgs(program, writer_kernel, core, writer_runtime_args);
+            SetRuntimeArgs(program, reader_kernel, core, reader_runtime_args);
+          }
         }
       }
     }
@@ -2539,10 +2543,11 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
           tt_metal::distributed::Finish(device->mesh_command_queue());
         }
 
-      // auto t_end = std::chrono::steady_clock::now();
-      // elapsed_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t_end
-      // - t_begin).count()); log_info(LogTest, "Time elapsed for executing
-      // empty kernels: {}us", elapsed_us[i]);
+        // auto t_end = std::chrono::steady_clock::now();
+        // elapsed_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(t_end
+        // - t_begin).count()); log_info(LogTest, "Time elapsed for executing
+        // empty kernels: {}us", elapsed_us[i]);
+      }
     }
 
     // Calculate stats
