@@ -105,7 +105,7 @@ The current logic uses integer division (`rows / groups`) to assign rows. Any re
 *   **Result**:
     *   **Group 0**: Rows 0-1 (8x2 grid, 16 cores)
     *   **Group 1**: Rows 2-3 (8x2 grid, 16 cores)
-    *   **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *<-- Absorbs remainder*
+    *   **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *(absorbs remainder)*
 
 **3. Row-Level Turn (8 Groups)**
 *   `--y_size 8 --core-groups 8`
@@ -161,58 +161,85 @@ Use the provided shell script `run_full_charac.sh` to compile and run the tests.
 ./run_full_charac.sh [path_to_executable] [arguments...]
 ```
 
-### Common Arguments
+### CLI Quick Reference (Current)
 
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--test <ID>` | `5` | Test Type ID (0=Empty, 1=ComputeMM, 2=SubDevice, 3=HostPipelineComputeMM, 4=HostPipelineEmpty). |
-| `--x_size <N>` | `0` (Max) | Number of columns in the core grid. |
-| `--y_size <N>` | `0` (Max) | Number of rows in the core grid. |
-| `--num-iters <N>` | `15` | Number of iterations to run the dispatch loop. |
-| `--core-groups <N>`| `2` | Number of sub-devices/splits for Test 2. |
-| `--clean-mode <0/1>`| `0` | If 1, cleans kernel cache before running. |
+All currently parsed options are listed below.
 
-### Matrix Arguments (for ComputeMM and SubDeviceMM)
+<details>
+<summary><strong>Show CLI options table</strong></summary>
 
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--m <N>` | `11264` | M dimension of the matrix. |
-| `--n <N>` | `3072` | N dimension of the matrix. |
-| `--k <N>` | `768` | K dimension of the matrix. |
-| `--dtype <0/1>` | `0` | Data type (0=BFP8, 1=FP16). |
-| `--fidel <0/1>` | `0` | Math fidelity (0=LoFi, 1=HiFi). |
+| Group | Option | Default | Applies To | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| Test Select | `--test <0..5>` | `5` | all | Test ID: `0` EmptyKernel, `1` ComputeMM, `2` SubDevice, `3` HostPipelineComputeMM, `4` HostPipelineEmpty (`5` = invalid sentinel). |
+| Matrix | `--m <N>` | `11264` | test 1,2,3,4 | Matrix/tensor M dimension. |
+| Matrix | `--n <N>` | `3072` | test 1,2,3,4 | Matrix/tensor N dimension. |
+| Matrix | `--k <N>` | `768` | test 1,2,3,4 | Matrix/tensor K dimension. |
+| Precision | `--dtype <0-1>` | `0` | test 1,2,3,4 | Data format selector (`0` BFP8, `1` FP16). Host-only paths currently enforce `0`. |
+| Precision | `--fidel <0-1>` | `0` | test 1,2 | Math fidelity selector. |
+| Layout/IO | `--dram` | off | test 1 | Enable DRAM-backed tensor path/kernels for ComputeMM. |
+| Cache | `--cache` | off | all | Enable program cache + persistent kernel cache lifecycle in benchmark run. |
+| Cache | `--clean-mode <0-1>` | `0` | all | Cache experiment mode; `1` invalidates cache benefits for that run. |
+| Grid | `--x_size <N>` | `0` | test 0,1,2 | Core grid X (columns). |
+| Grid | `--y_size <N>` | `0` | test 0,1,2 | Core grid Y (rows). |
+| Grid | `--core_groups <N>` | `1` | test 0,2 | Number of core groups (sub-partitions). Must be `> 0`. |
+| Runtime | `--num-iters <N>` | `15` | all | Benchmark iteration count. |
+| Runtime | `--num-rt-args <N>` | `255` | test 0 | Number of runtime args used by empty-kernel setup path. |
+| Runtime | `--cpu <id>` | `0xFFFFFFFF` | all | Optional CPU affinity pinning. Sentinel means no pinning. |
+| Validation | `--bypass-check` | off | test 1,3,4 | Skip correctness checks (PCC/RMSE and visual validation samples). |
 
-## Examples
+</details>
 
-**1. Run Empty Kernel Launch on full grid:**
+Notes:
+- If both `--x_size` and `--y_size` are `0`, the current implementation defaults to single-core `1x1` execution.
+- `--core_groups` must be `<= --y_size` when explicit grid sizes are provided.
+
+### Example Commands
+
+<details>
+<summary><strong>Show examples (grouped)</strong></summary>
+
+**Empty / Baseline**
+
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50
 ```
 
-**2. Run Compute MM on a 1x1 grid (Single Core Benchmarking):**
+**ComputeMM**
+
 ```bash
+# Single-core
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --x_size 1 --y_size 1 --m 512 --n 512 --k 512
-```
 
-**3. Run Compute MM on a 8x8 grid:**
-```bash
+# 8x8 grid
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --x_size 8 --y_size 8
+
+# DRAM mode + cache enabled
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --cache --x_size 8 --y_size 8 --m 4096 --n 4096 --k 4096
 ```
 
-**4. Run Sub-Device Parallelism Test (Requires >= 2 rows):**
+**Sub-Device**
+
 ```bash
-./run_full_charac.sh ./build/test/test_full_charac --test 2 --x_size 8 --y_size 4
+./run_full_charac.sh ./build/test/test_full_charac --test 2 --x_size 8 --y_size 4 --core_groups 2
 ```
 
-**5. Run Host-Only ComputeMM Pipeline (no kernels):**
+**Host-only Pipelines**
+
 ```bash
+# ComputeMM host pipeline
 ./run_full_charac.sh ./build/test/test_full_charac --test 3 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
-```
 
-**6. Run Host-Only Empty Tensor Pipeline (no kernels):**
-```bash
+# Empty tensor host pipeline
 ./run_full_charac.sh ./build/test/test_full_charac --test 4 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
 ```
+
+**CPU pinning (optional)**
+
+```bash
+./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3
+```
+
+</details>
 
 ## Profiling
 
