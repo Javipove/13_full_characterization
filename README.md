@@ -1,37 +1,39 @@
 # Tenstorrent Full Characterization Benchmark
 
+<!-- markdownlint-disable MD033 -->
+
 This benchmark suite (`13_full_characterization`) is designed to characterize Host overheads, Data Movement, and Dispatching efficiency on Tenstorrent architectures using the `MeshDevice` and `MeshWorkload` APIs.
 
 ## Test Types
 
 The benchmark supports the following test types, selected via the `--test` argument:
 
-1.  **Empty Kernel Launch (`--test 0`)**:
-    *   **Purpose**: Measures the pure overhead of dispatching and launching kernels with minimal compute/data movement.
-    *   **Mechanism**: Launches empty reader/writer/compute kernels.
+1. **Empty Kernel Launch (`--test 0`)**:
+    * **Purpose**: Measures the pure overhead of dispatching and launching kernels with minimal compute/data movement.
+    * **Mechanism**: Launches empty reader/writer/compute kernels.
 
-2.  **Compute MM (`--test 1`)**:
-    *   **Purpose**: Benchmarks the "Host Overhead" (Data Generation, Tiling, Transfer) and "Dispatch Overhead" for a standard Matrix Multiplication.
-    *   **Mechanism**: Runs a dense MatMul (M x N x K).
-    *   **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
-    *   **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
+2. **Compute MM (`--test 1`)**:
+    * **Purpose**: Benchmarks the "Host Overhead" (Data Generation, Tiling, Transfer) and "Dispatch Overhead" for a standard Matrix Multiplication.
+    * **Mechanism**: Runs a dense MatMul (M x N x K).
+    * **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
+    * **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
 
-3.  **Sub-Device Parallelism (`--test 2`)**:
-    *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
-    *   **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
-    *   **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
-        *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
-        *   Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
+3. **Sub-Device Parallelism (`--test 2`)**:
+    * **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
+    * **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
+    * **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
+        * You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
+        * Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
 
-4.  **Host Pipeline ComputeMM (`--test 3`)**:
-    *   **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
-    *   **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
-    *   **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
+4. **Host Pipeline ComputeMM (`--test 3`)**:
+    * **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
+    * **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
+    * **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
 
-5.  **Host Pipeline Empty Tensor (`--test 4`)**:
-    *   **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
-    *   **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
-    *   **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
+5. **Host Pipeline Empty Tensor (`--test 4`)**:
+    * **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
+    * **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
+    * **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
 
 ## Host-Only Tests Deep Dive (`--test 3` vs `--test 4`)
 
@@ -40,6 +42,7 @@ Both tests are **host-only data-path benchmarks**. They do not create a `Program
 ### Shared Pipeline Stages
 
 Each iteration executes:
+
 1. Generate FP32 tensor(s) on host.
 2. Transform to device-ready layout (`tilize_swizzled` + `pack_as_bfp8_tiles`).
 3. Write packed tensor(s) to DRAM (`WriteToBuffer`).
@@ -59,65 +62,53 @@ Each iteration executes:
 
 ### Reported Metrics
 
-- `generate`: host-side random tensor generation.
-- `transform`: tilize + pack to BFP8 format.
-- `write`: DRAM write time for packed tensor payloads.
-- `read`: DRAM read time for packed tensor payloads.
-- `inverse_transform`: unpack + untilize back to row-major FP32.
-- `end_to_end`: full iteration wall time.
-- Throughput summary: total bytes and effective GB/s for write and read.
+* `generate`: host-side random tensor generation.
+* `transform`: tilize + pack to BFP8 format.
+* `write`: DRAM write time for packed tensor payloads.
+* `read`: DRAM read time for packed tensor payloads.
+* `inverse_transform`: unpack + untilize back to row-major FP32.
+* `end_to_end`: full iteration wall time.
+* Throughput summary: total bytes and effective GB/s for write and read.
 
 Current constraints:
-- Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
-- `--num-iters` must be greater than 0.
 
-## Validation Status (Current Debugging Campaign)
-
-The table below tracks configurations explicitly validated or currently under validation.
-
-| Test ID | Test Name | Mode | Scope / Shape | Status | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `--test 0` | Empty Kernel Launch | N/A | Standard dispatch path | ✅ Proven working | Stable baseline; dispatch-only path works as expected. |
-| `--test 1` | ComputeMM | `L1` | Small tensor sizes | ✅ Proven working | L1 path works for small sizes. |
-| `--test 1` | ComputeMM | `DRAM` | `6x6` grid | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
-| `--test 1` | ComputeMM | `DRAM` | `1x1` grid | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
-| `--test 1` | ComputeMM | `DRAM` | `2x2` grid | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
-| `--test 3` | Host Pipeline ComputeMM | Host-only | FP32→BFP8→DRAM→BFP8→FP32 | ✅ Included in validation scope | Implemented and ready for scaling/overhead campaigns (no kernel dispatch). |
-| `--test 4` | Host Pipeline Empty Tensor | Host-only | Single-tensor host pipeline | ✅ Included in validation scope | Implemented and ready for baseline host overhead studies. |
-
-Notes:
-- This section is intentionally conservative and updated as new runs are confirmed.
-- `--test 2` (SubDevice) and unlisted shape/grid combinations remain to be validated in this campaign.
+* Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
+* `--num-iters` must be greater than 0.
 
 ### Partitioning Logic Examples
+
 The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core-groups`:
 
-**1. Perfect Split (2 Groups)**
-*   `--y_size 8 --core-groups 2`
-*   **Math**: `8 / 2 = 4` rows per group.
-*   **Result**:
-    *   **Group 0**: Rows 0-3 (8x4 grid, 32 cores)
-    *   **Group 1**: Rows 4-7 (8x4 grid, 32 cores)
+#### 1. Perfect Split (2 Groups)
 
-**2. Uneven Split (3 Groups)**
-*   `--y_size 8 --core-groups 3`
-*   **Math**: `8 / 3 = 2` rows per group (integer division). Remainder goes to the last group.
-*   **Result**:
-    *   **Group 0**: Rows 0-1 (8x2 grid, 16 cores)
-    *   **Group 1**: Rows 2-3 (8x2 grid, 16 cores)
-    *   **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *(absorbs remainder)*
+* `--y_size 8 --core-groups 2`
+* **Math**: `8 / 2 = 4` rows per group.
+* **Result**:
+  * **Group 0**: Rows 0-3 (8x4 grid, 32 cores)
+  * **Group 1**: Rows 4-7 (8x4 grid, 32 cores)
 
-**3. Row-Level Turn (8 Groups)**
-*   `--y_size 8 --core-groups 8`
-*   **Math**: `8 / 8 = 1` row per group.
-*   **Result**:
-    *   **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
+#### 2. Uneven Split (3 Groups)
+
+* `--y_size 8 --core-groups 3`
+* **Math**: `8 / 3 = 2` rows per group (integer division). Remainder goes to the last group.
+* **Result**:
+  * **Group 0**: Rows 0-1 (8x2 grid, 16 cores)
+  * **Group 1**: Rows 2-3 (8x2 grid, 16 cores)
+  * **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *(absorbs remainder)*
+
+#### 3. Row-Level Turn (8 Groups)
+
+* `--y_size 8 --core-groups 8`
+* **Math**: `8 / 8 = 1` row per group.
+* **Result**:
+  * **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
 
 ## API Translation: New vs Legacy
 
 This section summarizes the concrete translations needed when porting between:
-- **New API path**: `test_full_charac.cpp` (`MeshDevice` / `distributed::*`)
-- **Legacy API path**: `test_full_charac_old.cpp` (`IDevice` / single-device enqueue)
+
+* **New API path**: `test_full_charac.cpp` (`MeshDevice` / `distributed::*`)
+* **Legacy API path**: `test_full_charac_old.cpp` (`IDevice` / single-device enqueue)
 
 | Functional Area | New API (`test_full_charac.cpp`) | Legacy API (`test_full_charac_old.cpp`) | Translation / Required Change |
 | :--- | :--- | :--- | :--- |
@@ -137,19 +128,20 @@ This section summarizes the concrete translations needed when porting between:
 
 ### Rationale & Limitations (From API Docs)
 
-- **Do not mix models within one flow**: avoid interleaving `MeshDevice`-style dispatch and legacy single-device dispatch in the same execution path.
-- **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
-- **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
-- **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
-- **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, full `ComputeMM` and `SubDevice` in old file are still gaps).
+* **Do not mix models within one flow**: avoid interleaving `MeshDevice`-style dispatch and legacy single-device dispatch in the same execution path.
+* **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
+* **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
+* **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
+* **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, full `ComputeMM` and `SubDevice` in old file are still gaps).
 
 ### Tracy Zone Unification Rules
 
 When adding or porting code, preserve the same functional hierarchy in both files:
-- Top-level function block (for example `ComputeMM Functional Blocks`, `EmptyKernel Functional Blocks`)
-- Input/setup block
-- Dispatch block with per-iteration + enqueue/wait sub-zones
-- Post-processing/validation block
+
+* Top-level function block (for example `ComputeMM Functional Blocks`, `EmptyKernel Functional Blocks`)
+* Input/setup block
+* Dispatch block with per-iteration + enqueue/wait sub-zones
+* Post-processing/validation block
 
 This ensures old/new traces remain diffable with minimal manual interpretation.
 
@@ -190,21 +182,22 @@ All currently parsed options are listed below.
 </details>
 
 Notes:
-- If both `--x_size` and `--y_size` are `0`, the current implementation defaults to single-core `1x1` execution.
-- `--core_groups` must be `<= --y_size` when explicit grid sizes are provided.
+
+* If both `--x_size` and `--y_size` are `0`, the current implementation defaults to single-core `1x1` execution.
+* `--core_groups` must be `<= --y_size` when explicit grid sizes are provided.
 
 ### Example Commands
 
 <details>
 <summary><strong>Show examples (grouped)</strong></summary>
 
-**Empty / Baseline**
+#### Empty / Baseline
 
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50
 ```
 
-**ComputeMM**
+#### ComputeMM
 
 ```bash
 # Single-core
@@ -217,13 +210,13 @@ Notes:
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --cache --x_size 8 --y_size 8 --m 4096 --n 4096 --k 4096
 ```
 
-**Sub-Device**
+#### Sub-Device
 
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 2 --x_size 8 --y_size 4 --core_groups 2
 ```
 
-**Host-only Pipelines**
+#### Host-only Pipelines
 
 ```bash
 # ComputeMM host pipeline
@@ -233,7 +226,7 @@ Notes:
 ./run_full_charac.sh ./build/test/test_full_charac --test 4 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
 ```
 
-**CPU pinning (optional)**
+#### CPU pinning (optional)
 
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3
@@ -244,9 +237,10 @@ Notes:
 ## Profiling
 
 This benchmark is instrumented with **Tracy**. To verify performance:
-1.  Compile with Tracy enabled (`-DTRACY_ENABLE=ON`).
-2.  Run the benchmark with the Tracy server (`Tracy-release`) open.
-3.  Inspect the complete zone inventory below (exact names as present in code).
+
+1. Compile with Tracy enabled (`-DTRACY_ENABLE=ON`).
+2. Run the benchmark with the Tracy server (`Tracy-release`) open.
+3. Inspect the complete zone inventory below (exact names as present in code).
 
 Use the Tracy GUI to measure the duration of these zones.
 
@@ -352,21 +346,23 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 </details>
 
 Validation-zone policy currently enforced:
-- PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
-- This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
-- Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
+
+* PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
+* This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
+* Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
 
 ### Dispatch Mode Requirement (Critical)
 
 This benchmark suite is intended to run in **fast dispatch** mode.
 
-- `TT_METAL_SLOW_DISPATCH_MODE` **must be unset** when running characterization tests.
-- Both binaries explicitly reject slow dispatch at startup because it changes execution semantics of host dispatch timing.
+* `TT_METAL_SLOW_DISPATCH_MODE` **must be unset** when running characterization tests.
+* Both binaries explicitly reject slow dispatch at startup because it changes execution semantics of host dispatch timing.
 
 Why this matters:
-- In fast dispatch, host enqueue is asynchronous and `Finish(...)` is the synchronization boundary.
-- In slow dispatch, host flow is more synchronous/direct, so measured dispatch and wait costs are not comparable to fast-dispatch data.
-- Tracy zones such as `Host Enqueue` and `Host FinishWait` lose their intended interpretation under slow dispatch.
+
+* In fast dispatch, host enqueue is asynchronous and `Finish(...)` is the synchronization boundary.
+* In slow dispatch, host flow is more synchronous/direct, so measured dispatch and wait costs are not comparable to fast-dispatch data.
+* Tracy zones such as `Host Enqueue` and `Host FinishWait` lose their intended interpretation under slow dispatch.
 
 Quick check before running:
 
@@ -395,16 +391,159 @@ It is critical to set `--x_size` and `--y_size` within the bounds of your specif
 *\*\*N150 is a single-chip card. While the unharvested grid is 8x9 (72 cores), manufacturing harvesting often reduces this (e.g., to 8x8 or 8x7).*
 
 ### Device Variants & Grid Sizes
-*   **Wormhole N150**: Features a single ASIC with up to 72 usable Tensix cores. Logical grid varies by harvesting but **8x9** is the unharvested max.
-*   **Wormhole N300**: Features two ASICs. Each ASIC is harvested to exactly **64 cores** (typically **8x8** logical grid) to ensure consistent performance across chips.
-*   **Grayskull E150**: Features 120 usable cores in a 12x10 grid. E75 variant is harvested to ~88 cores.
+
+* **Wormhole N150**: Features a single ASIC with up to 72 usable Tensix cores. Logical grid varies by harvesting but **8x9** is the unharvested max.
+* **Wormhole N300**: Features two ASICs. Each ASIC is harvested to exactly **64 cores** (typically **8x8** logical grid) to ensure consistent performance across chips.
+* **Grayskull E150**: Features 120 usable cores in a 12x10 grid. E75 variant is harvested to ~88 cores.
 
 ### N150 vs N300 Impact
-*   **Grid Size**: If running on N150, you *might* have access to an 8x9 grid. On N300 (Device 0), you are likely limited to 8x8.
-*   **This Benchmark**: Runs on **Device 0** only. On an N300, this subjects the test to the thermal environment of a dual-chip card, but execution logic remains identical to N150.
+
+* **Grid Size**: If running on N150, you *might* have access to an 8x9 grid. On N300 (Device 0), you are likely limited to 8x8.
+* **This Benchmark**: Runs on **Device 0** only. On an N300, this subjects the test to the thermal environment of a dual-chip card, but execution logic remains identical to N150.
 
 ### Critical Considerations
-1.  **Harvesting Check**: If you set `--x_size 0 --y_size 0` (default), the benchmark automatically queries `device->compute_with_storage_grid_size()` to use the maximum available unharvested grid. This is the recommended way to avoid runtime errors.
-2.  **Sub-Device Test Requirements**: The `SubDeviceMM` test (`--test 2`) strictly partitions the grid along the Y-axis. It **requires at least 2 unharvested rows**. If your harvested chip has `y_size < 2`, this test will fail.
-3.  **Data Type precision**: `BFLOAT8_B` (BFP8) is the standard for high-performance inference. `BFLOAT16` is used when higher precision is needed but has 2x memory footprint and lower math throughput.
 
+1. **Harvesting Check**: If you set `--x_size 0 --y_size 0` (default), the benchmark automatically queries `device->compute_with_storage_grid_size()` to use the maximum available unharvested grid. This is the recommended way to avoid runtime errors.
+2. **Sub-Device Test Requirements**: The `SubDeviceMM` test (`--test 2`) strictly partitions the grid along the Y-axis. It **requires at least 2 unharvested rows**. If your harvested chip has `y_size < 2`, this test will fail.
+3. **Data Type precision**: `BFLOAT8_B` (BFP8) is the standard for high-performance inference. `BFLOAT16` is used when higher precision is needed but has 2x memory footprint and lower math throughput.
+
+## Validation Status (Current Debugging Campaign)
+
+The table below tracks configurations explicitly validated or currently under validation.
+
+| Test ID | Test Name | Mode | Scope / Shape | Status | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `--test 0` | Empty Kernel Launch | N/A | Standard dispatch path | ✅ Proven working | Stable baseline; dispatch-only path works as expected. |
+| `--test 1` | ComputeMM | `L1` | Small tensor sizes | ✅ Proven working | L1 path works for small sizes. |
+| `--test 1` | ComputeMM | `DRAM` | `6x6` grid | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
+| `--test 1` | ComputeMM | `DRAM` | `1x1` grid | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
+| `--test 1` | ComputeMM | `DRAM` | `2x2` grid | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
+| `--test 3` | Host Pipeline ComputeMM | Host-only | FP32→BFP8→DRAM→BFP8→FP32 | ✅ Included in validation scope | Implemented and ready for scaling/overhead campaigns (no kernel dispatch). |
+| `--test 4` | Host Pipeline Empty Tensor | Host-only | Single-tensor host pipeline | ✅ Included in validation scope | Implemented and ready for baseline host overhead studies. |
+
+Notes:
+
+* This section is intentionally conservative and updated as new runs are confirmed.
+* `--test 2` (SubDevice) and unlisted shape/grid combinations remain to be validated in this campaign.
+
+## Code-Level Analysis of Test 3 and Test 4
+
+This section analyzes the implemented host-only paths in `test_full_charac.cpp` / `test_full_charac_old.cpp` and summarizes the tensor-size math used by the code.
+
+### Tensor Shapes and Tile Counts Used by the Code
+
+Both tests first align dimensions to tile boundaries via `get_aligned_input_tile_num(...)`:
+
+$$
+M_t = \left\lceil \frac{M}{32} \right\rceil,\quad
+N_t = \left\lceil \frac{N}{32} \right\rceil,\quad
+K_t = \left\lceil \frac{K}{32} \right\rceil
+$$
+
+The code then computes tile counts:
+
+* Test 3 (`--test 3`, ComputeMM host pipeline):
+  * `in0` tiles: $M_t \cdot K_t$
+  * `in1` tiles: $K_t \cdot N_t$
+* Test 4 (`--test 4`, Empty host pipeline):
+  * `tensor` tiles: $M_t \cdot N_t$
+
+Packed bytes are computed exactly as in code:
+
+$$
+B = N_{\mathrm{tiles}} \cdot S
+$$
+
+where $S = \mathrm{tile\_size}(\mathrm{Bfp8\_b})$ is read from TT-Metal runtime (`tt::tile_size(...)`) and not hardcoded in the benchmark.
+
+### Generic Formula Summary
+
+Let:
+
+$$
+\alpha(x) = \left\lceil \frac{x}{32} \right\rceil,
+\qquad
+S = \mathrm{tile\_size}(\mathrm{Bfp8\_b}),
+\qquad
+I = \mathrm{num\_iters}
+$$
+
+Then:
+
+* Test 3 (`MxK` + `KxN` host pipeline)
+
+$$
+B_{\mathrm{iter},3} = 2\,\big(\alpha(M)\alpha(K) + \alpha(K)\alpha(N)\big)\,S
+$$
+
+$$
+B_{\mathrm{run},3} = I\,B_{\mathrm{iter},3}
+$$
+
+* Test 4 (`MxN` single-tensor host pipeline)
+
+$$
+B_{\mathrm{iter},4} = 2\,\alpha(M)\alpha(N)\,S
+$$
+
+$$
+B_{\mathrm{run},4} = I\,B_{\mathrm{iter},4}
+$$
+
+The benchmark reports effective bandwidth from accumulated bytes and accumulated measured transfer time:
+
+$$
+\mathrm{BW} = \frac{B_{\mathrm{total}}}{T_{\mathrm{total}}}
+$$
+
+### Example with Current Defaults (`M=11264, N=3072, K=768`)
+
+With 32x32 tiles:
+
+$$
+M_t=352,\;N_t=96,\;K_t=24
+$$
+
+So:
+
+* Test 3 tiles per direction: $352\cdot24 + 24\cdot96 = 10752$
+* Test 4 tiles per direction: $352\cdot96 = 33792$
+
+If `Bfp8_b` tile size is 1088 B (DeepWiki/TT-Metal convention), then:
+
+* Test 3 one-way bytes: $10752\cdot1088 = 11{,}698{,}176$ B
+* Test 3 roundtrip bytes/iter: $23{,}396{,}352$ B
+* Test 4 one-way bytes: $33792\cdot1088 = 36{,}765{,}696$ B
+* Test 4 roundtrip bytes/iter: $73{,}531{,}392$ B
+
+### Tiling and BFP8 Conversion Subprocesses
+
+Code path used by both tests:
+
+1. FP32 generation (`generate_fp32_random`)
+2. tilize (`tilize_swizzled`) to 32x32 tile layout
+3. BFP8 pack (`pack_as_bfp8_tiles`) to `Bfp8_b`
+4. DRAM write/read (`WriteToBuffer` / `ReadFromBuffer`)
+5. unpack (`unpack_bfp8_tiles_into_float_vec`) + untilize (`untilize_swizzled`)
+
+DeepWiki-backed summary (repo: `tenstorrent/tt-metal`):
+
+* Tile granularity is 32x32 elements.
+* BFP8 packing stores values using block-floating representation with shared exponent groups and quantized mantissas.
+* Host preprocessing adds tile-boundary padding when dimensions are not multiples of 32.
+
+Conceptual BFP8 quantization model for a block of values $x_i$:
+
+$$
+E = \max_i \left\lfloor \log_2\left(|x_i|\right) \right\rfloor,
+\qquad
+m_i = \mathrm{round}\!\left(\frac{x_i}{2^E}\cdot 2^p\right)
+$$
+
+where $E$ is the shared exponent for the block and $m_i$ is the quantized mantissa/sign payload (with format-specific bit allocation in `Bfp8_b`).
+
+Practical implication for these tests:
+
+* `transform` time includes both layout conversion and BFP8 quantization.
+* `inverse_transform` includes BFP8 decode and reverse layout conversion.
+* PCC checks validate roundtrip numerical fidelity after quantize/dequantize and layout transforms.
