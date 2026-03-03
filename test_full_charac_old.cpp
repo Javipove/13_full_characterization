@@ -69,8 +69,21 @@
 #include <tt-metalium/bfloat8.hpp>
 #include <tt-metalium/command_queue.hpp>
 #include <tt-metalium/host_api.hpp>
+#if __has_include(<tt-metalium/test_common.hpp>)
+#include <tt-metalium/test_common.hpp>
+#elif __has_include("tt_metal/api/tt-metalium/test_common.hpp")
+#include "tt_metal/api/tt-metalium/test_common.hpp"
+#elif __has_include("test_common.hpp")
+#include "test_common.hpp"
+#endif
 #include <tt-metalium/tt_metal.hpp>
+#if __has_include(<tt-metalium/tilize_utils.hpp>)
 #include <tt-metalium/tilize_utils.hpp>
+#elif __has_include(<tt-metalium/tilize_untilize.hpp>)
+#include <tt-metalium/tilize_untilize.hpp>
+#elif __has_include(<tt-metalium/test_tiles.hpp>)
+#include <tt-metalium/test_tiles.hpp>
+#endif
 #include <tt-metalium/persistent_kernel_cache.hpp>
 
 // Utility / test helpers
