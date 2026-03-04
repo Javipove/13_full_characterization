@@ -762,9 +762,20 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
   if (use_dram) {
-    auto in0_packed =
-        pack_fp32_vec_as_bfp8_tiles(inputs.in0_vec, /*row_major_input=*/true,
-                                    /*is_exp_a=*/false);
+    std::vector<float> in0_tilized;
+    std::vector<uint32_t> in0_packed;
+    try {
+      in0_tilized = tilize_swizzled(inputs.in0_vec, Mt * 32, Kt * 32);
+      in0_packed =
+          pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
+                                      /*is_exp_a=*/false);
+    } catch (const std::exception &e) {
+      throw std::runtime_error(
+          "Legacy ComputeMM DRAM IN0 transform failed: Mt=" +
+          std::to_string(Mt) + ", Kt=" + std::to_string(Kt) +
+          ", in0_vec_size=" + std::to_string(inputs.in0_vec.size()) +
+          ", what=" + e.what());
+    }
 
     uint32_t in0_num_tiles = Mt * Kt;
     uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
@@ -775,16 +786,41 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
         .buffer_type = tt_metal::BufferType::DRAM});
     tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
 
-    auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-        in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-    inputs.in0_vec = in0_unpacked;
+    try {
+      auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+          in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+      inputs.in0_vec = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+    } catch (const std::exception &e) {
+      throw std::runtime_error(
+          "Legacy ComputeMM DRAM IN0 inverse-transform failed: Mt=" +
+          std::to_string(Mt) + ", Kt=" + std::to_string(Kt) +
+          ", what=" + e.what());
+    }
 
-    auto in1_packed =
-      pack_fp32_vec_as_bfp8_tiles(inputs.in1_vec, /*row_major_input=*/true,
-                                    /*is_exp_a=*/false);
-    auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-        in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-    inputs.in1_vec = in1_unpacked;
+    std::vector<float> in1_tilized;
+    std::vector<uint32_t> in1_packed;
+    try {
+      in1_tilized = tilize_swizzled(inputs.in1_vec, Kt * 32, Nt * 32);
+      in1_packed =
+          pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
+                                      /*is_exp_a=*/false);
+    } catch (const std::exception &e) {
+      throw std::runtime_error(
+          "Legacy ComputeMM DRAM IN1 transform failed: Kt=" +
+          std::to_string(Kt) + ", Nt=" + std::to_string(Nt) +
+          ", in1_vec_size=" + std::to_string(inputs.in1_vec.size()) +
+          ", what=" + e.what());
+    }
+    try {
+      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+    } catch (const std::exception &e) {
+      throw std::runtime_error(
+          "Legacy ComputeMM DRAM IN1 inverse-transform failed: Kt=" +
+          std::to_string(Kt) + ", Nt=" + std::to_string(Nt) +
+          ", what=" + e.what());
+    }
 
     uint32_t in1_num_tiles = Kt * Nt;
     uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
@@ -830,10 +866,22 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
                         Mt * 32, Kt * 32);
       auto in0_block_slice =
           get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-      std::vector<uint32_t> in0 =
-          pack_fp32_vec_as_bfp8_tiles(in0_block_slice,
-                                      /*row_major_input=*/true,
-                                      /*is_exp_a=*/false);
+          std::vector<float> in0_block_tilized;
+          std::vector<uint32_t> in0;
+          try {
+          in0_block_tilized =
+            tilize_swizzled(in0_block_slice, num_r * 32, in0_block_w * 32);
+          in0 = pack_fp32_vec_as_bfp8_tiles(in0_block_tilized,
+                            /*row_major_input=*/true,
+                            /*is_exp_a=*/false);
+          } catch (const std::exception &e) {
+          throw std::runtime_error(
+            "Legacy ComputeMM L1 IN0 transform failed: num_r=" +
+            std::to_string(num_r) + ", in0_block_w=" +
+            std::to_string(in0_block_w) + ", Kt=" + std::to_string(Kt) +
+            ", in0_block_slice_size=" + std::to_string(in0_block_slice.size()) +
+            ", what=" + e.what());
+          }
 
       for (int c = 0; c < (int)core_range.x; c++) {
         int num_c =
@@ -858,10 +906,21 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
           in1_block_slice[idx] = (float)1;
         }
 
-        std::vector<uint32_t> in1 =
-            pack_fp32_vec_as_bfp8_tiles(in1_block_slice,
-                                        /*row_major_input=*/true,
-                                        /*is_exp_a=*/false);
+        std::vector<float> in1_block_tilized;
+        std::vector<uint32_t> in1;
+        try {
+          in1_block_tilized =
+            tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
+          in1 = pack_fp32_vec_as_bfp8_tiles(in1_block_tilized,
+                          /*row_major_input=*/true,
+                          /*is_exp_a=*/false);
+        } catch (const std::exception &e) {
+          throw std::runtime_error(
+            "Legacy ComputeMM L1 IN1 transform failed: in0_block_w=" +
+            std::to_string(in0_block_w) + ", num_c=" +
+            std::to_string(num_c) + ", in1_block_slice_size=" +
+            std::to_string(in1_block_slice.size()) + ", what=" + e.what());
+        }
 
         CoreCoord core = {(std::size_t)c, (std::size_t)r};
         tt_metal::detail::WriteToDeviceL1(device, core, in0_addr, in0);
@@ -1383,7 +1442,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
           tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
           auto out_float = unpack_bfp8_tiles_into_float_vec(
               out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-          device_vec = out_float;
+          device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
             for (uint32_t r = 0; r < params.M; ++r) {
@@ -1407,6 +1466,8 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               auto core_data_float = unpack_bfp8_tiles_into_float_vec(
                   core_data_tiles, /*row_major_output=*/true,
                   /*is_exp_a=*/false);
+                auto core_data_untilized = untilize_swizzled(
+                  core_data_float, per_core_Mt * 32, per_core_Nt * 32);
 
               uint32_t global_r_start = y * per_core_Mt * 32;
               uint32_t global_c_start = x * per_core_Nt * 32;
@@ -1418,7 +1479,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
                   uint32_t global_idx =
                       (global_r_start + r) * (params.N) + (global_c_start + c);
                   if (global_idx < device_vec.size()) {
-                    device_vec[global_idx] = core_data_float[r * c_len + c];
+                    device_vec[global_idx] = core_data_untilized[r * c_len + c];
                   }
                 }
               }
@@ -1546,11 +1607,13 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_vec,
+        auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
+        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_tilized,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
 
-        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_vec,
+        auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
+        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_tilized,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
@@ -1594,9 +1657,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in0_roundtrip = untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
 
         in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        in1_roundtrip = untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1721,7 +1786,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        packed = pack_fp32_vec_as_bfp8_tiles(tensor_vec,
+        auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
+        packed = pack_fp32_vec_as_bfp8_tiles(tilized,
                                              /*row_major_input=*/true,
                                              /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
@@ -1785,6 +1851,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         roundtrip = unpack_bfp8_tiles_into_float_vec(
             readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        roundtrip = untilize_swizzled(roundtrip, Mt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
