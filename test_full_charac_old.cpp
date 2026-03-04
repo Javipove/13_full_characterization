@@ -79,10 +79,15 @@
 #include <tt-metalium/tt_metal.hpp>
 #if __has_include(<tt-metalium/tilize_utils.hpp>)
 #include <tt-metalium/tilize_utils.hpp>
+#define HAS_SWIZZLED_TILIZE_UTILS 1
 #elif __has_include(<tt-metalium/tilize_untilize.hpp>)
 #include <tt-metalium/tilize_untilize.hpp>
+#define HAS_SWIZZLED_TILIZE_UTILS 0
 #elif __has_include(<tt-metalium/test_tiles.hpp>)
 #include <tt-metalium/test_tiles.hpp>
+#define HAS_SWIZZLED_TILIZE_UTILS 0
+#else
+#define HAS_SWIZZLED_TILIZE_UTILS 0
 #endif
 #include <tt-metalium/persistent_kernel_cache.hpp>
 
@@ -328,6 +333,22 @@ std::vector<float> generate_fp32_random(uint32_t num_elems,
     vec[i] = rand_float();
   }
   return vec;
+}
+
+template <typename T>
+std::vector<T> tilize_compat(const std::vector<T> &input, uint32_t rows,
+                             uint32_t cols) {
+  std::vector<T> output = input;
+  tilize(output, rows, cols);
+  return output;
+}
+
+template <typename T>
+std::vector<T> untilize_compat(const std::vector<T> &input, uint32_t rows,
+                               uint32_t cols) {
+  std::vector<T> output = input;
+  untilize(output, rows, cols);
+  return output;
 }
 
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
@@ -765,7 +786,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     std::vector<float> in0_tilized;
     std::vector<uint32_t> in0_packed;
     try {
-      in0_tilized = tilize_swizzled(inputs.in0_vec, Mt * 32, Kt * 32);
+      in0_tilized = tilize_compat(inputs.in0_vec, Mt * 32, Kt * 32);
       in0_packed =
           pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
                                       /*is_exp_a=*/false);
@@ -789,7 +810,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     try {
       auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
           in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in0_vec = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+      inputs.in0_vec = untilize_compat(in0_unpacked, Mt * 32, Kt * 32);
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN0 inverse-transform failed: Mt=" +
@@ -800,7 +821,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     std::vector<float> in1_tilized;
     std::vector<uint32_t> in1_packed;
     try {
-      in1_tilized = tilize_swizzled(inputs.in1_vec, Kt * 32, Nt * 32);
+      in1_tilized = tilize_compat(inputs.in1_vec, Kt * 32, Nt * 32);
       in1_packed =
           pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
                                       /*is_exp_a=*/false);
@@ -814,7 +835,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     try {
       auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
           in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+      inputs.in1_vec = untilize_compat(in1_unpacked, Kt * 32, Nt * 32);
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN1 inverse-transform failed: Kt=" +
@@ -870,7 +891,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
           std::vector<uint32_t> in0;
           try {
           in0_block_tilized =
-            tilize_swizzled(in0_block_slice, num_r * 32, in0_block_w * 32);
+            tilize_compat(in0_block_slice, num_r * 32, in0_block_w * 32);
           in0 = pack_fp32_vec_as_bfp8_tiles(in0_block_tilized,
                             /*row_major_input=*/true,
                             /*is_exp_a=*/false);
@@ -909,8 +930,8 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
         std::vector<float> in1_block_tilized;
         std::vector<uint32_t> in1;
         try {
-          in1_block_tilized =
-            tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
+            in1_block_tilized =
+              tilize_compat(in1_block_slice, in0_block_w * 32, num_c * 32);
           in1 = pack_fp32_vec_as_bfp8_tiles(in1_block_tilized,
                           /*row_major_input=*/true,
                           /*is_exp_a=*/false);
@@ -1442,7 +1463,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
           tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
           auto out_float = unpack_bfp8_tiles_into_float_vec(
               out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-          device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
+          device_vec = untilize_compat(out_float, Mt * 32, Nt * 32);
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
             for (uint32_t r = 0; r < params.M; ++r) {
@@ -1466,7 +1487,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               auto core_data_float = unpack_bfp8_tiles_into_float_vec(
                   core_data_tiles, /*row_major_output=*/true,
                   /*is_exp_a=*/false);
-                auto core_data_untilized = untilize_swizzled(
+                  auto core_data_untilized = untilize_compat(
                   core_data_float, per_core_Mt * 32, per_core_Nt * 32);
 
               uint32_t global_r_start = y * per_core_Mt * 32;
@@ -1607,12 +1628,12 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
+        auto in0_tilized = tilize_compat(in0_vec, Mt * 32, Kt * 32);
         in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_tilized,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
 
-        auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
+        auto in1_tilized = tilize_compat(in1_vec, Kt * 32, Nt * 32);
         in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_tilized,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
@@ -1657,11 +1678,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in0_roundtrip = untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
+        in0_roundtrip = untilize_compat(in0_roundtrip, Mt * 32, Kt * 32);
 
         in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in1_roundtrip = untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
+        in1_roundtrip = untilize_compat(in1_roundtrip, Kt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1786,7 +1807,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
+        auto tilized = tilize_compat(tensor_vec, Mt * 32, Nt * 32);
         packed = pack_fp32_vec_as_bfp8_tiles(tilized,
                                              /*row_major_input=*/true,
                                              /*is_exp_a=*/false);
@@ -1851,7 +1872,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         roundtrip = unpack_bfp8_tiles_into_float_vec(
             readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        roundtrip = untilize_swizzled(roundtrip, Mt * 32, Nt * 32);
+        roundtrip = untilize_compat(roundtrip, Mt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
