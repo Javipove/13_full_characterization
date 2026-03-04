@@ -325,7 +325,7 @@ std::vector<float> generate_fp32_random(uint32_t num_elems,
   auto rand_float = std::bind(
       std::uniform_real_distribution<float>(-scale, scale), std::mt19937(seed));
   for (uint32_t i = 0; i < num_elems; ++i) {
-    vec.at(i) = rand_float();
+    vec[i] = rand_float();
   }
   return vec;
 }
@@ -638,23 +638,52 @@ get_multi_dim_per_core_factor_legacy(uint32_t per_core_M, uint32_t per_core_N,
 }
 
 template <typename T>
-std::vector<T> get_row_slice(std::vector<T> data, int start_row_index,
+std::vector<T> get_row_slice(const std::vector<T> &data, int start_row_index,
                              int num_rows, int /*rows*/, int cols) {
+  size_t start = static_cast<size_t>(start_row_index) * static_cast<size_t>(cols);
+  size_t end =
+      static_cast<size_t>(start_row_index + num_rows) * static_cast<size_t>(cols);
+  if (end > data.size()) {
+    throw std::runtime_error(
+        "get_row_slice out of range: start=" + std::to_string(start) +
+        ", end=" + std::to_string(end) +
+        ", size=" + std::to_string(data.size()));
+  }
+
   std::vector<T> result;
-  for (int i = start_row_index * cols; i < (start_row_index + num_rows) * cols;
-       i++) {
-    result.push_back(data.at(i));
+  result.reserve(end - start);
+  for (size_t i = start; i < end; ++i) {
+    result.push_back(data[i]);
   }
   return result;
 }
 
 template <typename T>
-std::vector<T> get_col_slice(std::vector<T> data, int start_col_index,
+std::vector<T> get_col_slice(const std::vector<T> &data, int start_col_index,
                              int num_cols, int rows, int cols) {
+  if (start_col_index < 0 || num_cols < 0 || rows < 0 || cols < 0 ||
+      start_col_index + num_cols > cols) {
+    throw std::runtime_error(
+        "get_col_slice invalid arguments: start_col_index=" +
+        std::to_string(start_col_index) + ", num_cols=" +
+        std::to_string(num_cols) + ", rows=" + std::to_string(rows) +
+        ", cols=" + std::to_string(cols));
+  }
+  size_t required_size = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  if (required_size > data.size()) {
+    throw std::runtime_error(
+        "get_col_slice input too small: required=" +
+        std::to_string(required_size) + ", size=" +
+        std::to_string(data.size()));
+  }
+
   std::vector<T> result;
+  result.reserve(static_cast<size_t>(rows) * static_cast<size_t>(num_cols));
   for (int r = 0; r < rows; r++) {
     for (int c = start_col_index; c < (start_col_index + num_cols); c++) {
-      result.push_back(data.at((r * cols) + c));
+      size_t idx = static_cast<size_t>(r) * static_cast<size_t>(cols) +
+                   static_cast<size_t>(c);
+      result.push_back(data[idx]);
     }
   }
   return result;
@@ -814,7 +843,19 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
                                            (float)0);
         int num_ones = std::min(in0_block_w, static_cast<uint32_t>(num_c)) * 32;
         for (int i = 0; i < num_ones; i++) {
-          in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
+          size_t idx = static_cast<size_t>(i) *
+                           static_cast<size_t>(num_c * 32) +
+                       static_cast<size_t>(i);
+          if (idx >= in1_block_slice.size()) {
+            throw std::runtime_error(
+                "in1 identity index out of range: idx=" +
+                std::to_string(idx) + ", size=" +
+                std::to_string(in1_block_slice.size()) +
+                ", num_ones=" + std::to_string(num_ones) +
+                ", num_c=" + std::to_string(num_c) +
+                ", in0_block_w=" + std::to_string(in0_block_w));
+          }
+          in1_block_slice[idx] = (float)1;
         }
 
         std::vector<uint32_t> in1 =
