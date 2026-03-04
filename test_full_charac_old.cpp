@@ -338,16 +338,56 @@ std::vector<float> generate_fp32_random(uint32_t num_elems,
 template <typename T>
 std::vector<T> tilize_compat(const std::vector<T> &input, uint32_t rows,
                              uint32_t cols) {
-  std::vector<T> output = input;
-  tilize(output, rows, cols);
+  if (rows % constants::TILE_HEIGHT != 0 || cols % constants::TILE_WIDTH != 0) {
+    throw std::runtime_error("tilize_compat requires rows/cols multiples of 32");
+  }
+  size_t expected = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  if (input.size() != expected) {
+    throw std::runtime_error(
+        "tilize_compat size mismatch: expected=" + std::to_string(expected) +
+        ", got=" + std::to_string(input.size()));
+  }
+
+  std::vector<T> output;
+  output.reserve(expected);
+  for (uint32_t tr = 0; tr < rows; tr += constants::TILE_HEIGHT) {
+    for (uint32_t tc = 0; tc < cols; tc += constants::TILE_WIDTH) {
+      for (uint32_t r = 0; r < constants::TILE_HEIGHT; ++r) {
+        for (uint32_t c = 0; c < constants::TILE_WIDTH; ++c) {
+          size_t src = static_cast<size_t>(tr + r) * cols + (tc + c);
+          output.push_back(input[src]);
+        }
+      }
+    }
+  }
   return output;
 }
 
 template <typename T>
 std::vector<T> untilize_compat(const std::vector<T> &input, uint32_t rows,
                                uint32_t cols) {
-  std::vector<T> output = input;
-  untilize(output, rows, cols);
+  if (rows % constants::TILE_HEIGHT != 0 || cols % constants::TILE_WIDTH != 0) {
+    throw std::runtime_error("untilize_compat requires rows/cols multiples of 32");
+  }
+  size_t expected = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  if (input.size() != expected) {
+    throw std::runtime_error(
+        "untilize_compat size mismatch: expected=" + std::to_string(expected) +
+        ", got=" + std::to_string(input.size()));
+  }
+
+  std::vector<T> output(expected);
+  size_t src = 0;
+  for (uint32_t tr = 0; tr < rows; tr += constants::TILE_HEIGHT) {
+    for (uint32_t tc = 0; tc < cols; tc += constants::TILE_WIDTH) {
+      for (uint32_t r = 0; r < constants::TILE_HEIGHT; ++r) {
+        for (uint32_t c = 0; c < constants::TILE_WIDTH; ++c) {
+          size_t dst = static_cast<size_t>(tr + r) * cols + (tc + c);
+          output[dst] = input[src++];
+        }
+      }
+    }
+  }
   return output;
 }
 
