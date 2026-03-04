@@ -1988,7 +1988,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         ZoneScopedN("ComputeMM Host Validation Metrics");
         pcc = get_pcc(golden_vec, device_vec);
         rmse = get_rmse(golden_vec, device_vec);
-        relative_rmse = get_relative_rmse(golden_vec, device_vec);
+        relative_rmse = get_relative_rmse(device_vec, golden_vec);
       }
       log_validation_sample_pairs("ComputeMM Validation", golden_vec,
                                   device_vec, 12);

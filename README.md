@@ -124,7 +124,7 @@ This section summarizes the concrete translations needed when porting between:
 | Host-only DRAM buffer path | `CreateBuffer`, `detail::WriteToBuffer`, `detail::ReadFromBuffer` | same calls | No translation needed for host-only tests (`--test 3`, `--test 4`). |
 | Empty-kernel dispatch tracing | `MeshWorkload` + enqueue/finish split zones | `EnqueueProgram` + `Finish` split zones | Keep identical Tracy zone names so traces are directly comparable. |
 | Sub-device model | Implemented via `CoreRange` splits inside mesh-based flow | **Not yet implemented** | Requires new legacy implementation; currently reported as known gap. |
-| ComputeMM full kernel path | Implemented in modern file | **Not yet implemented** (stub) | Legacy file currently uses host-pipeline coverage instead; full MM kernel parity still pending. |
+| ComputeMM full kernel path | Implemented in modern file | Implemented (L1 + DRAM execution paths) | Legacy path now dispatches full ComputeMM kernels with host-side golden/reference validation. |
 
 ### Rationale & Limitations (From API Docs)
 
@@ -132,7 +132,7 @@ This section summarizes the concrete translations needed when porting between:
 * **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
 * **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
 * **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
-* **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, full `ComputeMM` and `SubDevice` in old file are still gaps).
+* **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, `SubDevice` in old file is still a gap).
 
 ### Tracy Zone Unification Rules
 
@@ -272,17 +272,16 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `Host->Device Transfer (L1 Write)` | new | Per-core L1 writes for IN0/IN1/in2 in L1 mode. |
 | `ComputeMM Functional Blocks` | new, old | Top-level ComputeMM benchmark functional block. |
 | `ComputeMM Input Data Processing` | new, old | ComputeMM input/setup-oriented phase. |
-| `ComputeMM Host Setup and Blocking` | new | Arch/tile/blocking/address derivation phase. |
+| `ComputeMM Host Setup and Blocking` | new, old | Arch/tile/blocking/address derivation phase. |
 | `ComputeMM Host Prepare Inputs` | new, old | Host-side tensor/data preparation before dispatch/readback. |
-| `ComputeMM Host Transform Inputs` | old | Host-only transform (tilize/pack) stage in legacy host-pipeline ComputeMM. |
-| `ComputeMM Host Resolve Buffer Addresses` | new | DRAM-vs-L1 effective address resolution step. |
-| `ComputeMM Host Program Build` | new | Program/kernel/cb build call for ComputeMM execution path. |
+| `ComputeMM Host Resolve Buffer Addresses` | new, old | DRAM-vs-L1 effective address resolution step. |
+| `ComputeMM Host Program Build` | new, old | Program/kernel/cb build call for ComputeMM execution path. |
 | `ComputeMM Host Dispatch` | new, old | Dispatch phase wrapper for enqueue/wait operations. |
 | `ComputeMM Host Dispatch Iteration` | new, old | Per-iteration dispatch scope (includes iteration `ZoneValue`). |
 | `ComputeMM Host Enqueue` | new, old | Enqueue call itself (mesh enqueue or program enqueue). |
 | `ComputeMM Host FinishWait` | new, old | Queue/device finish synchronization wait. |
 | `ComputeMM Host Post Processing` | new, old | Post-dispatch validation/readback wrapper scope. |
-| `ComputeMM Host Golden Reference` | new | FP32 golden matmul reference computation. |
+| `ComputeMM Host Golden Reference` | new, old | FP32 golden matmul reference computation. |
 | `ComputeMM Host Device Readback and Decode` | new, old | Device output readback + unpack/untilize/decode path. |
 | `ComputeMM Host Validation Metrics` | new, old | PCC/RMSE validation metric computation/checking block. |
 

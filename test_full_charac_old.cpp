@@ -90,7 +90,6 @@
 // #include "test_common.hpp"
 #include "hostdevcommon/common_values.hpp"
 #include "hostdevcommon/kernel_structs.h"
-#include "tt_metal/tt_metal/perf_microbenchmark/common/util.hpp"
 // #include "tt_metal/test_utils/deprecated/tensor.hpp"
 
 // Impl / dispatch / internal
@@ -411,13 +410,1022 @@ void log_host_pipeline_stats(const std::string &tag, const HostPipelineStats &s,
            avg_read_bytes_per_iter, write_gbps, read_gbps);
 }
 
-bool test_compute_mm(tt::tt_metal::IDevice * /*device*/,
-                     const TestParams & /*params*/) {
-  log_error(LogTest,
-            "ComputeMM legacy port is not implemented yet in "
-            "test_full_charac_old.cpp (known gap). Use test_full_charac.cpp "
-            "for current ComputeMM coverage.");
-  return false;
+uint32_t get_l1_size_legacy(tt::ARCH arch) {
+  constexpr uint32_t GS_L1_SIZE = 1048576;
+  constexpr uint32_t WH_L1_SIZE = 1499136;
+  constexpr uint32_t BH_L1_SIZE = 1499136;
+
+  if (arch == tt::ARCH::WORMHOLE_B0) {
+    return WH_L1_SIZE;
+  }
+  if (arch == tt::ARCH::GRAYSKULL) {
+    return GS_L1_SIZE;
+  }
+  if (arch == tt::ARCH::BLACKHOLE) {
+    return BH_L1_SIZE;
+  }
+  return 0;
+}
+
+std::tuple<MathFidelity, bool> get_compute_params_legacy(tt::ARCH arch) {
+  MathFidelity math_fidelity = MathFidelity::HiFi4;
+  bool fp32_dest_acc_en = false;
+  if (arch == tt::ARCH::WORMHOLE_B0 or arch == tt::ARCH::BLACKHOLE) {
+    math_fidelity = MathFidelity::HiFi2;
+    fp32_dest_acc_en = false;
+  } else if (arch == tt::ARCH::GRAYSKULL) {
+    math_fidelity = MathFidelity::HiFi4;
+    fp32_dest_acc_en = false;
+  }
+  return {math_fidelity, fp32_dest_acc_en};
+}
+
+uint32_t get_in0_block_w_legacy(uint32_t per_core_Mt, uint32_t per_core_Nt,
+                                uint32_t Kt, uint32_t single_tile_size,
+                                uint32_t l1_size, uint32_t l1_unreserved_base,
+                                bool use_dram = false) {
+  std::vector<uint32_t> in0_block_w_choices = {4, 2, 1};
+  uint32_t num_buffer = 2;
+  for (auto choice : in0_block_w_choices) {
+    if (Kt % choice != 0) {
+      continue;
+    }
+
+    uint32_t in0_cb_size = per_core_Mt * choice * num_buffer * single_tile_size;
+    uint32_t in1_cb_size = per_core_Nt * choice * num_buffer * single_tile_size;
+    uint32_t in2_cb_size = 2 * single_tile_size;
+    uint32_t intermediate_cb_size =
+        per_core_Mt * per_core_Nt * single_tile_size;
+    uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
+
+    uint32_t total_l1_needed =
+        in0_cb_size + in1_cb_size + in2_cb_size + intermediate_cb_size +
+        out_cb_size;
+    if (!use_dram) {
+      uint32_t per_core_in0_size = per_core_Mt * choice * single_tile_size;
+      uint32_t per_core_in1_size = per_core_Nt * choice * single_tile_size;
+      uint32_t per_core_out_size = per_core_Mt * per_core_Nt * single_tile_size;
+      total_l1_needed += per_core_in0_size + per_core_in1_size + per_core_out_size;
+    }
+
+    if (l1_unreserved_base + total_l1_needed + L1_SAFETY_MARGIN_BYTES <=
+        l1_size) {
+      return choice;
+    }
+  }
+  return 0;
+}
+
+std::tuple<uint32_t, uint32_t> get_out_subblock_params_legacy(
+  uint32_t per_core_Mt, uint32_t per_core_Nt, uint32_t choice = 0) {
+  constexpr std::array<std::tuple<uint32_t, uint32_t>, 20> SUBBLOCK_HW_CHOICES =
+      {{
+          {4, 2}, {2, 4}, {8, 1}, {1, 8}, {7, 1}, {1, 7}, {3, 2},
+          {2, 3}, {6, 1}, {1, 6}, {5, 1}, {1, 5}, {2, 2}, {4, 1},
+          {1, 4}, {3, 1}, {1, 3}, {2, 1}, {1, 2}, {1, 1},
+      }};
+
+  uint32_t index = 0;
+  for (const auto &subblock_hw : SUBBLOCK_HW_CHOICES) {
+    auto subblock_h = std::get<0>(subblock_hw);
+    auto subblock_w = std::get<1>(subblock_hw);
+    if (per_core_Mt % subblock_h == 0 and per_core_Nt % subblock_w == 0) {
+      if (index >= choice) {
+        return {subblock_h, subblock_w};
+      }
+      index++;
+    }
+  }
+
+  return {1, 1};
+}
+
+std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+           uint32_t>
+get_all_buffers_addresses_legacy(uint32_t per_core_Mt, uint32_t per_core_Nt,
+                                 uint32_t in0_block_w,
+                                 uint32_t single_tile_size,
+                                 uint32_t l1_unreserved_base,
+                                 bool use_dram = false) {
+  uint32_t num_buffer = 2;
+  uint32_t in0_cb_addr = l1_unreserved_base;
+  uint32_t in0_cb_size =
+      per_core_Mt * in0_block_w * num_buffer * single_tile_size;
+  uint32_t in1_cb_addr = in0_cb_addr + in0_cb_size;
+  uint32_t in1_cb_size =
+      per_core_Nt * in0_block_w * num_buffer * single_tile_size;
+  uint32_t in2_cb_addr = in1_cb_addr + in1_cb_size;
+  uint32_t in2_cb_size = 2 * single_tile_size;
+  uint32_t interm_cb_addr = in2_cb_addr + in2_cb_size;
+  uint32_t interm_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
+  uint32_t out_cb_addr = interm_cb_addr + interm_cb_size;
+  uint32_t out_cb_size = per_core_Mt * per_core_Nt * single_tile_size;
+  uint32_t in0_addr = 0;
+  uint32_t in1_addr = 0;
+  uint32_t out_addr = 0;
+  if (!use_dram) {
+    uint32_t per_core_in0_tiles = per_core_Mt * in0_block_w;
+    uint32_t per_core_in1_tiles = per_core_Nt * in0_block_w;
+    in0_addr = out_cb_addr + out_cb_size;
+    in1_addr = in0_addr + (per_core_in0_tiles * single_tile_size);
+    out_addr = in1_addr + (per_core_in1_tiles * single_tile_size);
+  }
+
+  return {in0_cb_addr,    in1_cb_addr, in2_cb_addr, out_cb_addr,
+          interm_cb_addr, in0_addr,    in1_addr,    out_addr};
+}
+
+std::tuple<uint32_t, uint32_t, uint32_t>
+get_multi_dim_per_core_factor_legacy(uint32_t per_core_M, uint32_t per_core_N,
+                                      uint32_t Kt,
+                                      uint32_t single_tile_size,
+                                      uint32_t l1_size,
+                                      uint32_t l1_unreserved_base) {
+  constexpr uint32_t MAX_K_BLOCKS_PREFERRED = 16;
+
+  uint32_t raw_avail_l1 = l1_size - l1_unreserved_base;
+  uint32_t avail_l1 =
+      (raw_avail_l1 > L1_SAFETY_MARGIN_BYTES)
+          ? (raw_avail_l1 - L1_SAFETY_MARGIN_BYTES)
+          : raw_avail_l1;
+
+  auto fits_l1 = [&](uint32_t obh, uint32_t obw, uint32_t bw) -> bool {
+    uint32_t in0_cb = obh * bw * 2 * single_tile_size;
+    uint32_t in1_cb = obw * bw * 2 * single_tile_size;
+    uint32_t in2_cb = 2 * single_tile_size;
+    uint32_t out_cb = obh * obw * single_tile_size;
+    uint32_t interm = obh * obw * single_tile_size;
+    return (in0_cb + in1_cb + in2_cb + out_cb + interm) <= avail_l1;
+  };
+
+  if (fits_l1(per_core_M, per_core_N, Kt)) {
+    return {per_core_M, per_core_N, Kt};
+  }
+
+  auto get_divisors = [](uint32_t n) -> std::vector<uint32_t> {
+    std::vector<uint32_t> divs;
+    for (uint32_t i = 1; i <= n; i++) {
+      if (n % i == 0)
+        divs.push_back(i);
+    }
+    return divs;
+  };
+
+  auto m_factors = get_divisors(per_core_M);
+  auto n_factors = get_divisors(per_core_N);
+
+  struct Pair {
+    uint32_t m, n;
+    uint32_t product;
+    float ratio;
+  };
+  std::vector<Pair> pairs;
+  for (auto mf : m_factors) {
+    for (auto nf : n_factors) {
+      float mx = (float)std::max(mf, nf);
+      float mn = (float)std::min(mf, nf);
+      pairs.push_back({mf, nf, mf * nf, mx / mn});
+    }
+  }
+  std::sort(pairs.begin(), pairs.end(), [](const Pair &a, const Pair &b) {
+    if (a.product != b.product)
+      return a.product > b.product;
+    return a.ratio < b.ratio;
+  });
+
+  std::vector<uint32_t> k_block_w_candidates;
+  for (uint32_t bw = Kt; bw >= 1; bw--) {
+    if (Kt % bw == 0) {
+      k_block_w_candidates.push_back(bw);
+    }
+  }
+
+  for (auto bw : k_block_w_candidates) {
+    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
+      continue;
+    }
+    for (auto &p : pairs) {
+      if (p.n != per_core_N) {
+        continue;
+      }
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
+  for (auto bw : k_block_w_candidates) {
+    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
+      continue;
+    }
+    for (auto &p : pairs) {
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
+  for (auto &p : pairs) {
+    for (auto bw : k_block_w_candidates) {
+      if (fits_l1(p.m, p.n, bw)) {
+        return {p.m, p.n, bw};
+      }
+    }
+  }
+
+  return {1, 1, 1};
+}
+
+template <typename T>
+std::vector<T> get_row_slice(std::vector<T> data, int start_row_index,
+                             int num_rows, int /*rows*/, int cols) {
+  std::vector<T> result;
+  for (int i = start_row_index * cols; i < (start_row_index + num_rows) * cols;
+       i++) {
+    result.push_back(data.at(i));
+  }
+  return result;
+}
+
+template <typename T>
+std::vector<T> get_col_slice(std::vector<T> data, int start_col_index,
+                             int num_cols, int rows, int cols) {
+  std::vector<T> result;
+  for (int r = 0; r < rows; r++) {
+    for (int c = start_col_index; c < (start_col_index + num_cols); c++) {
+      result.push_back(data.at((r * cols) + c));
+    }
+  }
+  return result;
+}
+
+float get_rmse(const std::vector<float> &x, const std::vector<float> &y) {
+  if (x.size() != y.size()) {
+    return std::numeric_limits<float>::infinity();
+  }
+
+  double sum_sq_diff = 0.0;
+  for (size_t i = 0; i < x.size(); ++i) {
+    double diff = static_cast<double>(x[i]) - static_cast<double>(y[i]);
+    sum_sq_diff += diff * diff;
+  }
+  return static_cast<float>(std::sqrt(sum_sq_diff / x.size()));
+}
+
+float get_relative_rmse(const std::vector<float> &x,
+                        const std::vector<float> &ref) {
+  if (x.size() != ref.size()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  const size_t n = x.size();
+  double err_sq_sum = 0.0;
+  double ref_sq_sum = 0.0;
+
+  for (size_t i = 0; i < n; ++i) {
+    double diff = static_cast<double>(x[i]) - ref[i];
+    err_sq_sum += diff * diff;
+    ref_sq_sum += static_cast<double>(ref[i]) * ref[i];
+  }
+
+  if (ref_sq_sum == 0.0) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  double rrmse = std::sqrt(err_sq_sum / ref_sq_sum);
+  return static_cast<float>(rrmse);
+}
+
+std::vector<float> matmul_reference(const std::vector<float> &a,
+                                    const std::vector<float> &b, uint32_t M,
+                                    uint32_t N, uint32_t K) {
+  std::vector<float> c(M * N, 0.0f);
+  for (uint32_t i = 0; i < M; ++i) {
+    for (uint32_t k = 0; k < K; ++k) {
+      double val_a = static_cast<double>(a[i * K + k]);
+      for (uint32_t j = 0; j < N; ++j) {
+        double current_val = static_cast<double>(c[i * N + j]);
+        current_val += val_a * static_cast<double>(b[k * N + j]);
+        c[i * N + j] = static_cast<float>(current_val);
+      }
+    }
+  }
+  return c;
+}
+
+struct BenchmarkInputsLegacy {
+  std::vector<float> in0_vec;
+  std::vector<float> in1_vec;
+  std::shared_ptr<tt_metal::Buffer> in0_buffer;
+  std::shared_ptr<tt_metal::Buffer> in1_buffer;
+  std::shared_ptr<tt_metal::Buffer> out_buffer;
+};
+
+BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
+    tt::tt_metal::IDevice *device, CoreCoord core_range, uint32_t Mt,
+    uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt, uint32_t per_core_Nt,
+    uint32_t in0_block_w, uint32_t single_tile_size, uint32_t in0_addr,
+    uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram) {
+  BenchmarkInputsLegacy inputs;
+  inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
+  inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, 5.0f);
+  std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
+
+  if (use_dram) {
+    auto in0_tilized = inputs.in0_vec;
+    tilize(in0_tilized, Mt * 32, Kt * 32);
+    auto in0_packed =
+        pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
+                                    /*is_exp_a=*/false);
+
+    uint32_t in0_num_tiles = Mt * Kt;
+    uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
+    inputs.in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = device,
+        .size = in0_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+    tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
+
+    auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
+        in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+    untilize(in0_unpacked, Mt * 32, Kt * 32);
+    inputs.in0_vec = in0_unpacked;
+
+    auto in1_tilized = inputs.in1_vec;
+    tilize(in1_tilized, Kt * 32, Nt * 32);
+    auto in1_packed =
+        pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
+                                    /*is_exp_a=*/false);
+    auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+        in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+    untilize(in1_unpacked, Kt * 32, Nt * 32);
+    inputs.in1_vec = in1_unpacked;
+
+    uint32_t in1_num_tiles = Kt * Nt;
+    uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+    inputs.in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = device,
+        .size = in1_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+    tt_metal::detail::WriteToBuffer(inputs.in1_buffer, in1_packed);
+
+    uint32_t out_num_tiles = Mt * Nt;
+    uint32_t out_size_bytes = out_num_tiles * single_tile_size;
+    inputs.out_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+        .device = device,
+        .size = out_size_bytes,
+        .page_size = single_tile_size,
+        .buffer_type = tt_metal::BufferType::DRAM});
+
+    for (uint32_t y = 0; y < core_range.y; y++) {
+      for (uint32_t x = 0; x < core_range.x; x++) {
+        CoreCoord core = {(std::size_t)x, (std::size_t)y};
+        tt_metal::detail::WriteToDeviceL1(device, core, in2_cb_addr, in2);
+      }
+    }
+  } else {
+    std::fill(inputs.in1_vec.begin(), inputs.in1_vec.end(), 0.0f);
+    uint32_t rows = Kt * 32;
+    uint32_t cols = Nt * 32;
+    uint32_t diag = std::min(rows, cols);
+    for (uint32_t i = 0; i < diag; ++i) {
+      inputs.in1_vec[i * cols + i] = 1.0f;
+    }
+
+    uint32_t last_block_h =
+        Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
+    uint32_t last_block_w =
+        Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+
+    for (int r = 0; r < (int)core_range.y; r++) {
+      int num_r = (r == (int)core_range.y - 1) ? (last_block_h) : (per_core_Mt);
+      std::vector<float> in0_slice =
+          get_row_slice(inputs.in0_vec, r * per_core_Mt * 32, num_r * 32,
+                        Mt * 32, Kt * 32);
+      auto in0_block_slice =
+          get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
+      auto in0_block_tilized = in0_block_slice;
+      tilize(in0_block_tilized, num_r * 32, in0_block_w * 32);
+      std::vector<uint32_t> in0 =
+          pack_fp32_vec_as_bfp8_tiles(in0_block_tilized,
+                                      /*row_major_input=*/true,
+                                      /*is_exp_a=*/false);
+
+      for (int c = 0; c < (int)core_range.x; c++) {
+        int num_c =
+            (c == (int)core_range.x - 1) ? (last_block_w) : (per_core_Nt);
+
+        std::vector<float> in1_block_slice(in0_block_w * num_c * 1024,
+                                           (float)0);
+        int num_ones = std::min(in0_block_w, static_cast<uint32_t>(num_c)) * 32;
+        for (int i = 0; i < num_ones; i++) {
+          in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
+        }
+
+        auto in1_block_tilized = in1_block_slice;
+        tilize(in1_block_tilized, in0_block_w * 32, num_c * 32);
+        std::vector<uint32_t> in1 =
+            pack_fp32_vec_as_bfp8_tiles(in1_block_tilized,
+                                        /*row_major_input=*/true,
+                                        /*is_exp_a=*/false);
+
+        CoreCoord core = {(std::size_t)c, (std::size_t)r};
+        tt_metal::detail::WriteToDeviceL1(device, core, in0_addr, in0);
+        tt_metal::detail::WriteToDeviceL1(device, core, in1_addr, in1);
+        tt_metal::detail::WriteToDeviceL1(device, core, in2_cb_addr, in2);
+      }
+    }
+  }
+
+  return inputs;
+}
+
+void create_program_compute_mm_legacy(
+    tt::tt_metal::IDevice *device, tt::DataFormat cb_data_format,
+    MathFidelity math_fidelity, bool fp32_dest_acc_en,
+    uint32_t single_tile_size, CoreCoord core_range, uint32_t Mt, uint32_t Nt,
+    uint32_t Kt, uint32_t in0_block_w, uint32_t out_subblock_h,
+    uint32_t out_subblock_w, uint32_t per_core_Mt, uint32_t per_core_Nt,
+    uint32_t out_block_h, uint32_t out_block_w, uint32_t num_blocks_h,
+    uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
+    uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
+    uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
+    tt_metal::Program &program) {
+  uint32_t num_buffer = 2;
+  uint32_t in0_block_tiles = out_block_h * in0_block_w;
+  uint32_t in0_CB_tiles = in0_block_tiles * num_buffer;
+  uint32_t in1_block_tiles = out_block_w * in0_block_w;
+  uint32_t in1_CB_tiles = in1_block_tiles * num_buffer;
+  uint32_t out_block_tiles_count = out_block_h * out_block_w;
+  uint32_t out_CB_tiles = out_block_tiles_count;
+  uint32_t out_CB_size = out_CB_tiles * single_tile_size;
+
+  uint32_t num_blocks = (Kt / in0_block_w);
+  uint32_t in0_num_subblocks = (out_block_h / out_subblock_h);
+  uint32_t in0_block_num_tiles =
+      out_subblock_h * in0_block_w * in0_num_subblocks;
+  uint32_t in0_subblock_num_tiles = out_subblock_h * in0_block_w;
+  uint32_t in1_num_subblocks = (out_block_w / out_subblock_w);
+  uint32_t in1_block_num_tiles =
+      out_subblock_w * in0_block_w * in1_num_subblocks;
+  uint32_t in1_per_core_w = out_subblock_w * in1_num_subblocks;
+  uint32_t out_subblock_num_tiles = out_subblock_h * out_subblock_w;
+
+  std::vector<uint32_t> compute_kernel_args = {
+      in0_block_w,            in0_num_subblocks,
+      in0_block_num_tiles,    in0_subblock_num_tiles,
+      in1_num_subblocks,      in1_block_num_tiles,
+      in1_per_core_w,         num_blocks,
+      out_subblock_h,         out_subblock_w,
+      out_subblock_num_tiles, 1,
+      num_blocks_w,           num_blocks_h};
+
+  CoreRange all_cores({0, 0}, {(std::size_t)core_range.x - 1,
+                               (std::size_t)core_range.y - 1});
+
+  tt_metal::CircularBufferConfig cb_src0 =
+      tt_metal::CircularBufferConfig(in0_CB_tiles * single_tile_size,
+                                     {{tt::CBIndex::c_0, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_0, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src0);
+
+  tt_metal::CircularBufferConfig cb_src1 =
+      tt_metal::CircularBufferConfig(in1_CB_tiles * single_tile_size,
+                                     {{tt::CBIndex::c_1, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_1, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src1);
+
+  tt_metal::CircularBufferConfig cb_src2 =
+      tt_metal::CircularBufferConfig(2 * single_tile_size,
+                                     {{tt::CBIndex::c_2, cb_data_format}})
+          .set_page_size(tt::CBIndex::c_2, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
+
+  std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
+      {(uint8_t)tt::CBIndex::c_16, cb_data_format},
+      {(uint8_t)tt::CBIndex::c_24, cb_data_format}};
+  tt_metal::CircularBufferConfig cb_out_config =
+      tt_metal::CircularBufferConfig(out_CB_size, cb_out_config_map)
+          .set_page_size(tt::CBIndex::c_16, single_tile_size)
+          .set_page_size(tt::CBIndex::c_24, single_tile_size);
+  tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
+                                 cb_out_config);
+
+  std::string reader_kernel_path;
+  std::string writer_kernel_path;
+  std::map<std::string, std::string> writer_defines;
+
+  if (use_dram) {
+    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in0_reader_bmm_tile_layout_dram.cpp";
+    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in1_reader_writer_bmm_tile_layout_dram.cpp";
+  } else {
+    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in0_reader_bmm_tile_layout.cpp";
+    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
+                         "13_full_charac/kernels/"
+                         "in1_reader_writer_bmm_tile_layout.cpp";
+    writer_defines["IN1_IS_IDENTITY"] = "1";
+  }
+
+  auto mm_reader_id = tt_metal::CreateKernel(
+      program, reader_kernel_path, all_cores,
+      tt_metal::DataMovementConfig{.processor =
+                                       tt_metal::DataMovementProcessor::RISCV_1,
+                                   .noc = tt_metal::NOC::RISCV_0_default});
+
+  auto mm_writer_id = tt_metal::CreateKernel(
+      program, writer_kernel_path, all_cores,
+      tt_metal::DataMovementConfig{.processor =
+                                       tt_metal::DataMovementProcessor::RISCV_0,
+                                   .noc = tt_metal::NOC::RISCV_1_default,
+                                   .defines = writer_defines});
+
+  tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels/"
+      "bmm_large_block_zm_fused_bias_activation.cpp",
+      all_cores,
+      tt_metal::ComputeConfig{.math_fidelity = math_fidelity,
+                              .fp32_dest_acc_en = fp32_dest_acc_en,
+                              .compile_args = compute_kernel_args});
+
+  uint32_t last_block_h =
+      Mt % per_core_Mt == 0 ? per_core_Mt : Mt % per_core_Mt;
+  uint32_t last_block_w =
+      Nt % per_core_Nt == 0 ? per_core_Nt : Nt % per_core_Nt;
+
+  for (int y = 0; y < (int)core_range.y; y++) {
+    for (int x = 0; x < (int)core_range.x; x++) {
+      CoreCoord core = {(std::size_t)x, (std::size_t)y};
+      auto phy_core = device->worker_core_from_logical_core(core);
+      uint32_t cur_core_valid_Mt =
+          (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
+      uint32_t cur_core_valid_Nt =
+          (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
+
+      uint32_t last_outer_block_h =
+          (cur_core_valid_Mt % out_block_h == 0) ? out_block_h
+                                                  : (cur_core_valid_Mt % out_block_h);
+      uint32_t last_outer_block_w =
+          (cur_core_valid_Nt % out_block_w == 0) ? out_block_w
+                                                  : (cur_core_valid_Nt % out_block_w);
+
+      uint32_t out_num_subblocks_h = out_block_h / out_subblock_h;
+      uint32_t out_num_subblocks_w = out_block_w / out_subblock_w;
+
+      uint32_t last_outer_num_nonzero_subblocks_h =
+          ((last_outer_block_h - 1) / out_subblock_h) + 1;
+      uint32_t last_outer_num_nonzero_subblocks_w =
+          ((last_outer_block_w - 1) / out_subblock_w) + 1;
+
+      uint32_t last_outer_subblock_h =
+          (last_outer_block_h % out_subblock_h == 0)
+              ? out_subblock_h
+              : (last_outer_block_h % out_subblock_h);
+      uint32_t last_outer_subblock_w =
+          (last_outer_block_w % out_subblock_w == 0)
+              ? out_subblock_w
+              : (last_outer_block_w % out_subblock_w);
+
+      uint32_t last_outer_padded_subblock_tiles_addr_skip =
+          single_tile_size * (out_subblock_w - last_outer_subblock_w);
+      uint32_t last_outer_padded_block_tiles_w_skip =
+          out_subblock_num_tiles *
+          (out_num_subblocks_w - last_outer_num_nonzero_subblocks_w);
+      uint32_t last_outer_padded_block_tiles_h_skip =
+          (out_num_subblocks_h - last_outer_num_nonzero_subblocks_h) *
+          (out_block_w * out_subblock_h);
+
+      std::vector<uint32_t> reader_args;
+      std::vector<uint32_t> writer_args;
+
+      if (use_dram) {
+        uint32_t in0_start_tile_id = y * per_core_Mt * Kt;
+        reader_args = {
+            in0_addr,
+            in0_start_tile_id,
+            1,
+            Kt,
+            in0_block_w,
+            in0_block_w,
+            out_block_h,
+            in0_block_w * out_block_h,
+            num_blocks,
+            (uint32_t)phy_core.x,
+            (uint32_t)phy_core.y,
+            last_outer_block_h,
+            num_blocks_h,
+            num_blocks_w,
+            out_block_h * Kt,
+            in2_cb_addr,
+        };
+
+        uint32_t in1_start_tile_id = x * per_core_Nt;
+        uint32_t out_start_tile_id = y * per_core_Mt * Nt + x * per_core_Nt;
+
+        writer_args = {
+            in1_addr,
+            in1_start_tile_id,
+            1,
+            Nt,
+            in0_block_w * Nt,
+            out_block_w,
+            in0_block_w,
+            out_block_w * in0_block_w,
+            num_blocks,
+            in2_cb_addr,
+            (uint32_t)phy_core.x,
+            (uint32_t)phy_core.y,
+            out_addr,
+            out_start_tile_id,
+            1,
+            Nt,
+            out_subblock_w,
+            out_subblock_h * Nt,
+            out_subblock_w,
+            out_subblock_h,
+            out_subblock_num_tiles,
+            in1_num_subblocks,
+            in0_num_subblocks,
+            last_outer_block_w,
+            last_outer_num_nonzero_subblocks_h,
+            last_outer_subblock_h,
+            last_outer_padded_block_tiles_h_skip,
+            last_outer_num_nonzero_subblocks_w,
+            last_outer_subblock_w,
+            last_outer_padded_subblock_tiles_addr_skip,
+            last_outer_padded_block_tiles_w_skip,
+            num_blocks_h,
+            num_blocks_w,
+            out_block_w,
+            out_block_h * Nt,
+            out_block_w,
+        };
+
+          if (x == 0 && y == 0) {
+            uint32_t in0_total_tiles = Mt * Kt;
+            uint32_t in1_total_tiles = Kt * Nt;
+            uint32_t out_total_tiles = Mt * Nt;
+
+            uint32_t in0_last_tile_est =
+              in0_start_tile_id + ((num_blocks_h - 1) * out_block_h * Kt) +
+              ((num_blocks - 1) * in0_block_w) + ((out_block_h - 1) * Kt) +
+              (in0_block_w - 1);
+
+            uint32_t in1_last_tile_est =
+              in1_start_tile_id + ((num_blocks_w - 1) * out_block_w) +
+              ((num_blocks - 1) * (in0_block_w * Nt)) +
+              ((in0_block_w - 1) * Nt) + (out_block_w - 1);
+
+            uint32_t out_last_tile_est =
+              out_start_tile_id + ((num_blocks_h - 1) * (out_block_h * Nt)) +
+              ((num_blocks_w - 1) * out_block_w) +
+              ((out_block_h - 1) * Nt) + (out_block_w - 1);
+
+            log_info(LogTest,
+                 "DRAM core(0,0) ranges: in0_start={}, in0_last_est={}, "
+                 "in1_start={}, in1_last_est={}, out_start={}, "
+                 "out_last_est={}",
+                 in0_start_tile_id, in0_last_tile_est, in1_start_tile_id,
+                 in1_last_tile_est, out_start_tile_id, out_last_tile_est);
+
+            log_info(LogTest,
+                 "DRAM core(0,0) totals: in0_total={}, in1_total={}, "
+                 "out_total={}, num_blocks={}x{} outer, K_blocks={}",
+                 in0_total_tiles, in1_total_tiles, out_total_tiles,
+                 num_blocks_h, num_blocks_w, num_blocks);
+          }
+      } else {
+        reader_args = {in0_addr,
+                       0,
+                       1,
+                       in0_block_w,
+                       in0_block_w,
+                       in0_block_w,
+                       per_core_Mt,
+                       in0_block_w * per_core_Mt,
+                       num_blocks,
+                       (uint32_t)phy_core.x,
+                       (uint32_t)phy_core.y,
+                       cur_core_valid_Mt};
+
+        writer_args = {in1_addr,
+                       0,
+                       1,
+                       cur_core_valid_Nt,
+                       in0_block_w * per_core_Nt,
+                       per_core_Nt,
+                       in0_block_w,
+                       per_core_Nt * in0_block_w,
+                       num_blocks,
+                       in2_cb_addr,
+                       (uint32_t)phy_core.x,
+                       (uint32_t)phy_core.y,
+                       out_addr,
+                       0,
+                       1,
+                       cur_core_valid_Nt,
+                       out_subblock_w,
+                       out_subblock_h * cur_core_valid_Nt,
+                       out_subblock_w,
+                       out_subblock_h,
+                       out_subblock_num_tiles,
+                       per_core_Nt / out_subblock_w,
+                       per_core_Mt / out_subblock_h,
+                       cur_core_valid_Nt,
+                       (y == (int)core_range.y - 1)
+                           ? last_outer_num_nonzero_subblocks_h
+                           : (per_core_Mt / out_subblock_h),
+                       (y == (int)core_range.y - 1) ? last_outer_subblock_h
+                                                     : out_subblock_h,
+                       (y == (int)core_range.y - 1)
+                           ? last_outer_padded_block_tiles_h_skip
+                           : 0,
+                       (x == (int)core_range.x - 1)
+                           ? last_outer_num_nonzero_subblocks_w
+                           : (per_core_Nt / out_subblock_w),
+                       (x == (int)core_range.x - 1) ? last_outer_subblock_w
+                                                     : out_subblock_w,
+                       (x == (int)core_range.x - 1)
+                           ? last_outer_padded_subblock_tiles_addr_skip
+                           : 0,
+                       (x == (int)core_range.x - 1)
+                           ? last_outer_padded_block_tiles_w_skip
+                           : 0};
+      }
+
+      tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);
+      tt_metal::SetRuntimeArgs(program, mm_writer_id, core, writer_args);
+    }
+  }
+}
+
+bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
+  bool pass = true;
+  try {
+    ZoneScopedN("ComputeMM Functional Blocks");
+    log_info(LogTest, "Starting Compute MM Test");
+    log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+
+    if (params.dtype != 0) {
+      log_error(LogTest,
+                "Legacy ComputeMM currently supports only --dtype 0 (BFP8), "
+                "requested dtype={}",
+                params.dtype);
+      return false;
+    }
+
+    auto arch = device->arch();
+    uint32_t l1_size = 0;
+    uint32_t l1_unreserved_base = 0;
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    uint32_t num_cores_x = params.core_x;
+    uint32_t num_cores_y = params.core_y;
+    CoreCoord core_range(num_cores_x, num_cores_y);
+    uint32_t per_core_Mt = 0;
+    uint32_t per_core_Nt = 0;
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b;
+    uint32_t single_tile_size = 0;
+    uint32_t out_block_h = 0, out_block_w = 0, in0_block_w = 0;
+    uint32_t num_blocks_h = 1, num_blocks_w = 1;
+    uint32_t out_subblock_h = 0, out_subblock_w = 0;
+    uint32_t in0_cb_addr = 0, in1_cb_addr = 0, in2_cb_addr = 0, out_cb_addr = 0,
+             interm_cb_addr = 0, in0_addr = 0, in1_addr = 0, out_addr = 0;
+    BenchmarkInputsLegacy inputs;
+    uint32_t effective_in0_addr = 0;
+    uint32_t effective_in1_addr = 0;
+    uint32_t effective_out_addr = 0;
+
+    {
+      ZoneScopedN("ComputeMM Input Data Processing");
+
+      {
+        ZoneScopedN("ComputeMM Host Setup and Blocking");
+        l1_size = get_l1_size_legacy(arch);
+        l1_unreserved_base =
+            device->allocator()->get_base_allocator_addr(HalMemType::L1);
+        std::tie(math_fidelity, fp32_dest_acc_en) = get_compute_params_legacy(arch);
+
+        std::tie(Mt, Nt, Kt) =
+            get_aligned_input_tile_num(params.M, params.N, params.K);
+
+        per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+        per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
+
+        data_format = (params.dtype == 0) ? tt::DataFormat::Bfp8_b
+                                          : tt::DataFormat::Float16_b;
+        single_tile_size = tt::tile_size(data_format);
+
+        if (params.use_dram) {
+          auto [obh, obw, bw] = get_multi_dim_per_core_factor_legacy(
+              per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+              l1_unreserved_base);
+          out_block_h = obh;
+          out_block_w = obw;
+          in0_block_w = bw;
+          num_blocks_h = per_core_Mt / out_block_h;
+          num_blocks_w = per_core_Nt / out_block_w;
+
+          log_info(LogTest,
+                   "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+                   "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
+                   per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+                   num_blocks_h, num_blocks_w, in0_block_w,
+                   L1_SAFETY_MARGIN_BYTES / 1024);
+        } else {
+          out_block_h = per_core_Mt;
+          out_block_w = per_core_Nt;
+          in0_block_w =
+              get_in0_block_w_legacy(per_core_Mt, per_core_Nt, Kt,
+                                     single_tile_size, l1_size,
+                                     l1_unreserved_base, false);
+        }
+
+        if (in0_block_w == 0) {
+          uint32_t out_cb_tiles = out_block_h * out_block_w;
+          uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+          uint32_t avail_l1 = l1_size - l1_unreserved_base;
+          log_error(LogTest,
+                    "Insufficient L1 memory for M={}, N={}, K={} "
+                    "(out_block={}x{}, out_CB={}tiles={}KB, "
+                    "avail_L1={}KB, dram={})",
+                    params.M, params.N, params.K, out_block_h, out_block_w,
+                    out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                    params.use_dram ? "yes" : "no");
+          return false;
+        }
+
+        std::tie(out_subblock_h, out_subblock_w) =
+            get_out_subblock_params_legacy(out_block_h, out_block_w);
+
+        std::tie(in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+                 interm_cb_addr, in0_addr, in1_addr, out_addr) =
+            get_all_buffers_addresses_legacy(out_block_h, out_block_w,
+                                             in0_block_w, single_tile_size,
+                                             l1_unreserved_base,
+                                             params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMM Host Prepare Inputs");
+        inputs = prepare_inputs_compute_mm_legacy(
+            device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+            in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+            params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMM Host Resolve Buffer Addresses");
+        effective_in0_addr = in0_addr;
+        effective_in1_addr = in1_addr;
+        effective_out_addr = out_addr;
+        if (params.use_dram) {
+          effective_in0_addr = inputs.in0_buffer->address();
+          effective_in1_addr = inputs.in1_buffer->address();
+          effective_out_addr = inputs.out_buffer->address();
+          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+                   effective_in0_addr, effective_in1_addr,
+                   effective_out_addr);
+        }
+      }
+    }
+
+    log_info(LogTest, "Num tests {}", params.num_iters);
+
+    tt_metal::Program program;
+    {
+      ZoneScopedN("ComputeMM Host Program Build");
+      create_program_compute_mm_legacy(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w,
+          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt,
+          out_block_h, out_block_w, num_blocks_h, num_blocks_w, in0_cb_addr,
+          in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
+          effective_in0_addr, effective_in1_addr, effective_out_addr,
+          params.use_dram, program);
+    }
+
+    {
+      ZoneScopedN("ComputeMM Host Dispatch");
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("ComputeMM Host Dispatch Iteration");
+        ZoneValue(i);
+        {
+          ZoneScopedN("ComputeMM Host Enqueue");
+          EnqueueProgram(device->command_queue(), program, false);
+        }
+        {
+          ZoneScopedN("ComputeMM Host FinishWait");
+          Finish(device->command_queue());
+        }
+      }
+    }
+
+    if (!params.bypass_check) {
+      ZoneScopedN("ComputeMM Host Post Processing");
+      log_info(LogTest, "Validation Started...");
+
+      std::vector<float> golden_vec;
+      {
+        ZoneScopedN("ComputeMM Host Golden Reference");
+        log_info(LogTest, "Computing Golden Reference (FP32)...");
+        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
+                                      params.N, params.K);
+      }
+
+      log_info(LogTest, "Reading Device Results...");
+      std::vector<float> device_vec(params.M * params.N, 0.0f);
+      {
+        ZoneScopedN("ComputeMM Host Device Readback and Decode");
+        if (params.use_dram) {
+          std::vector<uint32_t> out_data;
+          tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
+          auto out_float = unpack_bfp8_tiles_into_float_vec(
+              out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
+          untilize(out_float, Mt * 32, Nt * 32);
+          device_vec = out_float;
+          if (device_vec.size() > (size_t)(params.M * params.N)) {
+            std::vector<float> trimmed(params.M * params.N, 0.0f);
+            for (uint32_t r = 0; r < params.M; ++r) {
+              for (uint32_t c = 0; c < params.N; ++c) {
+                trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+              }
+            }
+            device_vec = trimmed;
+          }
+        } else {
+          for (int y = 0; y < (int)num_cores_y; y++) {
+            for (int x = 0; x < (int)num_cores_x; x++) {
+              CoreCoord core = {(std::size_t)x, (std::size_t)y};
+              uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+              uint32_t read_size = core_n_tiles * single_tile_size;
+
+              std::vector<uint32_t> core_data_tiles;
+              tt_metal::detail::ReadFromDeviceL1(device, core, out_addr,
+                                                 read_size, core_data_tiles);
+
+              auto core_data_float = unpack_bfp8_tiles_into_float_vec(
+                  core_data_tiles, /*row_major_output=*/true,
+                  /*is_exp_a=*/false);
+              untilize(core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+
+              uint32_t global_r_start = y * per_core_Mt * 32;
+              uint32_t global_c_start = x * per_core_Nt * 32;
+              uint32_t r_len = per_core_Mt * 32;
+              uint32_t c_len = per_core_Nt * 32;
+
+              for (uint32_t r = 0; r < r_len; ++r) {
+                for (uint32_t c = 0; c < c_len; ++c) {
+                  uint32_t global_idx =
+                      (global_r_start + r) * (params.N) + (global_c_start + c);
+                  if (global_idx < device_vec.size()) {
+                    device_vec[global_idx] = core_data_float[r * c_len + c];
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      float pcc = 0.0f;
+      float rmse = 0.0f;
+      float relative_rmse = 0.0f;
+      {
+        ZoneScopedN("ComputeMM Host Validation Metrics");
+        pcc = get_pcc(golden_vec, device_vec);
+        rmse = get_rmse(golden_vec, device_vec);
+        relative_rmse = get_relative_rmse(device_vec, golden_vec);
+      }
+
+      log_validation_sample_pairs("ComputeMM Validation", golden_vec,
+                                  device_vec, 12);
+      log_info(LogTest,
+               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+               "= {:.4f}",
+               pcc, rmse, relative_rmse);
+
+      if (pcc < 0.99f) {
+        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+        pass = false;
+      } else {
+        log_info(LogTest, "Validation PASSED");
+      }
+    }
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
 }
 
 bool test_sub_device_manager_mm(tt::tt_metal::IDevice * /*device*/,
