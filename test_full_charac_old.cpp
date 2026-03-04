@@ -144,6 +144,7 @@ void log_validation_sample_pairs(const std::string &tag,
 
 constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 constexpr uint32_t MAX_ARGS = 255;
+constexpr uint32_t L1_SAFETY_MARGIN_BYTES = 64 * 1024;
 
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
@@ -732,10 +733,8 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
   if (use_dram) {
-    auto in0_tilized = inputs.in0_vec;
-    tilize(in0_tilized, Mt * 32, Kt * 32);
     auto in0_packed =
-        pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
+        pack_fp32_vec_as_bfp8_tiles(inputs.in0_vec, /*row_major_input=*/true,
                                     /*is_exp_a=*/false);
 
     uint32_t in0_num_tiles = Mt * Kt;
@@ -749,17 +748,13 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
 
     auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
         in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-    untilize(in0_unpacked, Mt * 32, Kt * 32);
     inputs.in0_vec = in0_unpacked;
 
-    auto in1_tilized = inputs.in1_vec;
-    tilize(in1_tilized, Kt * 32, Nt * 32);
     auto in1_packed =
-        pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
+      pack_fp32_vec_as_bfp8_tiles(inputs.in1_vec, /*row_major_input=*/true,
                                     /*is_exp_a=*/false);
     auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
         in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-    untilize(in1_unpacked, Kt * 32, Nt * 32);
     inputs.in1_vec = in1_unpacked;
 
     uint32_t in1_num_tiles = Kt * Nt;
@@ -806,10 +801,8 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
                         Mt * 32, Kt * 32);
       auto in0_block_slice =
           get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-      auto in0_block_tilized = in0_block_slice;
-      tilize(in0_block_tilized, num_r * 32, in0_block_w * 32);
       std::vector<uint32_t> in0 =
-          pack_fp32_vec_as_bfp8_tiles(in0_block_tilized,
+          pack_fp32_vec_as_bfp8_tiles(in0_block_slice,
                                       /*row_major_input=*/true,
                                       /*is_exp_a=*/false);
 
@@ -824,10 +817,8 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
           in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
         }
 
-        auto in1_block_tilized = in1_block_slice;
-        tilize(in1_block_tilized, in0_block_w * 32, num_c * 32);
         std::vector<uint32_t> in1 =
-            pack_fp32_vec_as_bfp8_tiles(in1_block_tilized,
+            pack_fp32_vec_as_bfp8_tiles(in1_block_slice,
                                         /*row_major_input=*/true,
                                         /*is_exp_a=*/false);
 
@@ -1351,7 +1342,6 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
           tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
           auto out_float = unpack_bfp8_tiles_into_float_vec(
               out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-          untilize(out_float, Mt * 32, Nt * 32);
           device_vec = out_float;
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
@@ -1376,7 +1366,6 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               auto core_data_float = unpack_bfp8_tiles_into_float_vec(
                   core_data_tiles, /*row_major_output=*/true,
                   /*is_exp_a=*/false);
-              untilize(core_data_float, per_core_Mt * 32, per_core_Nt * 32);
 
               uint32_t global_r_start = y * per_core_Mt * 32;
               uint32_t global_c_start = x * per_core_Nt * 32;
@@ -1516,15 +1505,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto in0_tilized = in0_vec;
-        tilize(in0_tilized, Mt * 32, Kt * 32);
-        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_tilized,
+        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_vec,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
 
-        auto in1_tilized = in1_vec;
-        tilize(in1_tilized, Kt * 32, Nt * 32);
-        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_tilized,
+        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_vec,
                                                  /*row_major_input=*/true,
                                                  /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
@@ -1568,11 +1553,9 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        untilize(in0_roundtrip, Mt * 32, Kt * 32);
 
         in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
             in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        untilize(in1_roundtrip, Kt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1697,9 +1680,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto tilized = tensor_vec;
-        tilize(tilized, Mt * 32, Nt * 32);
-        packed = pack_fp32_vec_as_bfp8_tiles(tilized,
+        packed = pack_fp32_vec_as_bfp8_tiles(tensor_vec,
                                              /*row_major_input=*/true,
                                              /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
@@ -1763,7 +1744,6 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
         auto t0 = std::chrono::steady_clock::now();
         roundtrip = unpack_bfp8_tiles_into_float_vec(
             readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        untilize(roundtrip, Mt * 32, Nt * 32);
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
