@@ -847,17 +847,6 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
         .buffer_type = tt_metal::BufferType::DRAM});
     tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
 
-    try {
-      auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-          in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in0_vec = untilize_compat(in0_unpacked, Mt * 32, Kt * 32);
-    } catch (const std::exception &e) {
-      throw std::runtime_error(
-          "Legacy ComputeMM DRAM IN0 inverse-transform failed: Mt=" +
-          std::to_string(Mt) + ", Kt=" + std::to_string(Kt) +
-          ", what=" + e.what());
-    }
-
     std::vector<float> in1_tilized;
     std::vector<uint32_t> in1_packed;
     try {
@@ -872,17 +861,6 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
           ", in1_vec_size=" + std::to_string(inputs.in1_vec.size()) +
           ", what=" + e.what());
     }
-    try {
-      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in1_vec = untilize_compat(in1_unpacked, Kt * 32, Nt * 32);
-    } catch (const std::exception &e) {
-      throw std::runtime_error(
-          "Legacy ComputeMM DRAM IN1 inverse-transform failed: Kt=" +
-          std::to_string(Kt) + ", Nt=" + std::to_string(Nt) +
-          ", what=" + e.what());
-    }
-
     uint32_t in1_num_tiles = Kt * Nt;
     uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
     inputs.in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
