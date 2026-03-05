@@ -395,22 +395,37 @@ std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &til
                                                 uint32_t rows,
                                                 uint32_t cols,
                                                 const std::string &tag) {
-  try {
-    // Keep official compute_mm behavior first: unpack(row_major_output=true)
-    // followed by untilize.
-    auto unpacked =
-        unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/true,
-                                         /*is_exp_a=*/false);
-    return untilize_compat(unpacked, rows, cols);
-  } catch (const std::exception &primary_error) {
-    log_warning(LogTest,
-                "{} decode primary path failed, retrying fallback unpack mode: {}",
-                tag, primary_error.what());
-    auto unpacked_fallback =
-        unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/false,
-                                         /*is_exp_a=*/false);
-    return untilize_compat(unpacked_fallback, rows, cols);
+  struct Attempt {
+    bool row_major_output;
+    bool is_exp_a;
+    const char *label;
+  };
+  const std::array<Attempt, 4> attempts = {{
+      {true, false, "official(row_major=true,is_exp_a=false)"},
+      {false, false, "fallback(row_major=false,is_exp_a=false)"},
+      {true, true, "compat(row_major=true,is_exp_a=true)"},
+      {false, true, "compat(row_major=false,is_exp_a=true)"},
+  }};
+
+  std::string failure_report;
+  for (const auto &a : attempts) {
+    try {
+      auto unpacked =
+          unpack_bfp8_tiles_into_float_vec(tiles, a.row_major_output, a.is_exp_a);
+      return untilize_compat(unpacked, rows, cols);
+    } catch (const std::exception &e) {
+      failure_report += std::string("[") + a.label + "] " + e.what() + " | ";
+      log_warning(LogTest, "{} decode attempt {} failed: {}", tag, a.label,
+                  e.what());
+    }
   }
+
+  throw std::runtime_error(tag +
+                           " decode failed for all unpack variants. rows=" +
+                           std::to_string(rows) + ", cols=" +
+                           std::to_string(cols) + ", tiles_u32=" +
+                           std::to_string(tiles.size()) + ", details=" +
+                           failure_report);
 }
 
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
