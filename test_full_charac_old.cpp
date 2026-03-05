@@ -391,6 +391,28 @@ std::vector<T> untilize_compat(const std::vector<T> &input, uint32_t rows,
   return output;
 }
 
+std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &tiles,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                const std::string &tag) {
+  try {
+    // Keep official compute_mm behavior first: unpack(row_major_output=true)
+    // followed by untilize.
+    auto unpacked =
+        unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/true,
+                                         /*is_exp_a=*/false);
+    return untilize_compat(unpacked, rows, cols);
+  } catch (const std::exception &primary_error) {
+    log_warning(LogTest,
+                "{} decode primary path failed, retrying fallback unpack mode: {}",
+                tag, primary_error.what());
+    auto unpacked_fallback =
+        unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/false,
+                                         /*is_exp_a=*/false);
+    return untilize_compat(unpacked_fallback, rows, cols);
+  }
+}
+
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
   if (x.size() != y.size() || x.empty()) {
     return 0.0f;
@@ -1479,9 +1501,9 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         if (params.use_dram) {
           std::vector<uint32_t> out_data;
           tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
-          auto out_float = unpack_bfp8_tiles_into_float_vec(
-              out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-          device_vec = untilize_compat(out_float, Mt * 32, Nt * 32);
+          device_vec = decode_bfp8_row_major_compat(
+              out_data, Mt * 32, Nt * 32,
+              "ComputeMM DRAM output readback");
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
             for (uint32_t r = 0; r < params.M; ++r) {
@@ -1502,11 +1524,9 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               tt_metal::detail::ReadFromDeviceL1(device, core, out_addr,
                                                  read_size, core_data_tiles);
 
-              auto core_data_float = unpack_bfp8_tiles_into_float_vec(
-                  core_data_tiles, /*row_major_output=*/true,
-                  /*is_exp_a=*/false);
-                  auto core_data_untilized = untilize_compat(
-                  core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+                auto core_data_untilized = decode_bfp8_row_major_compat(
+                  core_data_tiles, per_core_Mt * 32, per_core_Nt * 32,
+                  "ComputeMM L1 output readback");
 
               uint32_t global_r_start = y * per_core_Mt * 32;
               uint32_t global_c_start = x * per_core_Nt * 32;
@@ -1694,13 +1714,13 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Host Post Processing");
         auto t0 = std::chrono::steady_clock::now();
-        in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
-            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in0_roundtrip = untilize_compat(in0_roundtrip, Mt * 32, Kt * 32);
+        in0_roundtrip = decode_bfp8_row_major_compat(
+          in0_readback, Mt * 32, Kt * 32,
+          "HostPipeline ComputeMM IN0 readback");
 
-        in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
-            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in1_roundtrip = untilize_compat(in1_roundtrip, Kt * 32, Nt * 32);
+        in1_roundtrip = decode_bfp8_row_major_compat(
+          in1_readback, Kt * 32, Nt * 32,
+          "HostPipeline ComputeMM IN1 readback");
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1888,9 +1908,9 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Host Post Processing");
         auto t0 = std::chrono::steady_clock::now();
-        roundtrip = unpack_bfp8_tiles_into_float_vec(
-            readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        roundtrip = untilize_compat(roundtrip, Mt * 32, Nt * 32);
+        roundtrip = decode_bfp8_row_major_compat(
+          readback, Mt * 32, Nt * 32,
+          "HostPipeline Empty readback");
         auto t1 = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
