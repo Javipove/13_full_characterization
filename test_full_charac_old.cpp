@@ -395,6 +395,23 @@ std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &til
                                                 uint32_t rows,
                                                 uint32_t cols,
                                                 const std::string &tag) {
+  const uint32_t bfp8_tile_words = tt::tile_size(tt::DataFormat::Bfp8_b) /
+                                   static_cast<uint32_t>(sizeof(uint32_t));
+  if (bfp8_tile_words == 0) {
+    throw std::runtime_error(tag +
+                             " decode invalid BFP8 tile geometry: tile_words=0");
+  }
+  if (tiles.empty()) {
+    throw std::runtime_error(tag + " decode received empty tile payload");
+  }
+  if (tiles.size() % bfp8_tile_words != 0) {
+    throw std::runtime_error(
+        tag + " decode payload size mismatch: tiles_u32=" +
+        std::to_string(tiles.size()) +
+        ", expected multiple of bfp8_tile_words=" +
+        std::to_string(bfp8_tile_words));
+  }
+
   struct Attempt {
     bool row_major_output;
     bool is_exp_a;
@@ -424,8 +441,49 @@ std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &til
                            " decode failed for all unpack variants. rows=" +
                            std::to_string(rows) + ", cols=" +
                            std::to_string(cols) + ", tiles_u32=" +
-                           std::to_string(tiles.size()) + ", details=" +
+                           std::to_string(tiles.size()) +
+                           ", bfp8_tile_words=" +
+                           std::to_string(bfp8_tile_words) + ", details=" +
                            failure_report);
+}
+
+void run_bfp8_host_selfcheck_once() {
+  static bool ran = false;
+  if (ran) {
+    return;
+  }
+  ran = true;
+
+  // Isolates host bfloat8 pack/unpack from kernel dispatch and DRAM IO.
+  std::vector<float> rm_in(constants::TILE_HW, 0.0f);
+  for (uint32_t i = 0; i < constants::TILE_HW; ++i) {
+    rm_in[i] = static_cast<float>((i % 67) - 33);
+  }
+
+  auto packed = pack_fp32_vec_as_bfp8_tiles(rm_in, /*row_major_input=*/true,
+                                             /*is_exp_a=*/false);
+  const uint32_t bfp8_tile_words = tt::tile_size(tt::DataFormat::Bfp8_b) /
+                                   static_cast<uint32_t>(sizeof(uint32_t));
+  if (packed.size() != bfp8_tile_words) {
+    throw std::runtime_error(
+        "BFP8 host self-check failed: packed tile words mismatch. got=" +
+        std::to_string(packed.size()) +
+        ", expected=" + std::to_string(bfp8_tile_words));
+  }
+
+  auto unpacked =
+      unpack_bfp8_tiles_into_float_vec(packed, /*row_major_output=*/true,
+                                       /*is_exp_a=*/false);
+  if (unpacked.size() != rm_in.size()) {
+    throw std::runtime_error(
+        "BFP8 host self-check failed: unpacked size mismatch. got=" +
+        std::to_string(unpacked.size()) +
+        ", expected=" + std::to_string(rm_in.size()));
+  }
+
+  log_info(LogTest,
+           "BFP8 host self-check passed (packed_words={}, unpacked_floats={})",
+           packed.size(), unpacked.size());
 }
 
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
@@ -1348,6 +1406,8 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
                 params.dtype);
       return false;
     }
+
+    run_bfp8_host_selfcheck_once();
 
     auto arch = device->arch();
     uint32_t l1_size = 0;
