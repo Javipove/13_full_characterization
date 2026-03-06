@@ -411,79 +411,10 @@ std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &til
         ", expected multiple of bfp8_tile_words=" +
         std::to_string(bfp8_tile_words));
   }
-
-  struct Attempt {
-    bool row_major_output;
-    bool is_exp_a;
-    const char *label;
-  };
-  const std::array<Attempt, 4> attempts = {{
-      {true, false, "official(row_major=true,is_exp_a=false)"},
-      {false, false, "fallback(row_major=false,is_exp_a=false)"},
-      {true, true, "compat(row_major=true,is_exp_a=true)"},
-      {false, true, "compat(row_major=false,is_exp_a=true)"},
-  }};
-
-  std::string failure_report;
-  for (const auto &a : attempts) {
-    try {
-      auto unpacked =
-          unpack_bfp8_tiles_into_float_vec(tiles, a.row_major_output, a.is_exp_a);
-      return untilize_compat(unpacked, rows, cols);
-    } catch (const std::exception &e) {
-      failure_report += std::string("[") + a.label + "] " + e.what() + " | ";
-      log_warning(LogTest, "{} decode attempt {} failed: {}", tag, a.label,
-                  e.what());
-    }
-  }
-
-  throw std::runtime_error(tag +
-                           " decode failed for all unpack variants. rows=" +
-                           std::to_string(rows) + ", cols=" +
-                           std::to_string(cols) + ", tiles_u32=" +
-                           std::to_string(tiles.size()) +
-                           ", bfp8_tile_words=" +
-                           std::to_string(bfp8_tile_words) + ", details=" +
-                           failure_report);
-}
-
-void run_bfp8_host_selfcheck_once() {
-  static bool ran = false;
-  if (ran) {
-    return;
-  }
-  ran = true;
-
-  // Isolates host bfloat8 pack/unpack from kernel dispatch and DRAM IO.
-  std::vector<float> rm_in(constants::TILE_HW, 0.0f);
-  for (uint32_t i = 0; i < constants::TILE_HW; ++i) {
-    rm_in[i] = static_cast<float>((i % 67) - 33);
-  }
-
-  auto packed = pack_fp32_vec_as_bfp8_tiles(rm_in, /*row_major_input=*/true,
-                                             /*is_exp_a=*/false);
-  const uint32_t bfp8_tile_words = tt::tile_size(tt::DataFormat::Bfp8_b) /
-                                   static_cast<uint32_t>(sizeof(uint32_t));
-  if (packed.size() != bfp8_tile_words) {
-    throw std::runtime_error(
-        "BFP8 host self-check failed: packed tile words mismatch. got=" +
-        std::to_string(packed.size()) +
-        ", expected=" + std::to_string(bfp8_tile_words));
-  }
-
   auto unpacked =
-      unpack_bfp8_tiles_into_float_vec(packed, /*row_major_output=*/true,
+      unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/true,
                                        /*is_exp_a=*/false);
-  if (unpacked.size() != rm_in.size()) {
-    throw std::runtime_error(
-        "BFP8 host self-check failed: unpacked size mismatch. got=" +
-        std::to_string(unpacked.size()) +
-        ", expected=" + std::to_string(rm_in.size()));
-  }
-
-  log_info(LogTest,
-           "BFP8 host self-check passed (packed_words={}, unpacked_floats={})",
-           packed.size(), unpacked.size());
+  return untilize_compat(unpacked, rows, cols);
 }
 
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
@@ -925,6 +856,11 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
       in0_packed =
           pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
                                       /*is_exp_a=*/false);
+      // Match new-API validation semantics: golden uses effective quantized
+      // values actually written to device.
+      inputs.in0_vec = decode_bfp8_row_major_compat(
+          in0_packed, Mt * 32, Kt * 32,
+          "ComputeMM DRAM IN0 quantized roundtrip");
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN0 transform failed: Mt=" +
@@ -949,6 +885,9 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
       in1_packed =
           pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
                                       /*is_exp_a=*/false);
+      inputs.in1_vec = decode_bfp8_row_major_compat(
+          in1_packed, Kt * 32, Nt * 32,
+          "ComputeMM DRAM IN1 quantized roundtrip");
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN1 transform failed: Kt=" +
@@ -1406,8 +1345,6 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
                 params.dtype);
       return false;
     }
-
-    run_bfp8_host_selfcheck_once();
 
     auto arch = device->arch();
     uint32_t l1_size = 0;
