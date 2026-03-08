@@ -8,10 +8,6 @@ build/
 
 # Other non published/public files
 SoA_Analysis.md
-bfloat8_mine.hpp
-
-#AI auxiliary files
-Roadmap.md
 
 #Python files
 Python/Matmul_Benchmark_Roadmap.md

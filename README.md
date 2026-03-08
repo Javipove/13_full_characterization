@@ -18,22 +18,22 @@ The benchmark supports the following test types, selected via the `--test` argum
     * **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
     * **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
 
-3. **Sub-Device Parallelism (`--test 2`)**:
-    * **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
-    * **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
-    * **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
-        * You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
-        * Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
+3.  **Sub-Device Parallelism (`--test 2`)**:
+    *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
+    *   **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
+    *   **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
+        *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
+        *   Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
 
-4. **Host Pipeline ComputeMM (`--test 3`)**:
-    * **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
-    * **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
-    * **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
+4.  **Host Pipeline ComputeMM (`--test 3`)**:
+    *   **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
+    *   **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
+    *   **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
 
-5. **Host Pipeline Empty Tensor (`--test 4`)**:
-    * **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
-    * **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
-    * **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
+5.  **Host Pipeline Empty Tensor (`--test 4`)**:
+    *   **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
+    *   **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
+    *   **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
 
 ## Host-Only Tests Deep Dive (`--test 3` vs `--test 4`)
 
@@ -42,7 +42,6 @@ Both tests are **host-only data-path benchmarks**. They do not create a `Program
 ### Shared Pipeline Stages
 
 Each iteration executes:
-
 1. Generate FP32 tensor(s) on host.
 2. Transform to device-ready layout (`tilize_swizzled` + `pack_as_bfp8_tiles`).
 3. Write packed tensor(s) to DRAM (`WriteToBuffer`).
@@ -62,18 +61,35 @@ Each iteration executes:
 
 ### Reported Metrics
 
-* `generate`: host-side random tensor generation.
-* `transform`: tilize + pack to BFP8 format.
-* `write`: DRAM write time for packed tensor payloads.
-* `read`: DRAM read time for packed tensor payloads.
-* `inverse_transform`: unpack + untilize back to row-major FP32.
-* `end_to_end`: full iteration wall time.
-* Throughput summary: total bytes and effective GB/s for write and read.
+- `generate`: host-side random tensor generation.
+- `transform`: tilize + pack to BFP8 format.
+- `write`: DRAM write time for packed tensor payloads.
+- `read`: DRAM read time for packed tensor payloads.
+- `inverse_transform`: unpack + untilize back to row-major FP32.
+- `end_to_end`: full iteration wall time.
+- Throughput summary: total bytes and effective GB/s for write and read.
 
 Current constraints:
+- Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
+- `--num-iters` must be greater than 0.
 
-* Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
-* `--num-iters` must be greater than 0.
+## Validation Status (Current Debugging Campaign)
+
+The table below tracks configurations explicitly validated or currently under validation.
+
+| Test ID | Test Name | Mode | Scope / Shape | Status | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `--test 0` | Empty Kernel Launch | N/A | Standard dispatch path | ✅ Proven working | Stable baseline; dispatch-only path works as expected. |
+| `--test 1` | ComputeMM | `L1` | Small tensor sizes | ✅ Proven working | L1 path works for small sizes. |
+| `--test 1` | ComputeMM | `DRAM` | `6x6` grid | ✅ Proven working | Dispatch + execution complete successfully on Wormhole hardware. |
+| `--test 1` | ComputeMM | `DRAM` | `1x1` grid | ⚠️ Not yet passing | Fails with completion-queue dispatch error (`CQ_DISPATCH_CMD_ILLEGAL`). |
+| `--test 1` | ComputeMM | `DRAM` | `2x2` grid | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
+| `--test 3` | Host Pipeline ComputeMM | Host-only | FP32→BFP8→DRAM→BFP8→FP32 | ✅ Included in validation scope | Implemented and ready for scaling/overhead campaigns (no kernel dispatch). |
+| `--test 4` | Host Pipeline Empty Tensor | Host-only | Single-tensor host pipeline | ✅ Included in validation scope | Implemented and ready for baseline host overhead studies. |
+
+Notes:
+- This section is intentionally conservative and updated as new runs are confirmed.
+- `--test 2` (SubDevice) and unlisted shape/grid combinations remain to be validated in this campaign.
 
 ### Partitioning Logic Examples
 
@@ -96,19 +112,17 @@ The current logic uses integer division (`rows / groups`) to assign rows. Any re
   * **Group 1**: Rows 2-3 (8x2 grid, 16 cores)
   * **Group 2**: Rows 4-7 (8x4 grid, 32 cores) *(absorbs remainder)*
 
-#### 3. Row-Level Turn (8 Groups)
-
-* `--y_size 8 --core-groups 8`
-* **Math**: `8 / 8 = 1` row per group.
-* **Result**:
-  * **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
+**3. Row-Level Turn (8 Groups)**
+*   `--y_size 8 --core-groups 8`
+*   **Math**: `8 / 8 = 1` row per group.
+*   **Result**:
+    *   **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
 
 ## API Translation: New vs Legacy
 
 This section summarizes the concrete translations needed when porting between:
-
-* **New API path**: `test_full_charac.cpp` (`MeshDevice` / `distributed::*`)
-* **Legacy API path**: `test_full_charac_old.cpp` (`IDevice` / single-device enqueue)
+- **New API path**: `test_full_charac.cpp` (`MeshDevice` / `distributed::*`)
+- **Legacy API path**: `test_full_charac_old.cpp` (`IDevice` / single-device enqueue)
 
 | Functional Area | New API (`test_full_charac.cpp`) | Legacy API (`test_full_charac_old.cpp`) | Translation / Required Change |
 | :--- | :--- | :--- | :--- |
@@ -124,24 +138,23 @@ This section summarizes the concrete translations needed when porting between:
 | Host-only DRAM buffer path | `CreateBuffer`, `detail::WriteToBuffer`, `detail::ReadFromBuffer` | same calls | No translation needed for host-only tests (`--test 3`, `--test 4`). |
 | Empty-kernel dispatch tracing | `MeshWorkload` + enqueue/finish split zones | `EnqueueProgram` + `Finish` split zones | Keep identical Tracy zone names so traces are directly comparable. |
 | Sub-device model | Implemented via `CoreRange` splits inside mesh-based flow | **Not yet implemented** | Requires new legacy implementation; currently reported as known gap. |
-| ComputeMM full kernel path | Implemented in modern file | Implemented (L1 + DRAM execution paths) | Legacy path now dispatches full ComputeMM kernels with host-side golden/reference validation. |
+| ComputeMM full kernel path | Implemented in modern file | **Not yet implemented** (stub) | Legacy file currently uses host-pipeline coverage instead; full MM kernel parity still pending. |
 
 ### Rationale & Limitations (From API Docs)
 
-* **Do not mix models within one flow**: avoid interleaving `MeshDevice`-style dispatch and legacy single-device dispatch in the same execution path.
-* **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
-* **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
-* **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
-* **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, `SubDevice` in old file is still a gap).
+- **Do not mix models within one flow**: avoid interleaving `MeshDevice`-style dispatch and legacy single-device dispatch in the same execution path.
+- **Mesh is lock-step oriented**: mesh workloads are designed to execute in coordinated fashion across mesh participants; benchmark logic should reflect that assumption.
+- **Memory model differs at scale**: mesh-oriented allocation patterns are more constrained/structured than ad-hoc per-device legacy allocations; ports should avoid assuming arbitrary per-device buffer layouts.
+- **Sync semantics should stay explicit**: when translating, preserve enqueue/wait boundaries (`Enqueue*` vs `Finish`) because those boundaries are what Tracy and host-overhead analysis rely on.
+- **Feature parity is not automatic**: modern distributed flows can expose capabilities not yet implemented in the legacy benchmark path (for this project, full `ComputeMM` and `SubDevice` in old file are still gaps).
 
 ### Tracy Zone Unification Rules
 
 When adding or porting code, preserve the same functional hierarchy in both files:
-
-* Top-level function block (for example `ComputeMM Functional Blocks`, `EmptyKernel Functional Blocks`)
-* Input/setup block
-* Dispatch block with per-iteration + enqueue/wait sub-zones
-* Post-processing/validation block
+- Top-level function block (for example `ComputeMM Functional Blocks`, `EmptyKernel Functional Blocks`)
+- Input/setup block
+- Dispatch block with per-iteration + enqueue/wait sub-zones
+- Post-processing/validation block
 
 This ensures old/new traces remain diffable with minimal manual interpretation.
 
@@ -160,39 +173,28 @@ All currently parsed options are listed below.
 <details>
 <summary><strong>Show CLI options table</strong></summary>
 
-| Group | Option | Default | Applies To | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| Test Select | `--test <0..5>` | `5` | all | Test ID: `0` EmptyKernel, `1` ComputeMM, `2` SubDevice, `3` HostPipelineComputeMM, `4` HostPipelineEmpty (`5` = invalid sentinel). |
-| Matrix | `--m <N>` | `11264` | test 1,2,3,4 | Matrix/tensor M dimension. |
-| Matrix | `--n <N>` | `3072` | test 1,2,3,4 | Matrix/tensor N dimension. |
-| Matrix | `--k <N>` | `768` | test 1,2,3,4 | Matrix/tensor K dimension. |
-| Precision | `--dtype <0-1>` | `0` | test 1,2,3,4 | Data format selector (`0` BFP8, `1` FP16). Host-only paths currently enforce `0`. |
-| Precision | `--fidel <0-1>` | `0` | test 1,2 | Math fidelity selector. |
-| Layout/IO | `--dram` | off | test 1 | Enable DRAM-backed tensor path/kernels for ComputeMM. |
-| Cache | `--cache` | off | all | Enable program cache + persistent kernel cache lifecycle in benchmark run. |
-| Cache | `--clean-mode <0-1>` | `0` | all | Cache experiment mode; `1` invalidates cache benefits for that run. |
-| Grid | `--x_size <N>` | `0` | test 0,1,2 | Core grid X (columns). |
-| Grid | `--y_size <N>` | `0` | test 0,1,2 | Core grid Y (rows). |
-| Grid | `--core_groups <N>` | `1` | test 0,2 | Number of core groups (sub-partitions). Must be `> 0`. |
-| Runtime | `--num-iters <N>` | `15` | all | Benchmark iteration count. |
-| Runtime | `--num-rt-args <N>` | `255` | test 0 | Number of runtime args used by empty-kernel setup path. |
-| Runtime | `--cpu <id>` | `0xFFFFFFFF` | all | Optional CPU affinity pinning. Sentinel means no pinning. |
-| Validation | `--bypass-check` | off | test 1,3,4 | Skip correctness checks (PCC/RMSE and visual validation samples). |
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--test <ID>` | `5` | Test Type ID (0=Empty, 1=ComputeMM, 2=SubDevice, 3=HostPipelineComputeMM, 4=HostPipelineEmpty). |
+| `--x_size <N>` | `0` (Max) | Number of columns in the core grid. |
+| `--y_size <N>` | `0` (Max) | Number of rows in the core grid. |
+| `--num-iters <N>` | `15` | Number of iterations to run the dispatch loop. |
+| `--core-groups <N>`| `2` | Number of sub-devices/splits for Test 2. |
+| `--clean-mode <0/1>`| `0` | If 1, cleans kernel cache before running. |
 
-</details>
+### Matrix Arguments (for ComputeMM and SubDeviceMM)
 
-Notes:
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--m <N>` | `11264` | M dimension of the matrix. |
+| `--n <N>` | `3072` | N dimension of the matrix. |
+| `--k <N>` | `768` | K dimension of the matrix. |
+| `--dtype <0/1>` | `0` | Data type (0=BFP8, 1=FP16). |
+| `--fidel <0/1>` | `0` | Math fidelity (0=LoFi, 1=HiFi). |
 
-* If both `--x_size` and `--y_size` are `0`, the current implementation defaults to single-core `1x1` execution.
-* `--core_groups` must be `<= --y_size` when explicit grid sizes are provided.
+## Examples
 
-### Example Commands
-
-<details>
-<summary><strong>Show examples (grouped)</strong></summary>
-
-#### Empty / Baseline
-
+**1. Run Empty Kernel Launch on full grid:**
 ```bash
 ./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50
 ```
@@ -229,7 +231,17 @@ Notes:
 #### CPU pinning (optional)
 
 ```bash
-./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3
+./run_full_charac.sh ./build/test/test_full_charac --test 2 --x_size 8 --y_size 4
+```
+
+**5. Run Host-Only ComputeMM Pipeline (no kernels):**
+```bash
+./run_full_charac.sh ./build/test/test_full_charac --test 3 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
+```
+
+**6. Run Host-Only Empty Tensor Pipeline (no kernels):**
+```bash
+./run_full_charac.sh ./build/test/test_full_charac --test 4 --num-iters 20 --m 4096 --n 4096 --k 4096 --bypass-check
 ```
 
 </details>
@@ -237,10 +249,9 @@ Notes:
 ## Profiling
 
 This benchmark is instrumented with **Tracy**. To verify performance:
-
-1. Compile with Tracy enabled (`-DTRACY_ENABLE=ON`).
-2. Run the benchmark with the Tracy server (`Tracy-release`) open.
-3. Inspect the complete zone inventory below (exact names as present in code).
+1.  Compile with Tracy enabled (`-DTRACY_ENABLE=ON`).
+2.  Run the benchmark with the Tracy server (`Tracy-release`) open.
+3.  Inspect the complete zone inventory below (exact names as present in code).
 
 Use the Tracy GUI to measure the duration of these zones.
 
@@ -272,16 +283,17 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `Host->Device Transfer (L1 Write)` | new | Per-core L1 writes for IN0/IN1/in2 in L1 mode. |
 | `ComputeMM Functional Blocks` | new, old | Top-level ComputeMM benchmark functional block. |
 | `ComputeMM Input Data Processing` | new, old | ComputeMM input/setup-oriented phase. |
-| `ComputeMM Host Setup and Blocking` | new, old | Arch/tile/blocking/address derivation phase. |
+| `ComputeMM Host Setup and Blocking` | new | Arch/tile/blocking/address derivation phase. |
 | `ComputeMM Host Prepare Inputs` | new, old | Host-side tensor/data preparation before dispatch/readback. |
-| `ComputeMM Host Resolve Buffer Addresses` | new, old | DRAM-vs-L1 effective address resolution step. |
-| `ComputeMM Host Program Build` | new, old | Program/kernel/cb build call for ComputeMM execution path. |
+| `ComputeMM Host Transform Inputs` | old | Host-only transform (tilize/pack) stage in legacy host-pipeline ComputeMM. |
+| `ComputeMM Host Resolve Buffer Addresses` | new | DRAM-vs-L1 effective address resolution step. |
+| `ComputeMM Host Program Build` | new | Program/kernel/cb build call for ComputeMM execution path. |
 | `ComputeMM Host Dispatch` | new, old | Dispatch phase wrapper for enqueue/wait operations. |
 | `ComputeMM Host Dispatch Iteration` | new, old | Per-iteration dispatch scope (includes iteration `ZoneValue`). |
 | `ComputeMM Host Enqueue` | new, old | Enqueue call itself (mesh enqueue or program enqueue). |
 | `ComputeMM Host FinishWait` | new, old | Queue/device finish synchronization wait. |
 | `ComputeMM Host Post Processing` | new, old | Post-dispatch validation/readback wrapper scope. |
-| `ComputeMM Host Golden Reference` | new, old | FP32 golden matmul reference computation. |
+| `ComputeMM Host Golden Reference` | new | FP32 golden matmul reference computation. |
 | `ComputeMM Host Device Readback and Decode` | new, old | Device output readback + unpack/untilize/decode path. |
 | `ComputeMM Host Validation Metrics` | new, old | PCC/RMSE validation metric computation/checking block. |
 
@@ -301,15 +313,7 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 
 | Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
 | :--- | :--- | :--- |
-| `HostPipeline ComputeMM Functional Blocks` | new, old | Top-level host-pipeline ComputeMM benchmark block. |
-| `HostPipeline ComputeMM Host Dispatch` | new, old | Iteration loop wrapper for host-only pipeline operations. |
-| `HostPipeline ComputeMM Iteration` | new, old | Per-iteration wrapper (includes iteration `ZoneValue`). |
-| `HostPipeline ComputeMM Prepare Inputs` | new, old | FP32 input tensor generation stage. |
-| `HostPipeline ComputeMM Transform Inputs` | new, old | Tilize + BFP8 pack stage for both input tensors. |
-| `HostPipeline ComputeMM Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for both tensors. |
-| `HostPipeline ComputeMM Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for both tensors. |
-| `HostPipeline ComputeMM Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
-| `HostPipeline ComputeMM Validation Metrics` | new, old | PCC checks for host-only ComputeMM pipeline roundtrip. |
+| `HostPipeline ComputeMM Validation Metrics` | new | PCC checks for host-only ComputeMM pipeline roundtrip. |
 
 </details>
 
@@ -318,14 +322,6 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 
 | Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
 | :--- | :--- | :--- |
-| `HostPipeline Empty Functional Blocks` | new, old | Top-level host-pipeline empty-tensor benchmark block. |
-| `HostPipeline Empty Host Dispatch` | new, old | Iteration loop wrapper for host-only pipeline operations. |
-| `HostPipeline Empty Iteration` | new, old | Per-iteration wrapper (includes iteration `ZoneValue`). |
-| `HostPipeline Empty Prepare Inputs` | new, old | FP32 tensor generation stage. |
-| `HostPipeline Empty Transform Inputs` | new, old | Tilize + BFP8 pack stage for single tensor. |
-| `HostPipeline Empty Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for tensor. |
-| `HostPipeline Empty Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for tensor. |
-| `HostPipeline Empty Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
 | `HostPipeline Empty Validation Metrics` | new, old | PCC checks for host-only empty-tensor pipeline roundtrip. |
 
 </details>
@@ -345,23 +341,21 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 </details>
 
 Validation-zone policy currently enforced:
-
-* PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
-* This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
-* Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
+- PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
+- This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
+- Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
 
 ### Dispatch Mode Requirement (Critical)
 
 This benchmark suite is intended to run in **fast dispatch** mode.
 
-* `TT_METAL_SLOW_DISPATCH_MODE` **must be unset** when running characterization tests.
-* Both binaries explicitly reject slow dispatch at startup because it changes execution semantics of host dispatch timing.
+- `TT_METAL_SLOW_DISPATCH_MODE` **must be unset** when running characterization tests.
+- Both binaries explicitly reject slow dispatch at startup because it changes execution semantics of host dispatch timing.
 
 Why this matters:
-
-* In fast dispatch, host enqueue is asynchronous and `Finish(...)` is the synchronization boundary.
-* In slow dispatch, host flow is more synchronous/direct, so measured dispatch and wait costs are not comparable to fast-dispatch data.
-* Tracy zones such as `Host Enqueue` and `Host FinishWait` lose their intended interpretation under slow dispatch.
+- In fast dispatch, host enqueue is asynchronous and `Finish(...)` is the synchronization boundary.
+- In slow dispatch, host flow is more synchronous/direct, so measured dispatch and wait costs are not comparable to fast-dispatch data.
+- Tracy zones such as `Host Enqueue` and `Host FinishWait` lose their intended interpretation under slow dispatch.
 
 Quick check before running:
 
