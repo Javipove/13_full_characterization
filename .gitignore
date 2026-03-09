@@ -10,5 +10,9 @@ build/
 SoA_Analysis.md
 bfloat8_mine.hpp
 
-#AI auxiliary files
+#Python files
+Python/Matmul_Benchmark_Roadmap.md
+Python/Advanced_Optimization.md
+Antigravity_implementation_plan.md
+bfloat8_mine.hpp
 Roadmap.md

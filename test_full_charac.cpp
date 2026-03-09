@@ -1104,8 +1104,16 @@ BenchmarkInputs prepare_inputs_compute_mm(
       // WriteToBuffer writes the packed data to the interleaved buffer.
       // Internally, this writes each page (tile) to the correct DRAM bank
       // based on the round-robin interleaving scheme.
-      tt_metal::detail::WriteToBuffer(inputs.in0_buffer, in0_packed);
+      tt_metal::EnqueueWriteBuffer(target_device->command_queue(), inputs.in0_buffer, in0_packed, false);
+    }
 
+    {
+      ZoneScopedN("ComputeMM Device: Wait for Transfer IN0 (Finish)");
+      tt_metal::Finish(target_device->command_queue());
+    }
+
+    {
+      ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN0");
       // Update inputs.in0_vec with effective BFP8 values for validation
       auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
           in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
@@ -1122,11 +1130,6 @@ BenchmarkInputs prepare_inputs_compute_mm(
           pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
                              /*row_major_input=*/true, /*is_exp_a=*/false);
 
-      // Update inputs.in1_vec with effective BFP8 values for validation
-      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
-
       uint32_t in1_num_tiles = Kt * Nt;
       uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
       inputs.in1_buffer =
@@ -1135,7 +1138,20 @@ BenchmarkInputs prepare_inputs_compute_mm(
               .size = in1_size_bytes,
               .page_size = single_tile_size, // one tile per page
               .buffer_type = tt_metal::BufferType::DRAM});
-      tt_metal::detail::WriteToBuffer(inputs.in1_buffer, in1_packed);
+      tt_metal::EnqueueWriteBuffer(target_device->command_queue(), inputs.in1_buffer, in1_packed, false);
+    }
+
+    {
+      ZoneScopedN("ComputeMM Device: Wait for Transfer IN1 (Finish)");
+      tt_metal::Finish(target_device->command_queue());
+    }
+
+    {
+      ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN1");
+      // Update inputs.in1_vec with effective BFP8 values for validation
+      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
+          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
     }
 
     // ---- DRAM Step 3: Create empty output buffer ----
@@ -1923,7 +1939,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           // === DRAM Readback ===
           // Read entire output buffer from DRAM
           std::vector<uint32_t> out_data;
-          tt_metal::detail::ReadFromBuffer(inputs.out_buffer, out_data);
+          tt_metal::EnqueueReadBuffer(target_device->command_queue(), inputs.out_buffer, out_data, true);
 
           // Unpack and untilize the full output
           auto out_float = unpack_bfp8_tiles_into_float_vec(
@@ -2152,8 +2168,9 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
       {
         ZoneScopedN("HostPipeline ComputeMM Host Enqueue");
         auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::WriteToBuffer(in0_buffer, in0_packed);
-        tt_metal::detail::WriteToBuffer(in1_buffer, in1_packed);
+        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in0_buffer, in0_packed, false);
+        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in1_buffer, in1_packed, false);
+        tt_metal::Finish(target_device->command_queue());
         auto t1 = std::chrono::steady_clock::now();
         stats.write_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -2167,8 +2184,8 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
       {
         ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
         auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::ReadFromBuffer(in0_buffer, in0_readback);
-        tt_metal::detail::ReadFromBuffer(in1_buffer, in1_readback);
+        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in0_buffer, in0_readback, true);
+        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in1_buffer, in1_readback, true);
         auto t1 = std::chrono::steady_clock::now();
         stats.read_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -2336,7 +2353,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
       {
         ZoneScopedN("HostPipeline Empty Host Enqueue");
         auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::WriteToBuffer(tensor_buffer, packed);
+        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), tensor_buffer, packed, false);
+        tt_metal::Finish(target_device->command_queue());
         auto t1 = std::chrono::steady_clock::now();
         stats.write_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -2348,7 +2366,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
       {
         ZoneScopedN("HostPipeline Empty Host FinishWait");
         auto t0 = std::chrono::steady_clock::now();
-        tt_metal::detail::ReadFromBuffer(tensor_buffer, readback);
+        tt_metal::EnqueueReadBuffer(target_device->command_queue(), tensor_buffer, readback, true);
         auto t1 = std::chrono::steady_clock::now();
         stats.read_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
