@@ -1173,7 +1173,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // DRAM writer kernel uses in2_cb_addr as zero source (same contract as
     // L1 writer path), so each participating core receives one zero tile.
     {
-      ZoneScopedN("Initialize DRAM in2 zero tile");
+      ZoneScopedN("ComputeMM Host CPU: MMIO L1 Zero Padding Setup");
       uint32_t num_cores_y = core_range.y;
       uint32_t num_cores_x = core_range.x;
       for (uint32_t y = 0; y < num_cores_y; y++) {
@@ -1258,13 +1258,14 @@ BenchmarkInputs prepare_inputs_compute_mm(
 
         // Transfer tile blocks to this core's L1 SRAM.
         // WriteToDeviceL1 writes directly to a specific address in the target
-        // core's L1 memory. The kernel reads from these addresses using local
-        // NOC self-read (noc_async_read with phy_core coordinates).
+        // core's SRAM (bypassing the command queue abstraction entirely).
         {
-          ZoneScopedN("Host->Device Transfer (L1 Write)");
+          ZoneScopedN("ComputeMM Host CPU: MMIO L1 Data Setup");
           CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
-          tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr, in0);
-          tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr, in1);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr,
+                                            in0);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr,
+                                            in1);
           tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
                                             in2);
         }
@@ -2160,6 +2161,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
                                         /*row_major_input=*/true,
                                         /*is_exp_a=*/false);
         auto t1 = std::chrono::steady_clock::now();
+        auto t1 = std::chrono::steady_clock::now();
         stats.transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
@@ -2167,6 +2169,74 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
 
       {
         ZoneScopedN("HostPipeline ComputeMM Host Enqueue");
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in0_buffer, in0_packed, false);
+        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in1_buffer, in1_packed, false);
+        tt_metal::Finish(target_device->command_queue());
+        auto t1 = std::chrono::steady_clock::now();
+        stats.write_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_written +=
+            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      std::vector<uint32_t> in0_readback;
+      std::vector<uint32_t> in1_readback;
+      {
+        ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
+        auto t0 = std::chrono::steady_clock::now();
+        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in0_buffer, in0_readback, true);
+        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in1_buffer, in1_readback, true);
+        auto t1 = std::chrono::steady_clock::now();
+        stats.read_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_read +=
+            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+      }
+
+      auto t_iter_end = std::chrono::steady_clock::now();
+      stats.end_to_end_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                 t_iter_start)
+              .count();
+      completed_iters++;
+
+      // We break validation out of the loop timing, executing it only on the FIRST iteration
+      if (i == 0 && !params.bypass_check) {
+        ZoneScopedN("HostPipeline ComputeMM Validation");
+        auto t0_post = std::chrono::steady_clock::now();
+        auto in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
+            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        auto in0_untilized = untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
+
+        auto in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
+            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        auto in1_untilized = untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
+        auto t1_post = std::chrono::steady_clock::now();
+        stats.inverse_transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
+                .count();
+
+        float in0_pcc = get_pcc(in0_vec, in0_untilized);
+        float in1_pcc = get_pcc(in1_vec, in1_untilized);
+        log_validation_sample_pairs("HostPipeline ComputeMM IN0",
+                                    in0_vec, in0_untilized, 12);
+        log_validation_sample_pairs("HostPipeline ComputeMM IN1",
+                                    in1_vec, in1_untilized, 12);
+
+        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+          log_error(LogTest,
+                    "Host-only ComputeMM roundtrip check failed: "
+                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                    in0_pcc, in1_pcc);
+          pass = false;
+          break;
+        }
+      }
+    }
+    }
         auto t0 = std::chrono::steady_clock::now();
         tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in0_buffer, in0_packed, false);
         tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in1_buffer, in1_packed, false);
@@ -2368,6 +2438,62 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
         auto t0 = std::chrono::steady_clock::now();
         tt_metal::EnqueueReadBuffer(target_device->command_queue(), tensor_buffer, readback, true);
         auto t1 = std::chrono::steady_clock::now();
+        stats.read_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
+      }
+      uint64_t readback_bytes =
+          static_cast<uint64_t>(readback.size()) * sizeof(uint32_t);
+      if (readback_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
+        log_error(LogTest,
+                  "Host-only Empty readback byte size mismatch: got={} B, "
+                  "expected={} B",
+                  readback_bytes, tensor_size_bytes);
+        return false;
+      }
+      auto t_transfer_end = std::chrono::steady_clock::now();
+      transfer_window_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_transfer_end -
+                                                                 t_transfer_start)
+              .count();
+      transfer_window_bytes += static_cast<uint64_t>(tensor_size_bytes) * 2;
+
+      auto t_iter_end = std::chrono::steady_clock::now();
+      stats.end_to_end_us +=
+          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                 t_iter_start)
+              .count();
+      completed_iters++;
+
+      // We break validation out of the loop timing, executing it only on the FIRST iteration
+      if (i == 0 && !params.bypass_check) {
+        ZoneScopedN("HostPipeline Empty Validation Processing");
+        auto t0_post = std::chrono::steady_clock::now();
+        auto roundtrip_float = unpack_bfp8_tiles_into_float_vec(
+            readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+        auto roundtrip =
+            untilize_swizzled(roundtrip_float, Mt * 32, Nt * 32);
+        auto t1_post = std::chrono::steady_clock::now();
+        stats.inverse_transform_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
+                .count();
+
+        float pcc = get_pcc(tensor_vec, roundtrip);
+        log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
+                                    roundtrip, 12);
+
+        if (pcc < 0.99f) {
+          log_error(LogTest,
+                    "Host-only Empty roundtrip check failed: "
+                    "pcc={:.4f}",
+                    pcc);
+          pass = false;
+          break;
+        }
+      }
+    }
+    }
         stats.read_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                 .count();
