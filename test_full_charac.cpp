@@ -562,7 +562,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
-    uint32_t start_core_y = 0);
+    uint32_t start_core_y = 0,
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -665,7 +666,7 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
       auto inputs_split = prepare_inputs_compute_mm(
           device, split_grid_size, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
           in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          /*use_dram=*/false, start_y);
+          /*use_dram=*/false, start_y, data_format);
     }
 
     // 3. Profiling Loop (Standard Dispatch)
@@ -974,12 +975,67 @@ std::vector<float> matmul_reference(const std::vector<float> &a,
 // MODIFIED: Added DRAM branch and Tracy instrumentation (original from
 // 1_compute_mm).
 ////////////////////////////////////////////////////////////////////////////////
+
+// ============================================================================
+// Dtype-generic pack/unpack helpers
+// ============================================================================
+// These encapsulate the different conversion pipelines for BFP8 and BF16:
+//   BFP8:  FP32 → tilize_swizzled<float>     → pack_as_bfp8_tiles         → u32
+//   BF16:  FP32 → bfloat16() → tilize_swizzled<bf16> → swizzled_to_nfaces → pack_bf16 → u32
+//
+//   BFP8:  u32 → unpack_bfp8_tiles → untilize_swizzled<float>              → FP32
+//   BF16:  u32 → unpack_bf16 → nfaces_to_swizzled → untilize_swizzled<bf16> → to_float → FP32
+// ============================================================================
+
+std::vector<uint32_t> pack_tilized_fp32_to_device_format(
+    const std::vector<float>& fp32_vec,
+    uint32_t rows, uint32_t cols,
+    tt::DataFormat data_format) {
+  if (data_format == tt::DataFormat::Bfp8_b) {
+    auto tilized = tilize_swizzled(fp32_vec, rows, cols);
+    return pack_as_bfp8_tiles(
+        tt::stl::make_const_span(tilized), /*row_major_input=*/true,
+        /*is_exp_a=*/false);
+  } else {
+    // Float16_b (BFLOAT16) path
+    std::vector<bfloat16> bf16_vec;
+    bf16_vec.reserve(fp32_vec.size());
+    for (float f : fp32_vec) bf16_vec.push_back(bfloat16(f));
+    auto tilized = tilize_swizzled(bf16_vec, rows, cols);
+    auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
+        tt::stl::make_const_span(tilized));
+    return pack_bfloat16_vec_into_uint32_vec(nfaces);
+  }
+}
+
+std::vector<float> unpack_device_tiles_to_fp32(
+    const std::vector<uint32_t>& packed,
+    uint32_t rows, uint32_t cols,
+    tt::DataFormat data_format) {
+  if (data_format == tt::DataFormat::Bfp8_b) {
+    auto unpacked = unpack_bfp8_tiles_into_float_vec(
+        packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+    return untilize_swizzled(unpacked, rows, cols);
+  } else {
+    // Float16_b (BFLOAT16) path
+    auto bf16_vec = unpack_uint32_vec_into_bfloat16_vec(packed);
+    auto swizzled = convert_layout_tile_nfaces_to_tile_swizzled(
+        tt::stl::make_const_span(bf16_vec));
+    auto untilized = untilize_swizzled(swizzled, rows, cols);
+    std::vector<float> result;
+    result.reserve(untilized.size());
+    for (const auto& v : untilized) result.push_back(static_cast<float>(v));
+    return result;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 BenchmarkInputs prepare_inputs_compute_mm(
     tt_metal::distributed::MeshDevice *device, CoreCoord core_range,
     uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
-    uint32_t start_core_y) {
+    uint32_t start_core_y, tt::DataFormat data_format) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   BenchmarkInputs inputs;
@@ -1011,10 +1067,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     std::vector<uint32_t> in0_packed;
     {
       ZoneScopedN("Tilize and Pack IN0 (DRAM)");
-      auto in0_tilized = tilize_swizzled(inputs.in0_vec, Mt * 32, Kt * 32);
-      in0_packed =
-          pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
-                             /*row_major_input=*/true, /*is_exp_a=*/false);
+      in0_packed = pack_tilized_fp32_to_device_format(
+          inputs.in0_vec, Mt * 32, Kt * 32, data_format);
 
       // Create a DRAM interleaved buffer to hold Mt*Kt tiles.
       // InterleavedBufferConfig tells the allocator to distribute tiles
@@ -1047,10 +1101,9 @@ BenchmarkInputs prepare_inputs_compute_mm(
 
     {
       ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN0");
-      // Update inputs.in0_vec with effective BFP8 values for validation
-      auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-          in0_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in0_vec = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+      // Update inputs.in0_vec with effective quantized values for validation
+      inputs.in0_vec = unpack_device_tiles_to_fp32(
+          in0_packed, Mt * 32, Kt * 32, data_format);
     }
 
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) ----
@@ -1059,10 +1112,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     std::vector<uint32_t> in1_packed;
     {
       ZoneScopedN("Tilize and Pack IN1 (DRAM)");
-      auto in1_tilized = tilize_swizzled(inputs.in1_vec, Kt * 32, Nt * 32);
-      in1_packed =
-          pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
-                             /*row_major_input=*/true, /*is_exp_a=*/false);
+      in1_packed = pack_tilized_fp32_to_device_format(
+          inputs.in1_vec, Kt * 32, Nt * 32, data_format);
 
       uint32_t in1_num_tiles = Kt * Nt;
       uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
@@ -1087,10 +1138,9 @@ BenchmarkInputs prepare_inputs_compute_mm(
 
     {
       ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN1");
-      // Update inputs.in1_vec with effective BFP8 values for validation
-      auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-          in1_packed, /*row_major_output=*/true, /*is_exp_a=*/false);
-      inputs.in1_vec = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
+      // Update inputs.in1_vec with effective quantized values for validation
+      inputs.in1_vec = unpack_device_tiles_to_fp32(
+          in1_packed, Kt * 32, Nt * 32, data_format);
     }
 
     // ---- DRAM Step 3: Create empty output buffer ----
@@ -1164,10 +1214,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
             inputs.in0_vec, r * per_core_Mt * 32, num_r * 32, Mt * 32, Kt * 32);
         auto in0_block_slice =
             get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-        auto in0_block_tilized =
-            tilize_swizzled(in0_block_slice, num_r * 32, in0_block_w * 32);
-        in0 = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_block_tilized),
-                                 /*row_major_input=*/true, /*is_exp_a=*/false);
+        in0 = pack_tilized_fp32_to_device_format(
+            in0_block_slice, num_r * 32, in0_block_w * 32, data_format);
       }
 
       for (int c = 0; c < (int)num_cores_x; c++) {
@@ -1191,11 +1239,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
             in1_block_slice.at((i * (num_c * 32)) + i) = (float)1;
           }
 
-          auto in1_block_tilized =
-              tilize_swizzled(in1_block_slice, in0_block_w * 32, num_c * 32);
-          in1 =
-              pack_as_bfp8_tiles(tt::stl::make_const_span(in1_block_tilized),
-                                 /*row_major_input=*/true, /*is_exp_a=*/false);
+          in1 = pack_tilized_fp32_to_device_format(
+              in1_block_slice, in0_block_w * 32, num_c * 32, data_format);
         }
 
         // Transfer tile blocks to this core's L1 SRAM.
@@ -1789,7 +1834,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         inputs = prepare_inputs_compute_mm(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-            params.use_dram);
+            params.use_dram, 0, data_format);
       }
 
       {
@@ -1879,10 +1924,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
               tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
 
           // Unpack and untilize the full output
-          auto out_float = unpack_bfp8_tiles_into_float_vec(
-              out_data, /*row_major_output=*/true, /*is_exp_a=*/false);
-          // out_float is in tilized layout (Mt*32 rows x Nt*32 cols)
-          device_vec = untilize_swizzled(out_float, Mt * 32, Nt * 32);
+          device_vec = unpack_device_tiles_to_fp32(
+              out_data, Mt * 32, Nt * 32, data_format);
           // Trim to actual M x N if needed
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
@@ -1906,11 +1949,9 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                                                  read_size, core_data_tiles);
 
               // Unpack and Untilize
-              auto core_data_float = unpack_bfp8_tiles_into_float_vec(
-                  core_data_tiles, /*row_major_output=*/true,
-                  /*is_exp_a=*/false);
-              auto core_data_untilized = untilize_swizzled(
-                  core_data_float, per_core_Mt * 32, per_core_Nt * 32);
+              auto core_data_untilized = unpack_device_tiles_to_fp32(
+                  core_data_tiles, per_core_Mt * 32, per_core_Nt * 32,
+                  data_format);
 
               // Copy into global device_vec
               uint32_t global_r_start = y * per_core_Mt * 32;
@@ -2036,15 +2077,9 @@ bool test_host_pipeline_compute_mm(
       return false;
     }
 
-    if (params.dtype != 0) {
-      log_error(LogTest,
-                "Host-only ComputeMM currently supports only --dtype 0 "
-                "(BFP8 path), requested dtype={}",
-                params.dtype);
-      return false;
-    }
 
-    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+    tt::DataFormat pipeline_data_format = (params.dtype == 0)
+        ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t in0_num_tiles = Mt * Kt;
@@ -2098,15 +2133,10 @@ bool test_host_pipeline_compute_mm(
         {
           ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
           auto t0 = std::chrono::steady_clock::now();
-          auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
-          in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
-                                          /*row_major_input=*/true,
-                                          /*is_exp_a=*/false);
-
-          auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
-          in1_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
-                                          /*row_major_input=*/true,
-                                          /*is_exp_a=*/false);
+          in0_packed = pack_tilized_fp32_to_device_format(
+              in0_vec, Mt * 32, Kt * 32, pipeline_data_format);
+          in1_packed = pack_tilized_fp32_to_device_format(
+              in1_vec, Kt * 32, Nt * 32, pipeline_data_format);
           auto t1 = std::chrono::steady_clock::now();
           stats.transform_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -2160,15 +2190,10 @@ bool test_host_pipeline_compute_mm(
         if (i == 0 && !params.bypass_check) {
           ZoneScopedN("HostPipeline ComputeMM Validation");
           auto t0_post = std::chrono::steady_clock::now();
-          auto in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
-              in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-          auto in0_untilized =
-              untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
-
-          auto in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
-              in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-          auto in1_untilized =
-              untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
+          auto in0_untilized = unpack_device_tiles_to_fp32(
+              in0_readback, Mt * 32, Kt * 32, pipeline_data_format);
+          auto in1_untilized = unpack_device_tiles_to_fp32(
+              in1_readback, Kt * 32, Nt * 32, pipeline_data_format);
           auto t1_post = std::chrono::steady_clock::now();
           stats.inverse_transform_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1_post -
@@ -2225,15 +2250,9 @@ bool test_host_pipeline_empty_tensor(
       return false;
     }
 
-    if (params.dtype != 0) {
-      log_error(LogTest,
-                "Host-only Empty currently supports only --dtype 0 "
-                "(BFP8 path), requested dtype={}",
-                params.dtype);
-      return false;
-    }
 
-    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+    tt::DataFormat pipeline_data_format = (params.dtype == 0)
+        ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
@@ -2288,10 +2307,8 @@ bool test_host_pipeline_empty_tensor(
         {
           ZoneScopedN("HostPipeline Empty Transform Inputs");
           auto t0 = std::chrono::steady_clock::now();
-          auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
-          packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
-                                      /*row_major_input=*/true,
-                                      /*is_exp_a=*/false);
+          packed = pack_tilized_fp32_to_device_format(
+              tensor_vec, Mt * 32, Nt * 32, pipeline_data_format);
           auto t1 = std::chrono::steady_clock::now();
           stats.transform_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -2363,9 +2380,8 @@ bool test_host_pipeline_empty_tensor(
         if (i == 0 && !params.bypass_check) {
           ZoneScopedN("HostPipeline Empty Validation Processing");
           auto t0_post = std::chrono::steady_clock::now();
-          auto roundtrip_float = unpack_bfp8_tiles_into_float_vec(
-              readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-          auto roundtrip = untilize_swizzled(roundtrip_float, Mt * 32, Nt * 32);
+          auto roundtrip = unpack_device_tiles_to_fp32(
+              readback, Mt * 32, Nt * 32, pipeline_data_format);
           auto t1_post = std::chrono::steady_clock::now();
           stats.inverse_transform_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1_post -
