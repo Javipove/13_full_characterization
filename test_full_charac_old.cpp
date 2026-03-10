@@ -149,7 +149,6 @@ void log_validation_sample_pairs(const std::string &tag,
 
 constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 constexpr uint32_t MAX_ARGS = 255;
-constexpr uint32_t L1_SAFETY_MARGIN_BYTES = 64 * 1024;
 
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
@@ -556,7 +555,7 @@ uint32_t get_in0_block_w_legacy(uint32_t per_core_Mt, uint32_t per_core_Nt,
       total_l1_needed += per_core_in0_size + per_core_in1_size + per_core_out_size;
     }
 
-    if (l1_unreserved_base + total_l1_needed + L1_SAFETY_MARGIN_BYTES <=
+    if (l1_unreserved_base + total_l1_needed <=
         l1_size) {
       return choice;
     }
@@ -564,6 +563,54 @@ uint32_t get_in0_block_w_legacy(uint32_t per_core_Mt, uint32_t per_core_Nt,
   return 0;
 }
 
+// ============================================================================
+// L1 Heuristic Block Allocator (DRAM Mode)
+// Solves for optimal `out_block_h`, `out_block_w` and `in0_block_w` config
+// such that Circular Buffers fit into the core's L1 SRAM (< 1.2MB watermark).
+// Based heavily on TTNN matmul_program_config formulas.
+// ============================================================================
+std::tuple<uint32_t, uint32_t, uint32_t> get_dynamic_l1_block_params(
+    uint32_t per_core_Mt, uint32_t per_core_Nt, uint32_t Kt,
+    uint32_t single_tile_size, uint32_t l1_size, uint32_t l1_unreserved_base) {
+  
+  // L1 space available for Circular Buffers
+  // TTNN's heuristic uses exactly l1_size - l1_unreserved_base
+  uint32_t max_l1_usage = l1_size - l1_unreserved_base;
+
+  std::vector<uint32_t> in0_block_w_choices = {4, 2, 1};
+  std::vector<std::tuple<uint32_t, uint32_t>> dim_divisors;
+
+  // Find all possible integer divisions of the core's grid size
+  for (uint32_t h_div = 1; h_div <= per_core_Mt; ++h_div) {
+    if (per_core_Mt % h_div != 0) continue;
+    for (uint32_t w_div = 1; w_div <= per_core_Nt; ++w_div) {
+      if (per_core_Nt % w_div != 0) continue;
+      dim_divisors.push_back({per_core_Mt / h_div, per_core_Nt / w_div});
+    }
+  }
+
+  // Iterate from largest output block (whole core) to smallest
+  for (const auto& [out_bh, out_bw] : dim_divisors) {
+    for (uint32_t in0_bw : in0_block_w_choices) {
+      if (Kt % in0_bw != 0) continue;
+      
+      // Memory footprint formulas (Deepwiki Section 2)
+      uint32_t cb_in0 = out_bh * in0_bw * 2 * single_tile_size; // double
+      uint32_t cb_in1 = out_bw * in0_bw * 2 * single_tile_size; // double
+      uint32_t cb_interm = out_bh * out_bw * single_tile_size;  // shared with cb_out
+      uint32_t cb_in2 = 2 * single_tile_size; // 2 zero pad tiles (TTNN alignment)
+
+      uint32_t total_cb = cb_in0 + cb_in1 + cb_interm + cb_in2;
+      
+      if (total_cb <= max_l1_usage) {
+        return {out_bh, out_bw, in0_bw};
+      }
+    }
+  }
+  
+  // Fallback (will trigger L1 crash logging downstream)
+  return {per_core_Mt, per_core_Nt, 0};
+}
 std::tuple<uint32_t, uint32_t> get_out_subblock_params_legacy(
   uint32_t per_core_Mt, uint32_t per_core_Nt, uint32_t choice = 0) {
   constexpr std::array<std::tuple<uint32_t, uint32_t>, 20> SUBBLOCK_HW_CHOICES =
@@ -1396,7 +1443,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         single_tile_size = tt::tile_size(data_format);
 
         if (params.use_dram) {
-          auto [obh, obw, bw] = get_multi_dim_per_core_factor_legacy(
+          auto [obh, obw, bw] = get_dynamic_l1_block_params(
               per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
               l1_unreserved_base);
           out_block_h = obh;
@@ -1404,13 +1451,11 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
           in0_block_w = bw;
           num_blocks_h = per_core_Mt / out_block_h;
           num_blocks_w = per_core_Nt / out_block_w;
-
           log_info(LogTest,
                    "DRAM blocking: per_core={}x{}, out_block={}x{}, "
-                   "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
+                   "num_blocks={}x{}, in0_block_w={}",
                    per_core_Mt, per_core_Nt, out_block_h, out_block_w,
-                   num_blocks_h, num_blocks_w, in0_block_w,
-                   L1_SAFETY_MARGIN_BYTES / 1024);
+                   num_blocks_h, num_blocks_w, in0_block_w);
         } else {
           out_block_h = per_core_Mt;
           out_block_w = per_core_Nt;
@@ -1960,14 +2005,7 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
     }
     }
 
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-    }
-    }
+
 
     log_info(LogTest,
              "Host-only Empty pipeline dims: Mt={}, Nt={}, completed_iters={}",

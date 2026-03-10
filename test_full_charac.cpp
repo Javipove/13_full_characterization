@@ -72,6 +72,7 @@
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
+#include <tt-metalium/command_queue.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/data_types.hpp>
@@ -87,13 +88,13 @@
 #include <tt-metalium/mesh_command_queue.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_workload.hpp>
+#include <tt-metalium/persistent_kernel_cache.hpp>
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/sub_device.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/tt_metal_profiler.hpp>
 #include <tt-metalium/work_split.hpp>
-#include <tt-metalium/persistent_kernel_cache.hpp>
 
 // Utility / test helpers
 #include "hostdevcommon/common_values.hpp"
@@ -113,8 +114,8 @@
 #include <umd/device/types/arch.hpp>
 #include <umd/device/types/xy_pair.hpp>
 
-// Logging
 #include <tt-logger/tt-logger.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
 
 // Tracy
 #include <tracy/Tracy.hpp>
@@ -140,13 +141,13 @@ void log_validation_sample_pairs(const std::string &tag,
   size_t common_size = std::min(reference.size(), observed.size());
   size_t num_samples = std::min(sample_count, common_size);
   log_info(LogTest,
-           "{} visual sample check (showing {} of {} aligned elements)",
-           tag, num_samples, common_size);
+           "{} visual sample check (showing {} of {} aligned elements)", tag,
+           num_samples, common_size);
 
   for (size_t i = 0; i < num_samples; ++i) {
     float abs_err = std::fabs(reference[i] - observed[i]);
-    log_info(LogTest, "{} [{}] ref={:.6f}, obs={:.6f}, abs_err={:.6f}", tag,
-             i, reference[i], observed[i], abs_err);
+    log_info(LogTest, "{} [{}] ref={:.6f}, obs={:.6f}, abs_err={:.6f}", tag, i,
+             reference[i], observed[i], abs_err);
   }
 }
 
@@ -162,7 +163,6 @@ constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 // constexpr uint32_t DEFAULT_KERNEL_SIZE_K = 1;
 // constexpr uint32_t MAX_CBS = 32;
 constexpr uint32_t MAX_ARGS = 255;
-constexpr uint32_t L1_SAFETY_MARGIN_BYTES = 64 * 1024;
 
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
@@ -236,8 +236,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(use_dram, input_args) =
         test_args::has_command_option_and_remaining_args(input_args, "--dram");
     std::tie(use_cache, input_args) =
-        test_args::has_command_option_and_remaining_args(input_args,
-                                                         "--cache");
+        test_args::has_command_option_and_remaining_args(input_args, "--cache");
 
     // Core grid size args
     std::tie(core_x, input_args) =
@@ -404,7 +403,7 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
           per_core_in0_size + per_core_in1_size + per_core_out_size;
     }
 
-    if (base_addr + total_l1_needed + L1_SAFETY_MARGIN_BYTES <= l1_size) {
+    if (base_addr + total_l1_needed <= l1_size) {
       in0_block_w = choice;
       break;
     }
@@ -412,135 +411,61 @@ uint32_t get_in0_block_w(uint32_t per_core_Mt, uint32_t per_core_Nt,
   return in0_block_w;
 }
 
-// TTNN-aligned L1 fitting for DRAM mode.
-// Finds the largest (out_block_h, out_block_w, in0_block_w) such that the
-// circular buffers fit within available L1.
-//
-// Algorithm (matching TTNN's get_multi_dim_per_core_factor):
-//   1. Enumerate all divisor pairs of per_core_M and per_core_N
-//   2. Sort by product (largest first), then by squareness
-//   3. Prefer candidates with num_blocks_w_dim == 1 (full per-core N)
-//   4. Prefer bounded K-loop depth (Kt / in0_block_w <= threshold)
-//   5. Fall back to generic first-fit search over all factors
-//
-// CB budget: in0_CB + in1_CB + in2_CB + out_CB + interm_CB <= avail_L1
-//   in0_CB = out_block_h * in0_block_w * 2 * tile_size  (double-buffered)
-//   in1_CB = out_block_w * in0_block_w * 2 * tile_size  (double-buffered)
-//   in2_CB = 2 * tile_size                                (zeros tile, shared)
-//   out_CB = out_block_h * out_block_w * tile_size        (output block)
-//   interm = out_block_h * out_block_w * tile_size        (FP32 partials)
-//
-// Returns {out_block_h, out_block_w, in0_block_w}
+// ============================================================================
+// L1 Heuristic Block Allocator (DRAM Mode)
+// Solves for optimal `out_block_h`, `out_block_w` and `in0_block_w` config
+// such that Circular Buffers fit into the core's L1 SRAM.
+// Based heavily on TTNN matmul_program_config formulas.
+// ============================================================================
 std::tuple<uint32_t, uint32_t, uint32_t>
-get_multi_dim_per_core_factor(uint32_t per_core_M, uint32_t per_core_N,
-                              uint32_t Kt, uint32_t single_tile_size,
-                              uint32_t l1_size, uint32_t l1_unreserved_base) {
-  constexpr uint32_t MAX_K_BLOCKS_PREFERRED = 16;
+get_dynamic_l1_block_params(uint32_t per_core_Mt, uint32_t per_core_Nt,
+                            uint32_t Kt, uint32_t single_tile_size,
+                            uint32_t l1_size, uint32_t l1_unreserved_base) {
 
-  uint32_t raw_avail_l1 = l1_size - l1_unreserved_base;
-  uint32_t avail_l1 =
-      (raw_avail_l1 > L1_SAFETY_MARGIN_BYTES)
-          ? (raw_avail_l1 - L1_SAFETY_MARGIN_BYTES)
-          : raw_avail_l1;
+  // Safe watermark: total L1 space available for Circular Buffers
+  // TTNN's dynamic heuristic uses exactly l1_size - l1_unreserved_base
+  uint32_t max_l1_usage = l1_size - l1_unreserved_base;
 
-  // Helper: check if a given (obh, obw, bw) fits in L1
-  auto fits_l1 = [&](uint32_t obh, uint32_t obw, uint32_t bw) -> bool {
-    uint32_t in0_cb = obh * bw * 2 * single_tile_size; // double-buffered
-    uint32_t in1_cb = obw * bw * 2 * single_tile_size; // double-buffered
-    uint32_t in2_cb = 2 * single_tile_size;            // zeros (reader+writer)
-    uint32_t out_cb = obh * obw * single_tile_size;    // output
-    uint32_t interm = obh * obw * single_tile_size;    // FP32 partials
-    return (in0_cb + in1_cb + in2_cb + out_cb + interm) <= avail_l1;
-  };
+  std::vector<uint32_t> in0_block_w_choices = {4, 2, 1};
+  std::vector<std::tuple<uint32_t, uint32_t>> dim_divisors;
 
-  // Try full dimensions first
-  if (fits_l1(per_core_M, per_core_N, Kt)) {
-    return {per_core_M, per_core_N, Kt};
-  }
-
-  // Enumerate divisors
-  auto get_divisors = [](uint32_t n) -> std::vector<uint32_t> {
-    std::vector<uint32_t> divs;
-    for (uint32_t i = 1; i <= n; i++) {
-      if (n % i == 0)
-        divs.push_back(i);
-    }
-    return divs;
-  };
-
-  auto m_factors = get_divisors(per_core_M);
-  auto n_factors = get_divisors(per_core_N);
-
-  // Build (m, n) pairs sorted by product descending, then squareness
-  struct Pair {
-    uint32_t m, n;
-    uint32_t product;
-    float ratio;
-  };
-  std::vector<Pair> pairs;
-  for (auto mf : m_factors) {
-    for (auto nf : n_factors) {
-      float mx = (float)std::max(mf, nf);
-      float mn = (float)std::min(mf, nf);
-      pairs.push_back({mf, nf, mf * nf, mx / mn});
-    }
-  }
-  // Sort: largest product first, then most square
-  std::sort(pairs.begin(), pairs.end(), [](const Pair &a, const Pair &b) {
-    if (a.product != b.product)
-      return a.product > b.product;
-    return a.ratio < b.ratio;
-  });
-
-  std::vector<uint32_t> k_block_w_candidates;
-  for (uint32_t bw = Kt; bw >= 1; bw--) {
-    if (Kt % bw == 0) {
-      k_block_w_candidates.push_back(bw);
-    }
-  }
-
-  // Prefer single outer W block when possible (num_blocks_w_dim == 1).
-  // This keeps DRAM writer progression simpler on large per-core N shapes,
-  // while preserving the generic multi-block fallback below.
-  for (auto bw : k_block_w_candidates) {
-    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
+  // Find all possible integer divisions of the core's grid size
+  for (uint32_t h_div = 1; h_div <= per_core_Mt; ++h_div) {
+    if (per_core_Mt % h_div != 0)
       continue;
-    }
-    for (auto &p : pairs) {
-      if (p.n != per_core_N) {
+    for (uint32_t w_div = 1; w_div <= per_core_Nt; ++w_div) {
+      if (per_core_Nt % w_div != 0)
         continue;
-      }
-      if (fits_l1(p.m, p.n, bw)) {
-        return {p.m, p.n, bw};
+      dim_divisors.push_back({per_core_Mt / h_div, per_core_Nt / w_div});
+    }
+  }
+
+  // Iterate from largest output block (whole core) to smallest
+  for (const auto &[out_bh, out_bw] : dim_divisors) {
+    for (uint32_t in0_bw : in0_block_w_choices) {
+      if (Kt % in0_bw != 0)
+        continue;
+
+      // Memory footprint formulas (Deepwiki Section 2)
+      uint32_t cb_in0 = out_bh * in0_bw * 2 * single_tile_size; // double
+      uint32_t cb_in1 = out_bw * in0_bw * 2 * single_tile_size; // double
+      uint32_t cb_interm =
+          out_bh * out_bw * single_tile_size; // shared with cb_out
+      uint32_t cb_in2 =
+          2 * single_tile_size; // 2 zero pad tiles (TTNN alignment)
+
+      uint32_t total_cb = cb_in0 + cb_in1 + cb_interm + cb_in2;
+
+      if (total_cb <= max_l1_usage) {
+        return {out_bh, out_bw, in0_bw};
       }
     }
   }
 
-  // Prefer bounded K-loop depth for DRAM stability on large per-core tiles.
-  // Search by larger in0_block_w first, then largest output block factors.
-  for (auto bw : k_block_w_candidates) {
-    if ((Kt / bw) > MAX_K_BLOCKS_PREFERRED) {
-      continue;
-    }
-    for (auto &p : pairs) {
-      if (fits_l1(p.m, p.n, bw)) {
-        return {p.m, p.n, bw};
-      }
-    }
-  }
-
-  // Try each (m, n) pair with decreasing in0_block_w
-  for (auto &p : pairs) {
-    for (auto bw : k_block_w_candidates) {
-      if (fits_l1(p.m, p.n, bw)) {
-        return {p.m, p.n, bw};
-      }
-    }
-  }
-
-  // Fallback: 1x1 with bw=1 should always fit
-  return {1, 1, 1};
+  // Fallback (will trigger L1 crash logging downstream)
+  return {per_core_Mt, per_core_Nt, 0};
 }
+
 ////////////////////////////////////////////////////////////////////////////////
 // Helper Struct for Benchmark I/O
 //
@@ -572,13 +497,16 @@ struct BenchmarkInputs {
   std::vector<float> in0_vec;
   std::vector<float> in1_vec;
 
-  // Device-side DRAM interleaved buffers.
+  // Device-side DRAM interleaved buffers (MeshBuffer for distributed API).
   // These are nullptr when use_dram=false (L1 mode).
   // When use_dram=true, each buffer holds tilized+packed data distributed
-  // across all DRAM banks via InterleavedBufferConfig{BufferType::DRAM}.
-  std::shared_ptr<tt_metal::Buffer> in0_buffer; // IN0 (A matrix) in DRAM
-  std::shared_ptr<tt_metal::Buffer> in1_buffer; // IN1 (B matrix) in DRAM
-  std::shared_ptr<tt_metal::Buffer> out_buffer; // Output (C matrix) in DRAM
+  // across all DRAM banks via MeshBuffer::create(ReplicatedBufferConfig).
+  std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>
+      in0_buffer; // IN0 (A matrix) in DRAM
+  std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>
+      in1_buffer; // IN1 (B matrix) in DRAM
+  std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>
+      out_buffer; // Output (C matrix) in DRAM
 };
 
 // ============================================================================
@@ -618,7 +546,7 @@ void create_program_compute_mm(
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
     uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
-  tt_metal::Program &program, uint32_t start_core_y = 0);
+    tt_metal::Program &program, uint32_t start_core_y = 0);
 
 // Generates random FP32 input matrices, tilizes/packs them, and transfers
 // them to the device. Returns a BenchmarkInputs struct.
@@ -1080,10 +1008,11 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // the FP32 data into BFP8_b format (block floating point, 8-bit mantissa).
     // We tilize the ENTIRE matrix at once (Mt*32 × Kt*32), unlike L1 mode
     // which slices per-core.
+    std::vector<uint32_t> in0_packed;
     {
       ZoneScopedN("Tilize and Pack IN0 (DRAM)");
       auto in0_tilized = tilize_swizzled(inputs.in0_vec, Mt * 32, Kt * 32);
-      auto in0_packed =
+      in0_packed =
           pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
                              /*row_major_input=*/true, /*is_exp_a=*/false);
 
@@ -1094,22 +1023,26 @@ BenchmarkInputs prepare_inputs_compute_mm(
       // kernel as a runtime argument for InterleavedAddrGenFast<true>.
       uint32_t in0_num_tiles = Mt * Kt;
       uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
-      inputs.in0_buffer =
-          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-              .device = target_device,
-              .size = in0_size_bytes,
-              .page_size = single_tile_size, // one tile per page
-              .buffer_type = tt_metal::BufferType::DRAM});
+      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
+          .page_size = single_tile_size,
+          .buffer_type = tt_metal::BufferType::DRAM,
+      };
+      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+          .size = in0_size_bytes};
+
+      inputs.in0_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+          global_buf, device_local, device);
 
       // WriteToBuffer writes the packed data to the interleaved buffer.
       // Internally, this writes each page (tile) to the correct DRAM bank
       // based on the round-robin interleaving scheme.
-      tt_metal::EnqueueWriteBuffer(target_device->command_queue(), inputs.in0_buffer, in0_packed, false);
+      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+          device->mesh_command_queue(), inputs.in0_buffer, in0_packed, false);
     }
 
     {
       ZoneScopedN("ComputeMM Device: Wait for Transfer IN0 (Finish)");
-      tt_metal::Finish(target_device->command_queue());
+      tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
     {
@@ -1123,27 +1056,33 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) ----
     // Same flow as IN0: tilize → pack BFP8 → create DRAM buffer → write.
     // IN1 has dimensions Kt*32 (rows) × Nt*32 (cols), totaling Kt*Nt tiles.
+    std::vector<uint32_t> in1_packed;
     {
       ZoneScopedN("Tilize and Pack IN1 (DRAM)");
       auto in1_tilized = tilize_swizzled(inputs.in1_vec, Kt * 32, Nt * 32);
-      auto in1_packed =
+      in1_packed =
           pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
                              /*row_major_input=*/true, /*is_exp_a=*/false);
 
       uint32_t in1_num_tiles = Kt * Nt;
       uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
-      inputs.in1_buffer =
-          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-              .device = target_device,
-              .size = in1_size_bytes,
-              .page_size = single_tile_size, // one tile per page
-              .buffer_type = tt_metal::BufferType::DRAM});
-      tt_metal::EnqueueWriteBuffer(target_device->command_queue(), inputs.in1_buffer, in1_packed, false);
+      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
+          .page_size = single_tile_size,
+          .buffer_type = tt_metal::BufferType::DRAM,
+      };
+      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+          .size = in1_size_bytes};
+
+      inputs.in1_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+          global_buf, device_local, device);
+
+      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+          device->mesh_command_queue(), inputs.in1_buffer, in1_packed, false);
     }
 
     {
       ZoneScopedN("ComputeMM Device: Wait for Transfer IN1 (Finish)");
-      tt_metal::Finish(target_device->command_queue());
+      tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
     {
@@ -1161,12 +1100,15 @@ BenchmarkInputs prepare_inputs_compute_mm(
     {
       uint32_t out_num_tiles = Mt * Nt;
       uint32_t out_size_bytes = out_num_tiles * single_tile_size;
-      inputs.out_buffer =
-          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-              .device = target_device,
-              .size = out_size_bytes,
-              .page_size = single_tile_size,
-              .buffer_type = tt_metal::BufferType::DRAM});
+      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
+          .page_size = single_tile_size,
+          .buffer_type = tt_metal::BufferType::DRAM,
+      };
+      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+          .size = out_size_bytes};
+
+      inputs.out_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+          global_buf, device_local, device);
     }
 
     // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
@@ -1262,10 +1204,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
         {
           ZoneScopedN("ComputeMM Host CPU: MMIO L1 Data Setup");
           CoreCoord core = {(std::size_t)c, (std::size_t)(r + start_core_y)};
-          tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr,
-                                            in0);
-          tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr,
-                                            in1);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in0_addr, in0);
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in1_addr, in1);
           tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
                                             in2);
         }
@@ -1329,7 +1269,7 @@ void create_program_compute_mm(
     uint32_t num_blocks_w, uint32_t in0_cb_addr, uint32_t in1_cb_addr,
     uint32_t in2_cb_addr, uint32_t out_cb_addr, uint32_t interm_cb_addr,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t out_addr, bool use_dram,
-  tt_metal::Program &program, uint32_t start_core_y) {
+    tt_metal::Program &program, uint32_t start_core_y) {
 
   // ---- Step 1: Define buffer sizes in tiles ----
   // Double buffering (num_buffer=2) allows the reader/writer to fill one
@@ -1422,15 +1362,15 @@ void create_program_compute_mm(
           .set_page_size(tt::CBIndex::c_2, single_tile_size);
   tt_metal::CreateCircularBuffer(program, all_cores, cb_src2);
 
-    // Output + intermediate CBs are configured together to match upstream
-    // 1_compute_mm behavior for bmm_large_block_zm_fused_bias_activation.
-    std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
+  // Output + intermediate CBs are configured together to match upstream
+  // 1_compute_mm behavior for bmm_large_block_zm_fused_bias_activation.
+  std::map<uint8_t, tt::DataFormat> cb_out_config_map = {
       {(uint8_t)tt::CBIndex::c_16, cb_data_format},
       {(uint8_t)tt::CBIndex::c_24, cb_data_format}};
   tt_metal::CircularBufferConfig cb_out_config =
       tt_metal::CircularBufferConfig(out_CB_size, cb_out_config_map)
-        .set_page_size(tt::CBIndex::c_16, single_tile_size)
-        .set_page_size(tt::CBIndex::c_24, single_tile_size);
+          .set_page_size(tt::CBIndex::c_16, single_tile_size)
+          .set_page_size(tt::CBIndex::c_24, single_tile_size);
   tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}),
                                  cb_out_config);
 
@@ -1534,45 +1474,45 @@ void create_program_compute_mm(
       auto phy_core = device->worker_core_from_logical_core(core);
 
       uint32_t cur_core_valid_Mt =
-        (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
+          (y == (int)core_range.y - 1) ? last_block_h : per_core_Mt;
       uint32_t cur_core_valid_Nt =
-        (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
+          (x == (int)core_range.x - 1) ? last_block_w : per_core_Nt;
 
       // Per-core boundary metadata (aligned with upstream 1_compute_mm)
       // For DRAM multi-block mode, these describe ONLY the last outer block
       // in each dimension. Interior outer blocks remain full-sized.
-      uint32_t last_outer_block_h =
-        (cur_core_valid_Mt % out_block_h == 0) ? out_block_h
-                           : (cur_core_valid_Mt % out_block_h);
-      uint32_t last_outer_block_w =
-        (cur_core_valid_Nt % out_block_w == 0) ? out_block_w
-                           : (cur_core_valid_Nt % out_block_w);
+      uint32_t last_outer_block_h = (cur_core_valid_Mt % out_block_h == 0)
+                                        ? out_block_h
+                                        : (cur_core_valid_Mt % out_block_h);
+      uint32_t last_outer_block_w = (cur_core_valid_Nt % out_block_w == 0)
+                                        ? out_block_w
+                                        : (cur_core_valid_Nt % out_block_w);
 
       uint32_t out_num_subblocks_h = out_block_h / out_subblock_h;
       uint32_t out_num_subblocks_w = out_block_w / out_subblock_w;
 
       uint32_t last_outer_num_nonzero_subblocks_h =
-        ((last_outer_block_h - 1) / out_subblock_h) + 1;
+          ((last_outer_block_h - 1) / out_subblock_h) + 1;
       uint32_t last_outer_num_nonzero_subblocks_w =
-        ((last_outer_block_w - 1) / out_subblock_w) + 1;
+          ((last_outer_block_w - 1) / out_subblock_w) + 1;
 
       uint32_t last_outer_subblock_h =
-        (last_outer_block_h % out_subblock_h == 0)
-          ? out_subblock_h
-          : (last_outer_block_h % out_subblock_h);
+          (last_outer_block_h % out_subblock_h == 0)
+              ? out_subblock_h
+              : (last_outer_block_h % out_subblock_h);
       uint32_t last_outer_subblock_w =
-        (last_outer_block_w % out_subblock_w == 0)
-          ? out_subblock_w
-          : (last_outer_block_w % out_subblock_w);
+          (last_outer_block_w % out_subblock_w == 0)
+              ? out_subblock_w
+              : (last_outer_block_w % out_subblock_w);
 
       uint32_t last_outer_padded_subblock_tiles_addr_skip =
-        single_tile_size * (out_subblock_w - last_outer_subblock_w);
+          single_tile_size * (out_subblock_w - last_outer_subblock_w);
       uint32_t last_outer_padded_block_tiles_w_skip =
-        out_subblock_num_tiles *
-        (out_num_subblocks_w - last_outer_num_nonzero_subblocks_w);
+          out_subblock_num_tiles *
+          (out_num_subblocks_w - last_outer_num_nonzero_subblocks_w);
       uint32_t last_outer_padded_block_tiles_h_skip =
-        (out_num_subblocks_h - last_outer_num_nonzero_subblocks_h) *
-        (out_block_w * out_subblock_h);
+          (out_num_subblocks_h - last_outer_num_nonzero_subblocks_h) *
+          (out_block_w * out_subblock_h);
 
       std::vector<uint32_t> reader_args;
       std::vector<uint32_t> writer_args;
@@ -1631,59 +1571,53 @@ void create_program_compute_mm(
             in1_num_subblocks,         // 21: out_num_subblocks_w
             in0_num_subblocks,         // 22: out_num_subblocks_h
             last_outer_block_w,        // 23: last_block_w for boundary bw
-            last_outer_num_nonzero_subblocks_h, // 24: last bh nonzero sbh
-            last_outer_subblock_h,            // 25: last bh tail sbh height
-            last_outer_padded_block_tiles_h_skip,  // 26: last bh padded rows
-            last_outer_num_nonzero_subblocks_w, // 27: last bw nonzero sbw
-            last_outer_subblock_w,              // 28: last bw tail sbw width
+            last_outer_num_nonzero_subblocks_h,   // 24: last bh nonzero sbh
+            last_outer_subblock_h,                // 25: last bh tail sbh height
+            last_outer_padded_block_tiles_h_skip, // 26: last bh padded rows
+            last_outer_num_nonzero_subblocks_w,   // 27: last bw nonzero sbw
+            last_outer_subblock_w,                // 28: last bw tail sbw width
             last_outer_padded_subblock_tiles_addr_skip, // 29: tail sbw skip
             last_outer_padded_block_tiles_w_skip,       // 30: last bw pad skip
-            num_blocks_h,              // 31: num_blocks_h_dim
-            num_blocks_w,              // 32: num_blocks_w_dim
-            out_block_w,               // 33: in1_w_dim_stride
-            out_block_h * Nt,          // 34: out_h_dim_stride
-            out_block_w,               // 35: out_w_dim_stride
+            num_blocks_h,                               // 31: num_blocks_h_dim
+            num_blocks_w,                               // 32: num_blocks_w_dim
+            out_block_w,                                // 33: in1_w_dim_stride
+            out_block_h * Nt,                           // 34: out_h_dim_stride
+            out_block_w,                                // 35: out_w_dim_stride
         };
 
-          if (x == 0 && y == 0) {
-            uint32_t in0_total_tiles = Mt * Kt;
-            uint32_t in1_total_tiles = Kt * Nt;
-            uint32_t out_total_tiles = Mt * Nt;
+        if (x == 0 && y == 0) {
+          uint32_t in0_total_tiles = Mt * Kt;
+          uint32_t in1_total_tiles = Kt * Nt;
+          uint32_t out_total_tiles = Mt * Nt;
 
-            uint32_t in0_last_tile_est =
-              in0_start_tile_id +
-              ((num_blocks_h - 1) * out_block_h * Kt) +
-              ((num_blocks - 1) * in0_block_w) +
-              ((out_block_h - 1) * Kt) +
+          uint32_t in0_last_tile_est =
+              in0_start_tile_id + ((num_blocks_h - 1) * out_block_h * Kt) +
+              ((num_blocks - 1) * in0_block_w) + ((out_block_h - 1) * Kt) +
               (in0_block_w - 1);
 
-            uint32_t in1_last_tile_est =
-              in1_start_tile_id +
-              ((num_blocks_w - 1) * out_block_w) +
+          uint32_t in1_last_tile_est =
+              in1_start_tile_id + ((num_blocks_w - 1) * out_block_w) +
               ((num_blocks - 1) * (in0_block_w * Nt)) +
-              ((in0_block_w - 1) * Nt) +
+              ((in0_block_w - 1) * Nt) + (out_block_w - 1);
+
+          uint32_t out_last_tile_est =
+              out_start_tile_id + ((num_blocks_h - 1) * (out_block_h * Nt)) +
+              ((num_blocks_w - 1) * out_block_w) + ((out_block_h - 1) * Nt) +
               (out_block_w - 1);
 
-            uint32_t out_last_tile_est =
-              out_start_tile_id +
-              ((num_blocks_h - 1) * (out_block_h * Nt)) +
-              ((num_blocks_w - 1) * out_block_w) +
-              ((out_block_h - 1) * Nt) +
-              (out_block_w - 1);
+          log_info(LogTest,
+                   "DRAM core(0,0) ranges: in0_start={}, in0_last_est={}, "
+                   "in1_start={}, in1_last_est={}, out_start={}, "
+                   "out_last_est={}",
+                   in0_start_tile_id, in0_last_tile_est, in1_start_tile_id,
+                   in1_last_tile_est, out_start_tile_id, out_last_tile_est);
 
-            log_info(LogTest,
-                 "DRAM core(0,0) ranges: in0_start={}, in0_last_est={}, "
-                 "in1_start={}, in1_last_est={}, out_start={}, "
-                 "out_last_est={}",
-                 in0_start_tile_id, in0_last_tile_est, in1_start_tile_id,
-                 in1_last_tile_est, out_start_tile_id, out_last_tile_est);
-
-            log_info(LogTest,
-                 "DRAM core(0,0) totals: in0_total={}, in1_total={}, "
-                 "out_total={}, num_blocks={}x{} outer, K_blocks={}",
-                 in0_total_tiles, in1_total_tiles, out_total_tiles,
-                 num_blocks_h, num_blocks_w, num_blocks);
-          }
+          log_info(LogTest,
+                   "DRAM core(0,0) totals: in0_total={}, in1_total={}, "
+                   "out_total={}, num_blocks={}x{} outer, K_blocks={}",
+                   in0_total_tiles, in1_total_tiles, out_total_tiles,
+                   num_blocks_h, num_blocks_w, num_blocks);
+        }
 
       } else {
         // === L1 Reader Args (12 args — upstream 1_compute_mm layout) ===
@@ -1701,49 +1635,46 @@ void create_program_compute_mm(
                        cur_core_valid_Mt};
 
         // === L1 Writer Args (31 args — upstream 1_compute_mm layout) ===
-        writer_args = {in1_addr,
-                       0,
-                       1,
-                       cur_core_valid_Nt,
-                       in0_block_w * per_core_Nt,
-                       per_core_Nt,
-                       in0_block_w,
-                       per_core_Nt * in0_block_w,
-                       num_blocks,
-                       in2_cb_addr,
-                       (uint32_t)phy_core.x,
-                       (uint32_t)phy_core.y,
-                       out_addr,
-                       0,
-                       1,
-                         cur_core_valid_Nt,
-                       out_subblock_w,
-                         out_subblock_h * cur_core_valid_Nt,
-                       out_subblock_w,
-                       out_subblock_h,
-                       out_subblock_w * out_subblock_h,
-                       per_core_Nt / out_subblock_w,
-                         per_core_Mt / out_subblock_h,
-                         cur_core_valid_Nt,
-                         (y == (int)core_range.y - 1)
-                           ? last_outer_num_nonzero_subblocks_h
-                           : (per_core_Mt / out_subblock_h),
-                         (y == (int)core_range.y - 1) ? last_outer_subblock_h
-                                      : out_subblock_h,
-                         (y == (int)core_range.y - 1)
-                           ? last_outer_padded_block_tiles_h_skip
-                           : 0,
-                         (x == (int)core_range.x - 1)
-                           ? last_outer_num_nonzero_subblocks_w
-                           : (per_core_Nt / out_subblock_w),
-                         (x == (int)core_range.x - 1) ? last_outer_subblock_w
-                                      : out_subblock_w,
-                         (x == (int)core_range.x - 1)
-                           ? last_outer_padded_subblock_tiles_addr_skip
-                           : 0,
-                         (x == (int)core_range.x - 1)
-                           ? last_outer_padded_block_tiles_w_skip
-                           : 0};
+        writer_args = {
+            in1_addr,
+            0,
+            1,
+            cur_core_valid_Nt,
+            in0_block_w * per_core_Nt,
+            per_core_Nt,
+            in0_block_w,
+            per_core_Nt * in0_block_w,
+            num_blocks,
+            in2_cb_addr,
+            (uint32_t)phy_core.x,
+            (uint32_t)phy_core.y,
+            out_addr,
+            0,
+            1,
+            cur_core_valid_Nt,
+            out_subblock_w,
+            out_subblock_h * cur_core_valid_Nt,
+            out_subblock_w,
+            out_subblock_h,
+            out_subblock_w * out_subblock_h,
+            per_core_Nt / out_subblock_w,
+            per_core_Mt / out_subblock_h,
+            cur_core_valid_Nt,
+            (y == (int)core_range.y - 1) ? last_outer_num_nonzero_subblocks_h
+                                         : (per_core_Mt / out_subblock_h),
+            (y == (int)core_range.y - 1) ? last_outer_subblock_h
+                                         : out_subblock_h,
+            (y == (int)core_range.y - 1) ? last_outer_padded_block_tiles_h_skip
+                                         : 0,
+            (x == (int)core_range.x - 1) ? last_outer_num_nonzero_subblocks_w
+                                         : (per_core_Nt / out_subblock_w),
+            (x == (int)core_range.x - 1) ? last_outer_subblock_w
+                                         : out_subblock_w,
+            (x == (int)core_range.x - 1)
+                ? last_outer_padded_subblock_tiles_addr_skip
+                : 0,
+            (x == (int)core_range.x - 1) ? last_outer_padded_block_tiles_w_skip
+                                         : 0};
       }
 
       tt_metal::SetRuntimeArgs(program, mm_reader_id, core, reader_args);
@@ -1807,7 +1738,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         single_tile_size = tt::tile_size(data_format);
 
         if (params.use_dram) {
-          auto [obh, obw, bw] = get_multi_dim_per_core_factor(
+          auto [obh, obw, bw] = get_dynamic_l1_block_params(
               per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
               l1_unreserved_base);
           out_block_h = obh;
@@ -1818,10 +1749,9 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
           log_info(LogTest,
                    "DRAM blocking: per_core={}x{}, out_block={}x{}, "
-                   "num_blocks={}x{}, in0_block_w={}, safety_margin={}KB",
+                   "num_blocks={}x{}, in0_block_w={}",
                    per_core_Mt, per_core_Nt, out_block_h, out_block_w,
-                   num_blocks_h, num_blocks_w, in0_block_w,
-                   L1_SAFETY_MARGIN_BYTES / 1024);
+                   num_blocks_h, num_blocks_w, in0_block_w);
         } else {
           out_block_h = per_core_Mt;
           out_block_w = per_core_Nt;
@@ -1868,12 +1798,17 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         effective_in1_addr = in1_addr;
         effective_out_addr = out_addr;
         if (params.use_dram) {
-          effective_in0_addr = inputs.in0_buffer->address();
-          effective_in1_addr = inputs.in1_buffer->address();
-          effective_out_addr = inputs.out_buffer->address();
+          // MeshBuffer doesn't expose address() directly; extract the
+          // underlying per-device Buffer* via get_device_buffer().
+          auto coord = tt::tt_metal::distributed::MeshCoordinate(0, 0);
+          effective_in0_addr =
+              inputs.in0_buffer->get_device_buffer(coord)->address();
+          effective_in1_addr =
+              inputs.in1_buffer->get_device_buffer(coord)->address();
+          effective_out_addr =
+              inputs.out_buffer->get_device_buffer(coord)->address();
           log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
-                   effective_in0_addr, effective_in1_addr,
-                   effective_out_addr);
+                   effective_in0_addr, effective_in1_addr, effective_out_addr);
         }
       }
     }
@@ -1886,12 +1821,11 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       ZoneScopedN("ComputeMM Host Program Build");
       create_program_compute_mm(
           device, data_format, math_fidelity, fp32_dest_acc_en,
-          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w,
-          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt,
-          out_block_h, out_block_w, num_blocks_h, num_blocks_w, in0_cb_addr,
-          in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
-          effective_in0_addr, effective_in1_addr, effective_out_addr,
-          params.use_dram, program);
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h,
+          out_subblock_w, per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+          num_blocks_h, num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr,
+          out_cb_addr, interm_cb_addr, effective_in0_addr, effective_in1_addr,
+          effective_out_addr, params.use_dram, program);
     }
 
     auto mesh_workload = tt_metal::distributed::MeshWorkload();
@@ -1940,7 +1874,9 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           // === DRAM Readback ===
           // Read entire output buffer from DRAM
           std::vector<uint32_t> out_data;
-          tt_metal::EnqueueReadBuffer(target_device->command_queue(), inputs.out_buffer, out_data, true);
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), out_data, inputs.out_buffer,
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
 
           // Unpack and untilize the full output
           auto out_float = unpack_bfp8_tiles_into_float_vec(
@@ -2050,35 +1986,42 @@ void log_host_pipeline_stats(const std::string &tag, const HostPipelineStats &s,
   double avg_read_us = s.read_us / iters;
   double avg_inverse_transform_us = s.inverse_transform_us / iters;
   double avg_end_to_end_us = s.end_to_end_us / iters;
-  double avg_write_bytes_per_iter = static_cast<double>(s.bytes_written) / iters;
+  double avg_write_bytes_per_iter =
+      static_cast<double>(s.bytes_written) / iters;
   double avg_read_bytes_per_iter = static_cast<double>(s.bytes_read) / iters;
 
   double write_seconds = s.write_us / 1e6;
   double read_seconds = s.read_us / 1e6;
-  double write_gbps = (write_seconds > 0.0)
-                          ? (static_cast<double>(s.bytes_written) / write_seconds) / 1e9
-                          : 0.0;
-  double read_gbps = (read_seconds > 0.0)
-                         ? (static_cast<double>(s.bytes_read) / read_seconds) / 1e9
-                         : 0.0;
+  double write_gbps =
+      (write_seconds > 0.0)
+          ? (static_cast<double>(s.bytes_written) / write_seconds) / 1e9
+          : 0.0;
+  double read_gbps =
+      (read_seconds > 0.0)
+          ? (static_cast<double>(s.bytes_read) / read_seconds) / 1e9
+          : 0.0;
 
   log_info(LogTest,
            "{} host-only pipeline timing (avg per iteration, us): "
-           "input_generation={:.2f}, tilize_pack_transform={:.2f}, h2d_write={:.2f}, "
-           "d2h_read={:.2f}, unpack_untilize_inverse_transform={:.2f}, host_end_to_end={:.2f}",
+           "input_generation={:.2f}, tilize_pack_transform={:.2f}, "
+           "h2d_write={:.2f}, "
+           "d2h_read={:.2f}, unpack_untilize_inverse_transform={:.2f}, "
+           "host_end_to_end={:.2f}",
            tag, avg_generate_us, avg_transform_us, avg_write_us, avg_read_us,
            avg_inverse_transform_us, avg_end_to_end_us);
 
-  log_info(LogTest,
-           "{} host-only transfer summary (all iterations): "
-           "total_h2d_bytes={}, total_d2h_bytes={}, avg_h2d_bytes_per_iter={:.0f}, "
-           "avg_d2h_bytes_per_iter={:.0f}, effective_h2d_bw={:.3f} GB/s, effective_d2h_bw={:.3f} GB/s",
-           tag, s.bytes_written, s.bytes_read, avg_write_bytes_per_iter,
-           avg_read_bytes_per_iter, write_gbps, read_gbps);
+  log_info(
+      LogTest,
+      "{} host-only transfer summary (all iterations): "
+      "total_h2d_bytes={}, total_d2h_bytes={}, avg_h2d_bytes_per_iter={:.0f}, "
+      "avg_d2h_bytes_per_iter={:.0f}, effective_h2d_bw={:.3f} GB/s, "
+      "effective_d2h_bw={:.3f} GB/s",
+      tag, s.bytes_written, s.bytes_read, avg_write_bytes_per_iter,
+      avg_read_bytes_per_iter, write_gbps, read_gbps);
 }
 
-bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
-                                   const TestParams &params) {
+bool test_host_pipeline_compute_mm(
+    tt::tt_metal::distributed::MeshDevice *device, const TestParams &params) {
   bool pass = true;
   try {
     ZoneScopedN("HostPipeline ComputeMM Functional Blocks");
@@ -2109,205 +2052,146 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
     uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
     uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
 
-    auto *target_device = device->get_devices()[0];
-
-    auto in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = target_device,
-        .size = in0_size_bytes,
+    tt::tt_metal::distributed::DeviceLocalBufferConfig device_local_in0{
         .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
+        .buffer_type = tt_metal::BufferType::DRAM,
+    };
+    tt::tt_metal::distributed::ReplicatedBufferConfig global_in0{
+        .size = in0_size_bytes};
+    auto in0_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+        global_in0, device_local_in0, device);
 
-    auto in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = target_device,
-        .size = in1_size_bytes,
+    tt::tt_metal::distributed::DeviceLocalBufferConfig device_local_in1{
         .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
+        .buffer_type = tt_metal::BufferType::DRAM,
+    };
+    tt::tt_metal::distributed::ReplicatedBufferConfig global_in1{
+        .size = in1_size_bytes};
+    auto in1_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+        global_in1, device_local_in1, device);
 
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
 
     {
-    ZoneScopedN("HostPipeline ComputeMM Host Dispatch");
-    for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScopedN("HostPipeline ComputeMM Iteration");
-      ZoneValue(i);
-      auto t_iter_start = std::chrono::steady_clock::now();
+      ZoneScopedN("HostPipeline ComputeMM Host Dispatch");
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("HostPipeline ComputeMM Iteration");
+        ZoneValue(i);
+        auto t_iter_start = std::chrono::steady_clock::now();
 
-      std::vector<float> in0_vec;
-      std::vector<float> in1_vec;
-      {
-        ZoneScopedN("HostPipeline ComputeMM Prepare Inputs");
-        auto t0 = std::chrono::steady_clock::now();
-        in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
-        in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.generate_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-
-      std::vector<uint32_t> in0_packed;
-      std::vector<uint32_t> in1_packed;
-      {
-        ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
-        auto t0 = std::chrono::steady_clock::now();
-        auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
-        in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
-                                        /*row_major_input=*/true,
-                                        /*is_exp_a=*/false);
-
-        auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
-        in1_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
-                                        /*row_major_input=*/true,
-                                        /*is_exp_a=*/false);
-        auto t1 = std::chrono::steady_clock::now();
-        auto t1 = std::chrono::steady_clock::now();
-        stats.transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-
-      {
-        ZoneScopedN("HostPipeline ComputeMM Host Enqueue");
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in0_buffer, in0_packed, false);
-        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in1_buffer, in1_packed, false);
-        tt_metal::Finish(target_device->command_queue());
-        auto t1 = std::chrono::steady_clock::now();
-        stats.write_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_written +=
-            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
-
-      std::vector<uint32_t> in0_readback;
-      std::vector<uint32_t> in1_readback;
-      {
-        ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in0_buffer, in0_readback, true);
-        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in1_buffer, in1_readback, true);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.read_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_read +=
-            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
-
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-
-      // We break validation out of the loop timing, executing it only on the FIRST iteration
-      if (i == 0 && !params.bypass_check) {
-        ZoneScopedN("HostPipeline ComputeMM Validation");
-        auto t0_post = std::chrono::steady_clock::now();
-        auto in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
-            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        auto in0_untilized = untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
-
-        auto in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
-            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        auto in1_untilized = untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
-        auto t1_post = std::chrono::steady_clock::now();
-        stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
-                .count();
-
-        float in0_pcc = get_pcc(in0_vec, in0_untilized);
-        float in1_pcc = get_pcc(in1_vec, in1_untilized);
-        log_validation_sample_pairs("HostPipeline ComputeMM IN0",
-                                    in0_vec, in0_untilized, 12);
-        log_validation_sample_pairs("HostPipeline ComputeMM IN1",
-                                    in1_vec, in1_untilized, 12);
-
-        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
-          log_error(LogTest,
-                    "Host-only ComputeMM roundtrip check failed: "
-                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
-                    in0_pcc, in1_pcc);
-          pass = false;
-          break;
+        std::vector<float> in0_vec;
+        std::vector<float> in1_vec;
+        {
+          ZoneScopedN("HostPipeline ComputeMM Prepare Inputs");
+          auto t0 = std::chrono::steady_clock::now();
+          in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
+          in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.generate_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
         }
-      }
-    }
-    }
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in0_buffer, in0_packed, false);
-        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), in1_buffer, in1_packed, false);
-        tt_metal::Finish(target_device->command_queue());
-        auto t1 = std::chrono::steady_clock::now();
-        stats.write_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+
+        std::vector<uint32_t> in0_packed;
+        std::vector<uint32_t> in1_packed;
+        {
+          ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
+          auto t0 = std::chrono::steady_clock::now();
+          auto in0_tilized = tilize_swizzled(in0_vec, Mt * 32, Kt * 32);
+          in0_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in0_tilized),
+                                          /*row_major_input=*/true,
+                                          /*is_exp_a=*/false);
+
+          auto in1_tilized = tilize_swizzled(in1_vec, Kt * 32, Nt * 32);
+          in1_packed = pack_as_bfp8_tiles(tt::stl::make_const_span(in1_tilized),
+                                          /*row_major_input=*/true,
+                                          /*is_exp_a=*/false);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.transform_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+        }
+
+        {
+          ZoneScopedN("HostPipeline ComputeMM Host Enqueue");
+          auto t0 = std::chrono::steady_clock::now();
+          tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+              device->mesh_command_queue(), in0_buffer, in0_packed, false);
+          tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+              device->mesh_command_queue(), in1_buffer, in1_packed, false);
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+          auto t1 = std::chrono::steady_clock::now();
+          stats.write_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_written +=
+              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+        }
+
+        std::vector<uint32_t> in0_readback;
+        std::vector<uint32_t> in1_readback;
+        {
+          ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
+          auto t0 = std::chrono::steady_clock::now();
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in0_readback, in0_buffer,
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in1_readback, in1_buffer,
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.read_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_read +=
+              static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
+        }
+
+        auto t_iter_end = std::chrono::steady_clock::now();
+        stats.end_to_end_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                  t_iter_start)
                 .count();
-        stats.bytes_written +=
-            static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
+        completed_iters++;
 
-      std::vector<uint32_t> in0_readback;
-      std::vector<uint32_t> in1_readback;
-      {
-        ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in0_buffer, in0_readback, true);
-        tt_metal::EnqueueReadBuffer(target_device->command_queue(), in1_buffer, in1_readback, true);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.read_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_read += static_cast<uint64_t>(in0_size_bytes + in1_size_bytes);
-      }
+        // We break validation out of the loop timing, executing it only on the
+        // FIRST iteration
+        if (i == 0 && !params.bypass_check) {
+          ZoneScopedN("HostPipeline ComputeMM Validation");
+          auto t0_post = std::chrono::steady_clock::now();
+          auto in0_roundtrip = unpack_bfp8_tiles_into_float_vec(
+              in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+          auto in0_untilized =
+              untilize_swizzled(in0_roundtrip, Mt * 32, Kt * 32);
 
-      std::vector<float> in0_roundtrip;
-      std::vector<float> in1_roundtrip;
-      {
-        ZoneScopedN("HostPipeline ComputeMM Host Post Processing");
-        auto t0 = std::chrono::steady_clock::now();
-        auto in0_unpacked = unpack_bfp8_tiles_into_float_vec(
-            in0_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in0_roundtrip = untilize_swizzled(in0_unpacked, Mt * 32, Kt * 32);
+          auto in1_roundtrip = unpack_bfp8_tiles_into_float_vec(
+              in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+          auto in1_untilized =
+              untilize_swizzled(in1_roundtrip, Kt * 32, Nt * 32);
+          auto t1_post = std::chrono::steady_clock::now();
+          stats.inverse_transform_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1_post -
+                                                                    t0_post)
+                  .count();
 
-        auto in1_unpacked = unpack_bfp8_tiles_into_float_vec(
-            in1_readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        in1_roundtrip = untilize_swizzled(in1_unpacked, Kt * 32, Nt * 32);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-
-      if (!params.bypass_check) {
-        ZoneScopedN("HostPipeline ComputeMM Validation Metrics");
-        float in0_pcc = get_pcc(in0_vec, in0_roundtrip);
-        float in1_pcc = get_pcc(in1_vec, in1_roundtrip);
-        if (i == 0) {
+          float in0_pcc = get_pcc(in0_vec, in0_untilized);
+          float in1_pcc = get_pcc(in1_vec, in1_untilized);
           log_validation_sample_pairs("HostPipeline ComputeMM IN0", in0_vec,
-                                      in0_roundtrip, 12);
+                                      in0_untilized, 12);
           log_validation_sample_pairs("HostPipeline ComputeMM IN1", in1_vec,
-                                      in1_roundtrip, 12);
-        }
-        if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
-          log_error(LogTest,
-                    "Host-only ComputeMM roundtrip check failed at iter {}: "
-                    "in0_pcc={:.4f}, in1_pcc={:.4f}",
-                    i, in0_pcc, in1_pcc);
-          pass = false;
-          break;
+                                      in1_untilized, 12);
+
+          if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+            log_error(LogTest,
+                      "Host-only ComputeMM roundtrip check failed: "
+                      "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                      in0_pcc, in1_pcc);
+            pass = false;
+            break;
+          }
         }
       }
-
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-    }
     }
 
     log_info(LogTest,
@@ -2315,7 +2199,7 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
              "completed_iters={}",
              Mt, Nt, Kt, completed_iters);
     log_host_pipeline_stats("Test 3 (Host-Only ComputeMM Pipeline)", stats,
-                completed_iters);
+                            completed_iters);
   } catch (const std::exception &e) {
     pass = false;
     log_error(LogTest, "{}", e.what());
@@ -2323,13 +2207,14 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::distributed::MeshDevice *device
   return pass;
 }
 
-bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *device,
-                                     const TestParams &params) {
+bool test_host_pipeline_empty_tensor(
+    tt::tt_metal::distributed::MeshDevice *device, const TestParams &params) {
   bool pass = true;
   try {
     ZoneScopedN("HostPipeline Empty Functional Blocks");
-    log_info(LogTest,
-             "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
+    log_info(
+        LogTest,
+        "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
 
     auto [Mt, Nt, Kt] =
         get_aligned_input_tile_num(params.M, params.N, params.K);
@@ -2353,16 +2238,20 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
     uint32_t tensor_size_bytes = num_tiles * single_tile_size;
-    uint64_t expected_tensor_elems =
-      static_cast<uint64_t>(Mt) * static_cast<uint64_t>(Nt) *
-      static_cast<uint64_t>(constants::TILE_HW);
+    uint64_t expected_tensor_elems = static_cast<uint64_t>(Mt) *
+                                     static_cast<uint64_t>(Nt) *
+                                     static_cast<uint64_t>(constants::TILE_HW);
 
-    auto *target_device = device->get_devices()[0];
-    auto tensor_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = target_device,
-        .size = tensor_size_bytes,
+    // No target_device needed — test 4 uses MeshBuffer::create directly.
+    tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
         .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
+        .buffer_type = tt_metal::BufferType::DRAM,
+    };
+    tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+        .size = tensor_size_bytes};
+
+    auto tensor_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+        global_buf, device_local, device);
 
     HostPipelineStats stats;
     double transfer_window_us = 0.0;
@@ -2370,188 +2259,133 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
     uint32_t completed_iters = 0;
 
     {
-    ZoneScopedN("HostPipeline Empty Host Dispatch");
-    for (uint32_t i = 0; i < params.num_iters; ++i) {
-      ZoneScopedN("HostPipeline Empty Iteration");
-      ZoneValue(i);
-      auto t_iter_start = std::chrono::steady_clock::now();
+      ZoneScopedN("HostPipeline Empty Host Dispatch");
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("HostPipeline Empty Iteration");
+        ZoneValue(i);
+        auto t_iter_start = std::chrono::steady_clock::now();
 
-      std::vector<float> tensor_vec;
-      {
-        ZoneScopedN("HostPipeline Empty Prepare Inputs");
-        auto t0 = std::chrono::steady_clock::now();
-        tensor_vec = generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.generate_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-      if (tensor_vec.size() != expected_tensor_elems) {
-        log_error(LogTest,
-                  "Host-only Empty tensor element count mismatch: got={}, "
-                  "expected={} (Mt={}, Nt={}, TILE_HW={})",
-                  tensor_vec.size(), expected_tensor_elems, Mt, Nt,
-                  constants::TILE_HW);
-        return false;
-      }
-
-      std::vector<uint32_t> packed;
-      {
-        ZoneScopedN("HostPipeline Empty Transform Inputs");
-        auto t0 = std::chrono::steady_clock::now();
-        auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
-        packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
-                                    /*row_major_input=*/true,
-                                    /*is_exp_a=*/false);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
-      uint64_t packed_bytes =
-          static_cast<uint64_t>(packed.size()) * sizeof(uint32_t);
-      if (packed_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
-        log_error(LogTest,
-                  "Host-only Empty packed byte size mismatch: got={} B, "
-                  "expected={} B (tiles={}, tile_size={})",
-                  packed_bytes, tensor_size_bytes, num_tiles,
-                  single_tile_size);
-        return false;
-      }
-
-      auto t_transfer_start = std::chrono::steady_clock::now();
-      {
-        ZoneScopedN("HostPipeline Empty Host Enqueue");
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueWriteBuffer(target_device->command_queue(), tensor_buffer, packed, false);
-        tt_metal::Finish(target_device->command_queue());
-        auto t1 = std::chrono::steady_clock::now();
-        stats.write_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_written += static_cast<uint64_t>(tensor_size_bytes);
-      }
-
-      std::vector<uint32_t> readback;
-      {
-        ZoneScopedN("HostPipeline Empty Host FinishWait");
-        auto t0 = std::chrono::steady_clock::now();
-        tt_metal::EnqueueReadBuffer(target_device->command_queue(), tensor_buffer, readback, true);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.read_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
-      }
-      uint64_t readback_bytes =
-          static_cast<uint64_t>(readback.size()) * sizeof(uint32_t);
-      if (readback_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
-        log_error(LogTest,
-                  "Host-only Empty readback byte size mismatch: got={} B, "
-                  "expected={} B",
-                  readback_bytes, tensor_size_bytes);
-        return false;
-      }
-      auto t_transfer_end = std::chrono::steady_clock::now();
-      transfer_window_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_transfer_end -
-                                                                 t_transfer_start)
-              .count();
-      transfer_window_bytes += static_cast<uint64_t>(tensor_size_bytes) * 2;
-
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-
-      // We break validation out of the loop timing, executing it only on the FIRST iteration
-      if (i == 0 && !params.bypass_check) {
-        ZoneScopedN("HostPipeline Empty Validation Processing");
-        auto t0_post = std::chrono::steady_clock::now();
-        auto roundtrip_float = unpack_bfp8_tiles_into_float_vec(
-            readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        auto roundtrip =
-            untilize_swizzled(roundtrip_float, Mt * 32, Nt * 32);
-        auto t1_post = std::chrono::steady_clock::now();
-        stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
-                .count();
-
-        float pcc = get_pcc(tensor_vec, roundtrip);
-        log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
-                                    roundtrip, 12);
-
-        if (pcc < 0.99f) {
-          log_error(LogTest,
-                    "Host-only Empty roundtrip check failed: "
-                    "pcc={:.4f}",
-                    pcc);
-          pass = false;
-          break;
+        std::vector<float> tensor_vec;
+        {
+          ZoneScopedN("HostPipeline Empty Prepare Inputs");
+          auto t0 = std::chrono::steady_clock::now();
+          tensor_vec = generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.generate_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
         }
-      }
-    }
-    }
-        stats.read_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-        stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
-      }
-      uint64_t readback_bytes =
-          static_cast<uint64_t>(readback.size()) * sizeof(uint32_t);
-      if (readback_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
-        log_error(LogTest,
-                  "Host-only Empty readback byte size mismatch: got={} B, "
-                  "expected={} B",
-                  readback_bytes, tensor_size_bytes);
-        return false;
-      }
-      auto t_transfer_end = std::chrono::steady_clock::now();
-      transfer_window_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_transfer_end -
-                                                                 t_transfer_start)
-              .count();
-      transfer_window_bytes += static_cast<uint64_t>(tensor_size_bytes) * 2;
+        if (tensor_vec.size() != expected_tensor_elems) {
+          log_error(LogTest,
+                    "Host-only Empty tensor element count mismatch: got={}, "
+                    "expected={} (Mt={}, Nt={}, TILE_HW={})",
+                    tensor_vec.size(), expected_tensor_elems, Mt, Nt,
+                    constants::TILE_HW);
+          return false;
+        }
 
-      std::vector<float> roundtrip;
-      {
-        ZoneScopedN("HostPipeline Empty Host Post Processing");
-        auto t0 = std::chrono::steady_clock::now();
-        auto unpacked = unpack_bfp8_tiles_into_float_vec(
-            readback, /*row_major_output=*/true, /*is_exp_a=*/false);
-        roundtrip = untilize_swizzled(unpacked, Mt * 32, Nt * 32);
-        auto t1 = std::chrono::steady_clock::now();
-        stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
-                .count();
-      }
+        std::vector<uint32_t> packed;
+        {
+          ZoneScopedN("HostPipeline Empty Transform Inputs");
+          auto t0 = std::chrono::steady_clock::now();
+          auto tilized = tilize_swizzled(tensor_vec, Mt * 32, Nt * 32);
+          packed = pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
+                                      /*row_major_input=*/true,
+                                      /*is_exp_a=*/false);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.transform_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+        }
+        uint64_t packed_bytes =
+            static_cast<uint64_t>(packed.size()) * sizeof(uint32_t);
+        if (packed_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
+          log_error(LogTest,
+                    "Host-only Empty packed byte size mismatch: got={} B, "
+                    "expected={} B (tiles={}, tile_size={})",
+                    packed_bytes, tensor_size_bytes, num_tiles,
+                    single_tile_size);
+          return false;
+        }
 
-      if (!params.bypass_check) {
-        ZoneScopedN("HostPipeline Empty Validation Metrics");
-        float pcc = get_pcc(tensor_vec, roundtrip);
-        if (i == 0) {
+        auto t_transfer_start = std::chrono::steady_clock::now();
+        {
+          ZoneScopedN("HostPipeline Empty Host Enqueue");
+          auto t0 = std::chrono::steady_clock::now();
+          tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+              device->mesh_command_queue(), tensor_buffer, packed, false);
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+          auto t1 = std::chrono::steady_clock::now();
+          stats.write_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_written += static_cast<uint64_t>(tensor_size_bytes);
+        }
+
+        std::vector<uint32_t> readback;
+        {
+          ZoneScopedN("HostPipeline Empty Host FinishWait");
+          auto t0 = std::chrono::steady_clock::now();
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), readback, tensor_buffer,
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+          auto t1 = std::chrono::steady_clock::now();
+          stats.read_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                  .count();
+          stats.bytes_read += static_cast<uint64_t>(tensor_size_bytes);
+        }
+        uint64_t readback_bytes =
+            static_cast<uint64_t>(readback.size()) * sizeof(uint32_t);
+        if (readback_bytes != static_cast<uint64_t>(tensor_size_bytes)) {
+          log_error(LogTest,
+                    "Host-only Empty readback byte size mismatch: got={} B, "
+                    "expected={} B",
+                    readback_bytes, tensor_size_bytes);
+          return false;
+        }
+        auto t_transfer_end = std::chrono::steady_clock::now();
+        transfer_window_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                t_transfer_end - t_transfer_start)
+                .count();
+        transfer_window_bytes += static_cast<uint64_t>(tensor_size_bytes) * 2;
+
+        auto t_iter_end = std::chrono::steady_clock::now();
+        stats.end_to_end_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
+                                                                  t_iter_start)
+                .count();
+        completed_iters++;
+
+        // We break validation out of the loop timing, executing it only on the
+        // FIRST iteration
+        if (i == 0 && !params.bypass_check) {
+          ZoneScopedN("HostPipeline Empty Validation Processing");
+          auto t0_post = std::chrono::steady_clock::now();
+          auto roundtrip_float = unpack_bfp8_tiles_into_float_vec(
+              readback, /*row_major_output=*/true, /*is_exp_a=*/false);
+          auto roundtrip = untilize_swizzled(roundtrip_float, Mt * 32, Nt * 32);
+          auto t1_post = std::chrono::steady_clock::now();
+          stats.inverse_transform_us +=
+              std::chrono::duration_cast<std::chrono::microseconds>(t1_post -
+                                                                    t0_post)
+                  .count();
+
+          float pcc = get_pcc(tensor_vec, roundtrip);
           log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
                                       roundtrip, 12);
-        }
-        if (pcc < 0.99f) {
-          log_error(LogTest,
-                    "Host-only Empty roundtrip check failed at iter {}: "
-                    "pcc={:.4f}",
-                    i, pcc);
-          pass = false;
-          break;
+
+          if (pcc < 0.99f) {
+            log_error(LogTest,
+                      "Host-only Empty roundtrip check failed: "
+                      "pcc={:.4f}",
+                      pcc);
+            pass = false;
+            break;
+          }
         }
       }
-
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-    }
     }
 
     log_info(LogTest,
@@ -2559,16 +2393,16 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::distributed::MeshDevice *devi
              Mt, Nt, completed_iters);
     double transfer_seconds = transfer_window_us / 1e6;
     double effective_bw_mb_s =
-      (transfer_seconds > 0.0)
-        ? (static_cast<double>(transfer_window_bytes) / transfer_seconds) /
-            1e6
-        : 0.0;
+        (transfer_seconds > 0.0)
+            ? (static_cast<double>(transfer_window_bytes) / transfer_seconds) /
+                  1e6
+            : 0.0;
     log_info(LogTest,
-         "Host-only Empty effective transfer BW: total_bytes={}, "
-         "transfer_time={:.2f}us, bw={:.3f} MB/s",
-         transfer_window_bytes, transfer_window_us, effective_bw_mb_s);
+             "Host-only Empty effective transfer BW: total_bytes={}, "
+             "transfer_time={:.2f}us, bw={:.3f} MB/s",
+             transfer_window_bytes, transfer_window_us, effective_bw_mb_s);
     log_host_pipeline_stats("Test 4 (Host-Only Empty Tensor Pipeline)", stats,
-                completed_iters);
+                            completed_iters);
   } catch (const std::exception &e) {
     pass = false;
     log_error(LogTest, "{}", e.what());
@@ -2597,20 +2431,18 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
            ++core_group_idx) {
         CoreCoord start_core = {0, (params.core_y / params.core_groups) *
                                        core_group_idx};
-        CoreCoord end_core = {
-            (std::size_t)params.core_x - 1,
-            (core_group_idx == params.core_groups - 1)
-                ? (std::size_t)params.core_y - 1
-                : ((params.core_y / params.core_groups) *
-                   (core_group_idx + 1)) -
-                      1};
+        CoreCoord end_core = {(std::size_t)params.core_x - 1,
+                              (core_group_idx == params.core_groups - 1)
+                                  ? (std::size_t)params.core_y - 1
+                                  : ((params.core_y / params.core_groups) *
+                                     (core_group_idx + 1)) -
+                                        1};
         CoreRange group_of_cores(start_core, end_core);
 
-        log_info(
-            LogTest,
-            "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
-            core_group_idx, start_core.x, start_core.y, end_core.x,
-            end_core.y);
+        log_info(LogTest,
+                 "Setting kernels for core group {}, cores ({},{}) ~ ({},{})",
+                 core_group_idx, start_core.x, start_core.y, end_core.x,
+                 end_core.y);
 
         for (int i = start_core.y; i <= end_core.y; i++) {
           for (int j = start_core.x; j <= end_core.x; j++) {
@@ -2650,8 +2482,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
                 .noc = tt_metal::NOC::RISCV_0_default,
                 .compile_args = writer_compile_args});
 
-        std::vector<uint32_t> compute_compile_args = {
-            uint32_t(core_group_idx)};
+        std::vector<uint32_t> compute_compile_args = {uint32_t(core_group_idx)};
         tt_metal::CreateKernel(
             program,
             "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
@@ -2688,12 +2519,12 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         std::move(program));
 
     // Explicitly compile the program to measure compile overhead.
-    //auto t_compile_begin = std::chrono::steady_clock::now();
-    //for (auto &[range, prog] : mesh_workload.get_programs()) {
+    // auto t_compile_begin = std::chrono::steady_clock::now();
+    // for (auto &[range, prog] : mesh_workload.get_programs()) {
     //    tt_metal::detail::CompileProgram(device->get_devices()[0], prog);
     //}
-    //auto t_compile_end = std::chrono::steady_clock::now();
-    //auto compile_time =
+    // auto t_compile_end = std::chrono::steady_clock::now();
+    // auto compile_time =
     //  std::chrono::duration_cast<std::chrono::microseconds>(t_compile_end -
     //                               t_compile_begin)
     //    .count();

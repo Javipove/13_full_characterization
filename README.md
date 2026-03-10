@@ -419,6 +419,9 @@ The table below tracks configurations explicitly validated or currently under va
 | `--test 1` | ComputeMM | `DRAM` | `2x2` grid | ⚠️ Not yet passing | Same failure signature as `1x1` in current debug state. |
 | `--test 3` | Host Pipeline ComputeMM | Host-only | FP32→BFP8→DRAM→BFP8→FP32 | ✅ Included in validation scope | Implemented and ready for scaling/overhead campaigns (no kernel dispatch). |
 | `--test 4` | Host Pipeline Empty Tensor | Host-only | Single-tensor host pipeline | ✅ Included in validation scope | Implemented and ready for baseline host overhead studies. |
+| `--test 1` | ComputeMM | `DRAM` | Large matrices (e.g. `4096x4096x4096`) | ✅ Proven working | Full MeshBuffer API migration (`MeshBuffer::create`, `EnqueueWriteMeshBuffer`, `ReadShard`, `get_device_buffer()->address()`). Dynamic L1 block solver prevents CB overflow. |
+| `--test 3` | Host Pipeline ComputeMM | Host-only | MeshBuffer distributed API | ✅ Proven working | Migrated from `CreateBuffer`/`EnqueueWriteBuffer` to `MeshBuffer::create`/`EnqueueWriteMeshBuffer`/`ReadShard`. |
+| `--test 4` | Host Pipeline Empty Tensor | Host-only | MeshBuffer distributed API | ✅ Proven working | Migrated from `EnqueueWriteBuffer`/`EnqueueReadBuffer` to `EnqueueWriteMeshBuffer`/`ReadShard`. |
 
 Notes:
 
