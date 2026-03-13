@@ -121,6 +121,14 @@
 #include <tracy/Tracy.hpp>
 #include <tt-metalium/tilize_utils.hpp>
 
+// ttnn
+#include <ttnn/distributed/distributed.hpp>
+#include <ttnn/operations/core/core.hpp>
+#include <ttnn/operations/creation.hpp>
+#include <ttnn/operations/data_movement/data_movement.hpp>
+#include <ttnn/tensor/tensor.hpp>
+
+
 using namespace tt;
 using namespace tt::tt_metal;
 
@@ -191,6 +199,7 @@ struct TestParams {
   uint32_t cpu_id;
   uint32_t clean_mode;
   TestType test;
+  bool unpack_device; // true: device, false: cpu
 };
 
 struct DeviceParams {
@@ -215,7 +224,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   uint32_t cpu_id;
   uint32_t clean_mode;
   TestType test;
+  bool unpack_device = false;
   uint32_t test_uint;
+  std::string unpack_tile_str;
   try {
     // Matrix related args
     std::tie(M, input_args) =
@@ -270,6 +281,19 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--test", 5);
+
+    std::tie(unpack_tile_str, input_args) =
+        test_args::get_command_option_with_remaining_args(
+            input_args, "--unpack-tile", "cpu");
+    if (unpack_tile_str == "device") {
+      unpack_device = true;
+    } else if (unpack_tile_str == "cpu") {
+      unpack_device = false;
+    } else {
+      throw std::runtime_error("Invalid --unpack-tile value: " +
+                               unpack_tile_str + ". Must be 'cpu' or 'device'");
+    }
+
     if (test_uint > static_cast<uint32_t>(TestType::InvalidTest)) {
       throw std::runtime_error("Invalid --test value");
     }
@@ -316,7 +340,8 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .num_rt_args = num_rt_args,
                     .cpu_id = cpu_id,
                     .clean_mode = clean_mode,
-                    .test = test};
+                    .test = test,
+                    .unpack_device = unpack_device};
   return params;
 }
 
@@ -507,6 +532,9 @@ struct BenchmarkInputs {
       in1_buffer; // IN1 (B matrix) in DRAM
   std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>
       out_buffer; // Output (C matrix) in DRAM
+
+  // Keep ttnn tensors alive if used for on-device tilization
+  std::vector<ttnn::Tensor> ttnn_tensors;
 };
 
 // ============================================================================
@@ -563,7 +591,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
     uint32_t start_core_y = 0,
-    tt::DataFormat data_format = tt::DataFormat::Bfp8_b);
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
+    bool unpack_device = false);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -666,7 +695,7 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
       auto inputs_split = prepare_inputs_compute_mm(
           device, split_grid_size, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
           in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          /*use_dram=*/false, start_y, data_format);
+          /*use_dram=*/false, start_y, data_format, params.unpack_device);
     }
 
     // 3. Profiling Loop (Standard Dispatch)
@@ -981,26 +1010,29 @@ std::vector<float> matmul_reference(const std::vector<float> &a,
 // ============================================================================
 // These encapsulate the different conversion pipelines for BFP8 and BF16:
 //   BFP8:  FP32 → tilize_swizzled<float>     → pack_as_bfp8_tiles         → u32
-//   BF16:  FP32 → bfloat16() → tilize_swizzled<bf16> → swizzled_to_nfaces → pack_bf16 → u32
+//   BF16:  FP32 → bfloat16() → tilize_swizzled<bf16> → swizzled_to_nfaces →
+//   pack_bf16 → u32
 //
-//   BFP8:  u32 → unpack_bfp8_tiles → untilize_swizzled<float>              → FP32
-//   BF16:  u32 → unpack_bf16 → nfaces_to_swizzled → untilize_swizzled<bf16> → to_float → FP32
+//   BFP8:  u32 → unpack_bfp8_tiles → untilize_swizzled<float>              →
+//   FP32 BF16:  u32 → unpack_bf16 → nfaces_to_swizzled →
+//   untilize_swizzled<bf16> → to_float → FP32
 // ============================================================================
 
-std::vector<uint32_t> pack_tilized_fp32_to_device_format(
-    const std::vector<float>& fp32_vec,
-    uint32_t rows, uint32_t cols,
-    tt::DataFormat data_format) {
+std::vector<uint32_t>
+pack_tilized_fp32_to_device_format(const std::vector<float> &fp32_vec,
+                                   uint32_t rows, uint32_t cols,
+                                   tt::DataFormat data_format) {
   if (data_format == tt::DataFormat::Bfp8_b) {
     auto tilized = tilize_swizzled(fp32_vec, rows, cols);
-    return pack_as_bfp8_tiles(
-        tt::stl::make_const_span(tilized), /*row_major_input=*/true,
-        /*is_exp_a=*/false);
+    return pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
+                              /*row_major_input=*/true,
+                              /*is_exp_a=*/false);
   } else {
     // Float16_b (BFLOAT16) path
     std::vector<bfloat16> bf16_vec;
     bf16_vec.reserve(fp32_vec.size());
-    for (float f : fp32_vec) bf16_vec.push_back(bfloat16(f));
+    for (float f : fp32_vec)
+      bf16_vec.push_back(bfloat16(f));
     auto tilized = tilize_swizzled(bf16_vec, rows, cols);
     auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
         tt::stl::make_const_span(tilized));
@@ -1008,10 +1040,9 @@ std::vector<uint32_t> pack_tilized_fp32_to_device_format(
   }
 }
 
-std::vector<float> unpack_device_tiles_to_fp32(
-    const std::vector<uint32_t>& packed,
-    uint32_t rows, uint32_t cols,
-    tt::DataFormat data_format) {
+std::vector<float>
+unpack_device_tiles_to_fp32(const std::vector<uint32_t> &packed, uint32_t rows,
+                            uint32_t cols, tt::DataFormat data_format) {
   if (data_format == tt::DataFormat::Bfp8_b) {
     auto unpacked = unpack_bfp8_tiles_into_float_vec(
         packed, /*row_major_output=*/true, /*is_exp_a=*/false);
@@ -1024,7 +1055,8 @@ std::vector<float> unpack_device_tiles_to_fp32(
     auto untilized = untilize_swizzled(swizzled, rows, cols);
     std::vector<float> result;
     result.reserve(untilized.size());
-    for (const auto& v : untilized) result.push_back(static_cast<float>(v));
+    for (const auto &v : untilized)
+      result.push_back(static_cast<float>(v));
     return result;
   }
 }
@@ -1035,7 +1067,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
-    uint32_t start_core_y, tt::DataFormat data_format) {
+    uint32_t start_core_y, tt::DataFormat data_format, bool unpack_device) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   BenchmarkInputs inputs;
@@ -1055,7 +1087,92 @@ BenchmarkInputs prepare_inputs_compute_mm(
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
   auto *target_device = device->get_devices()[0];
 
-  if (use_dram) {
+  if (unpack_device && use_dram) {
+    ZoneScopedN("Prepare Inputs On-Device (ttnn)");
+
+    ttnn::DataType output_dtype = (data_format == tt::DataFormat::Bfp8_b)
+                                      ? ttnn::DataType::BFLOAT8_B
+                                      : ttnn::DataType::BFLOAT16;
+
+    // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) on device ----
+    {
+      ZoneScopedN("ttnn::IN0_Prepare");
+      // Use rank 4 shape for ttnn compatibility (1, 1, H, W)
+      ttnn::Shape shape({1, 1, Mt * 32, Kt * 32});
+      
+      auto host_tensor_a = ttnn::Tensor::from_vector(
+          inputs.in0_vec, // Not using std::move because we need it for validation
+          ttnn::TensorSpec(
+              shape,
+              ttnn::TensorLayout(ttnn::DataType::FLOAT32, ttnn::PageConfig(ttnn::Layout::ROW_MAJOR))
+          )
+      );
+
+      auto device_tensor_a_rm = host_tensor_a.to_device(device);
+      auto device_tensor_a_tiled = device_tensor_a_rm.to_layout(ttnn::Layout::TILE);
+      auto device_tensor_a_final = ttnn::typecast(device_tensor_a_tiled, output_dtype);
+
+      inputs.in0_buffer = device_tensor_a_final.device_storage().get_mesh_buffer();
+      inputs.ttnn_tensors.push_back(device_tensor_a_final);
+    }
+
+    // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) on device ----
+    {
+      ZoneScopedN("ttnn::IN1_Prepare");
+      ttnn::Shape shape({1, 1, Kt * 32, Nt * 32});
+
+      auto host_tensor_b = ttnn::Tensor::from_vector(
+          inputs.in1_vec, // Not using std::move because we need it for validation
+          ttnn::TensorSpec(
+              shape,
+              ttnn::TensorLayout(ttnn::DataType::FLOAT32, ttnn::PageConfig(ttnn::Layout::ROW_MAJOR))
+          )
+      );
+
+      auto device_tensor_b_rm = host_tensor_b.to_device(device);
+      auto device_tensor_b_tiled = device_tensor_b_rm.to_layout(ttnn::Layout::TILE);
+      auto device_tensor_b_final = ttnn::typecast(device_tensor_b_tiled, output_dtype);
+
+      inputs.in1_buffer = device_tensor_b_final.device_storage().get_mesh_buffer();
+      inputs.ttnn_tensors.push_back(device_tensor_b_final);
+    }
+
+    // ---- DRAM Step 3: Wait for all on-device operations to finish ----
+    {
+      ZoneScopedN("ttnn::Sync");
+      tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+    }
+
+    // ---- DRAM Step 4: Create empty output buffer ----
+    {
+      uint32_t out_num_tiles = Mt * Nt;
+      uint32_t out_size_bytes = out_num_tiles * single_tile_size;
+      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
+          .page_size = single_tile_size,
+          .buffer_type = tt_metal::BufferType::DRAM,
+      };
+      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+          .size = out_size_bytes};
+
+      inputs.out_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+          global_buf, device_local, device);
+    }
+
+    // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
+    {
+      ZoneScopedN("ComputeMM Host CPU: MMIO L1 Zero Padding Setup");
+      uint32_t num_cores_y = core_range.y;
+      uint32_t num_cores_x = core_range.x;
+      for (uint32_t y = 0; y < num_cores_y; y++) {
+        for (uint32_t x = 0; x < num_cores_x; x++) {
+          CoreCoord core = {(std::size_t)x, (std::size_t)(y + start_core_y)};
+          tt_metal::detail::WriteToDeviceL1(target_device, core, in2_cb_addr,
+                                            in2);
+        }
+      }
+    }
+
+  } else if (use_dram) {
     ZoneScopedN("Prepare DRAM Inputs");
 
     // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) ----
@@ -1067,8 +1184,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     std::vector<uint32_t> in0_packed;
     {
       ZoneScopedN("Tilize and Pack IN0 (DRAM)");
-      in0_packed = pack_tilized_fp32_to_device_format(
-          inputs.in0_vec, Mt * 32, Kt * 32, data_format);
+      in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
+                                                      Kt * 32, data_format);
 
       // Create a DRAM interleaved buffer to hold Mt*Kt tiles.
       // InterleavedBufferConfig tells the allocator to distribute tiles
@@ -1102,8 +1219,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     {
       ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN0");
       // Update inputs.in0_vec with effective quantized values for validation
-      inputs.in0_vec = unpack_device_tiles_to_fp32(
-          in0_packed, Mt * 32, Kt * 32, data_format);
+      inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed, Mt * 32, Kt * 32,
+                                                   data_format);
     }
 
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) ----
@@ -1112,8 +1229,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     std::vector<uint32_t> in1_packed;
     {
       ZoneScopedN("Tilize and Pack IN1 (DRAM)");
-      in1_packed = pack_tilized_fp32_to_device_format(
-          inputs.in1_vec, Kt * 32, Nt * 32, data_format);
+      in1_packed = pack_tilized_fp32_to_device_format(inputs.in1_vec, Kt * 32,
+                                                      Nt * 32, data_format);
 
       uint32_t in1_num_tiles = Kt * Nt;
       uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
@@ -1139,8 +1256,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     {
       ZoneScopedN("ComputeMM Host CPU: Decode Validation Golden IN1");
       // Update inputs.in1_vec with effective quantized values for validation
-      inputs.in1_vec = unpack_device_tiles_to_fp32(
-          in1_packed, Kt * 32, Nt * 32, data_format);
+      inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed, Kt * 32, Nt * 32,
+                                                   data_format);
     }
 
     // ---- DRAM Step 3: Create empty output buffer ----
@@ -1214,8 +1331,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
             inputs.in0_vec, r * per_core_Mt * 32, num_r * 32, Mt * 32, Kt * 32);
         auto in0_block_slice =
             get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-        in0 = pack_tilized_fp32_to_device_format(
-            in0_block_slice, num_r * 32, in0_block_w * 32, data_format);
+        in0 = pack_tilized_fp32_to_device_format(in0_block_slice, num_r * 32,
+                                                 in0_block_w * 32, data_format);
       }
 
       for (int c = 0; c < (int)num_cores_x; c++) {
@@ -1834,7 +1951,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         inputs = prepare_inputs_compute_mm(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-            params.use_dram, 0, data_format);
+            params.use_dram, 0, data_format, params.unpack_device);
       }
 
       {
@@ -1926,8 +2043,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           {
             ZoneScopedN("ComputeMM Host Decode DRAM");
             // Unpack and untilize the full output
-            device_vec = unpack_device_tiles_to_fp32(
-                out_data, Mt * 32, Nt * 32, data_format);
+            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
+                                                     data_format);
             // Trim to actual M x N if needed
             if (device_vec.size() > (size_t)(params.M * params.N)) {
               std::vector<float> trimmed(params.M * params.N, 0.0f);
@@ -1941,8 +2058,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           }
         } else {
           // === L1 Readback (per-core: read all raw tiles first) ===
-          std::vector<std::vector<uint32_t>> all_core_tiles(
-              num_cores_y * num_cores_x);
+          std::vector<std::vector<uint32_t>> all_core_tiles(num_cores_y *
+                                                            num_cores_x);
           for (int y = 0; y < (int)num_cores_y; y++) {
             for (int x = 0; x < (int)num_cores_x; x++) {
               CoreCoord core = {(std::size_t)x, (std::size_t)y};
@@ -1961,8 +2078,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             for (int y = 0; y < (int)num_cores_y; y++) {
               for (int x = 0; x < (int)num_cores_x; x++) {
                 auto core_data_untilized = unpack_device_tiles_to_fp32(
-                    all_core_tiles[y * num_cores_x + x],
-                    per_core_Mt * 32, per_core_Nt * 32, data_format);
+                    all_core_tiles[y * num_cores_x + x], per_core_Mt * 32,
+                    per_core_Nt * 32, data_format);
 
                 uint32_t global_r_start = y * per_core_Mt * 32;
                 uint32_t global_c_start = x * per_core_Nt * 32;
@@ -1971,10 +2088,11 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
 
                 for (uint32_t r = 0; r < r_len; ++r) {
                   for (uint32_t c = 0; c < c_len; ++c) {
-                    uint32_t global_idx =
-                        (global_r_start + r) * (params.N) + (global_c_start + c);
+                    uint32_t global_idx = (global_r_start + r) * (params.N) +
+                                          (global_c_start + c);
                     if (global_idx < device_vec.size()) {
-                      device_vec[global_idx] = core_data_untilized[r * c_len + c];
+                      device_vec[global_idx] =
+                          core_data_untilized[r * c_len + c];
                     }
                   }
                 }
@@ -2088,9 +2206,9 @@ bool test_host_pipeline_compute_mm(
       return false;
     }
 
-
     tt::DataFormat pipeline_data_format = (params.dtype == 0)
-        ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
+                                              ? tt::DataFormat::Bfp8_b
+                                              : tt::DataFormat::Float16_b;
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t in0_num_tiles = Mt * Kt;
@@ -2261,9 +2379,9 @@ bool test_host_pipeline_empty_tensor(
       return false;
     }
 
-
     tt::DataFormat pipeline_data_format = (params.dtype == 0)
-        ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
+                                              ? tt::DataFormat::Bfp8_b
+                                              : tt::DataFormat::Float16_b;
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
