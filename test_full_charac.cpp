@@ -283,7 +283,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                                                                 "--test", 5);
 
     std::tie(unpack_tile_str, input_args) =
-        test_args::get_command_option_with_remaining_args(
+        test_args::get_command_option_and_remaining_args(
             input_args, "--unpack-tile", "cpu");
     if (unpack_tile_str == "device") {
       unpack_device = true;
@@ -1100,17 +1100,16 @@ BenchmarkInputs prepare_inputs_compute_mm(
       // Use rank 4 shape for ttnn compatibility (1, 1, H, W)
       ttnn::Shape shape({1, 1, Mt * 32, Kt * 32});
       
-      auto host_tensor_a = ttnn::Tensor::from_vector(
-          inputs.in0_vec, // Not using std::move because we need it for validation
-          ttnn::TensorSpec(
-              shape,
-              ttnn::TensorLayout(ttnn::DataType::FLOAT32, ttnn::PageConfig(ttnn::Layout::ROW_MAJOR))
-          )
+      auto host_tensor_a = ttnn::Tensor(
+          tt::tt_metal::HostBuffer(inputs.in0_vec), // Not moving to keep for validation
+          shape,
+          ttnn::DataType::FLOAT32,
+          ttnn::Layout::ROW_MAJOR
       );
 
       auto device_tensor_a_rm = host_tensor_a.to_device(device);
       auto device_tensor_a_tiled = device_tensor_a_rm.to_layout(ttnn::Layout::TILE);
-      auto device_tensor_a_final = ttnn::typecast(device_tensor_a_tiled, output_dtype);
+      auto device_tensor_a_final = ttnn::to_dtype(device_tensor_a_tiled, output_dtype);
 
       inputs.in0_buffer = device_tensor_a_final.device_storage().get_mesh_buffer();
       inputs.ttnn_tensors.push_back(device_tensor_a_final);
@@ -1121,17 +1120,16 @@ BenchmarkInputs prepare_inputs_compute_mm(
       ZoneScopedN("ttnn::IN1_Prepare");
       ttnn::Shape shape({1, 1, Kt * 32, Nt * 32});
 
-      auto host_tensor_b = ttnn::Tensor::from_vector(
-          inputs.in1_vec, // Not using std::move because we need it for validation
-          ttnn::TensorSpec(
-              shape,
-              ttnn::TensorLayout(ttnn::DataType::FLOAT32, ttnn::PageConfig(ttnn::Layout::ROW_MAJOR))
-          )
+      auto host_tensor_b = ttnn::Tensor(
+          tt::tt_metal::HostBuffer(inputs.in1_vec), // Not moving to keep for validation
+          shape,
+          ttnn::DataType::FLOAT32,
+          ttnn::Layout::ROW_MAJOR
       );
 
       auto device_tensor_b_rm = host_tensor_b.to_device(device);
       auto device_tensor_b_tiled = device_tensor_b_rm.to_layout(ttnn::Layout::TILE);
-      auto device_tensor_b_final = ttnn::typecast(device_tensor_b_tiled, output_dtype);
+      auto device_tensor_b_final = ttnn::to_dtype(device_tensor_b_tiled, output_dtype);
 
       inputs.in1_buffer = device_tensor_b_final.device_storage().get_mesh_buffer();
       inputs.ttnn_tensors.push_back(device_tensor_b_final);
@@ -2045,8 +2043,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             // 2. Typecast to FLOAT32 on device
             ttnn::Tensor device_tensor_fp32;
             {
-                ZoneScopedN("ttnn::typecast(FLOAT32)");
-                device_tensor_fp32 = ttnn::typecast(device_tensor_rm, ttnn::DataType::FLOAT32);
+                ZoneScopedN("ttnn::to_dtype(FLOAT32)");
+                device_tensor_fp32 = ttnn::to_dtype(device_tensor_rm, ttnn::DataType::FLOAT32);
             }
 
             // 3. Bring to host as vector<float>
