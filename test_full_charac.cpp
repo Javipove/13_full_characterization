@@ -1914,7 +1914,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       auto *target_device = device->get_devices()[0];
 
       {
-        ZoneScopedN("ComputeMM Host Device Readback and Decode");
+        ZoneScopedN("ComputeMM Host Device Readback");
         if (params.use_dram) {
           // === DRAM Readback ===
           // Read entire output buffer from DRAM
@@ -1923,48 +1923,59 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
               device->mesh_command_queue(), out_data, inputs.out_buffer,
               tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
 
-          // Unpack and untilize the full output
-          device_vec = unpack_device_tiles_to_fp32(
-              out_data, Mt * 32, Nt * 32, data_format);
-          // Trim to actual M x N if needed
-          if (device_vec.size() > (size_t)(params.M * params.N)) {
-            std::vector<float> trimmed(params.M * params.N, 0.0f);
-            for (uint32_t r = 0; r < params.M; ++r) {
-              for (uint32_t c = 0; c < params.N; ++c) {
-                trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+          {
+            ZoneScopedN("ComputeMM Host Decode DRAM");
+            // Unpack and untilize the full output
+            device_vec = unpack_device_tiles_to_fp32(
+                out_data, Mt * 32, Nt * 32, data_format);
+            // Trim to actual M x N if needed
+            if (device_vec.size() > (size_t)(params.M * params.N)) {
+              std::vector<float> trimmed(params.M * params.N, 0.0f);
+              for (uint32_t r = 0; r < params.M; ++r) {
+                for (uint32_t c = 0; c < params.N; ++c) {
+                  trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                }
               }
+              device_vec = trimmed;
             }
-            device_vec = trimmed;
           }
         } else {
-          // === L1 Readback (per-core stitching) ===
+          // === L1 Readback (per-core: read all raw tiles first) ===
+          std::vector<std::vector<uint32_t>> all_core_tiles(
+              num_cores_y * num_cores_x);
           for (int y = 0; y < (int)num_cores_y; y++) {
             for (int x = 0; x < (int)num_cores_x; x++) {
               CoreCoord core = {(std::size_t)x, (std::size_t)y};
               uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
               uint32_t read_size = core_n_tiles * single_tile_size;
 
-              std::vector<uint32_t> core_data_tiles;
-              tt_metal::detail::ReadFromDeviceL1(target_device, core, out_addr,
-                                                 read_size, core_data_tiles);
+              tt_metal::detail::ReadFromDeviceL1(
+                  target_device, core, out_addr, read_size,
+                  all_core_tiles[y * num_cores_x + x]);
+            }
+          }
 
-              // Unpack and Untilize
-              auto core_data_untilized = unpack_device_tiles_to_fp32(
-                  core_data_tiles, per_core_Mt * 32, per_core_Nt * 32,
-                  data_format);
+          {
+            ZoneScopedN("ComputeMM Host Decode L1");
+            // Unpack & stitch all cores
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                auto core_data_untilized = unpack_device_tiles_to_fp32(
+                    all_core_tiles[y * num_cores_x + x],
+                    per_core_Mt * 32, per_core_Nt * 32, data_format);
 
-              // Copy into global device_vec
-              uint32_t global_r_start = y * per_core_Mt * 32;
-              uint32_t global_c_start = x * per_core_Nt * 32;
-              uint32_t r_len = per_core_Mt * 32;
-              uint32_t c_len = per_core_Nt * 32;
+                uint32_t global_r_start = y * per_core_Mt * 32;
+                uint32_t global_c_start = x * per_core_Nt * 32;
+                uint32_t r_len = per_core_Mt * 32;
+                uint32_t c_len = per_core_Nt * 32;
 
-              for (uint32_t r = 0; r < r_len; ++r) {
-                for (uint32_t c = 0; c < c_len; ++c) {
-                  uint32_t global_idx =
-                      (global_r_start + r) * (params.N) + (global_c_start + c);
-                  if (global_idx < device_vec.size()) {
-                    device_vec[global_idx] = core_data_untilized[r * c_len + c];
+                for (uint32_t r = 0; r < r_len; ++r) {
+                  for (uint32_t c = 0; c < c_len; ++c) {
+                    uint32_t global_idx =
+                        (global_r_start + r) * (params.N) + (global_c_start + c);
+                    if (global_idx < device_vec.size()) {
+                      device_vec[global_idx] = core_data_untilized[r * c_len + c];
+                    }
                   }
                 }
               }
