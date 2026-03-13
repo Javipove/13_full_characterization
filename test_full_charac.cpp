@@ -1143,19 +1143,16 @@ BenchmarkInputs prepare_inputs_compute_mm(
       tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
-    // ---- DRAM Step 4: Create empty output buffer ----
+    // ---- DRAM Step 4: Create empty output buffer via ttnn ----
     {
-      uint32_t out_num_tiles = Mt * Nt;
-      uint32_t out_size_bytes = out_num_tiles * single_tile_size;
-      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
-          .page_size = single_tile_size,
-          .buffer_type = tt_metal::BufferType::DRAM,
-      };
-      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
-          .size = out_size_bytes};
+      ZoneScopedN("ttnn::Output_Prepare");
+      ttnn::Shape shape({1, 1, Mt * 32, Nt * 32});
 
-      inputs.out_buffer = tt::tt_metal::distributed::MeshBuffer::create(
-          global_buf, device_local, device);
+      auto device_tensor_out = ttnn::empty(shape, output_dtype, ttnn::Layout::TILE,
+                                           device, ttnn::DRAM_MEMORY_CONFIG);
+
+      inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
+      inputs.ttnn_tensors.push_back(device_tensor_out);
     }
 
     // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
@@ -2033,18 +2030,31 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       {
         ZoneScopedN("ComputeMM Host Device Readback");
         if (params.use_dram) {
-          // === DRAM Readback ===
-          // Read entire output buffer from DRAM
-          std::vector<uint32_t> out_data;
-          tt::tt_metal::distributed::ReadShard(
-              device->mesh_command_queue(), out_data, inputs.out_buffer,
-              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+          if (params.unpack_device) {
+            ZoneScopedN("ComputeMM Host Device Unpack (ttnn)");
+            // Retrieve output tensor from ttnn_tensors (it's the last one added)
+            auto &device_tensor_out = inputs.ttnn_tensors.back();
 
-          {
-            ZoneScopedN("ComputeMM Host Decode DRAM");
-            // Unpack and untilize the full output
-            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
-                                                     data_format);
+            // 1. Convert to ROW_MAJOR layout on device
+            ttnn::Tensor device_tensor_rm;
+            {
+                ZoneScopedN("ttnn::to_layout(ROW_MAJOR)");
+                device_tensor_rm = device_tensor_out.to_layout(ttnn::Layout::ROW_MAJOR);
+            }
+
+            // 2. Typecast to FLOAT32 on device
+            ttnn::Tensor device_tensor_fp32;
+            {
+                ZoneScopedN("ttnn::typecast(FLOAT32)");
+                device_tensor_fp32 = ttnn::typecast(device_tensor_rm, ttnn::DataType::FLOAT32);
+            }
+
+            // 3. Bring to host as vector<float>
+            {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_fp32.to_vector<float>();
+            }
+
             // Trim to actual M x N if needed
             if (device_vec.size() > (size_t)(params.M * params.N)) {
               std::vector<float> trimmed(params.M * params.N, 0.0f);
@@ -2054,6 +2064,30 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                 }
               }
               device_vec = trimmed;
+            }
+          } else {
+            // === DRAM Readback ===
+            // Read entire output buffer from DRAM
+            std::vector<uint32_t> out_data;
+            tt::tt_metal::distributed::ReadShard(
+                device->mesh_command_queue(), out_data, inputs.out_buffer,
+                tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+
+            {
+              ZoneScopedN("ComputeMM Host Decode DRAM");
+              // Unpack and untilize the full output
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
+                                                       data_format);
+              // Trim to actual M x N if needed
+              if (device_vec.size() > (size_t)(params.M * params.N)) {
+                std::vector<float> trimmed(params.M * params.N, 0.0f);
+                for (uint32_t r = 0; r < params.M; ++r) {
+                  for (uint32_t c = 0; c < params.N; ++c) {
+                    trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                  }
+                }
+                device_vec = trimmed;
+              }
             }
           }
         } else {
