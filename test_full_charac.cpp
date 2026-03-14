@@ -122,12 +122,13 @@
 #include <tt-metalium/tilize_utils.hpp>
 
 // ttnn
-#include <ttnn/distributed/distributed.hpp>
-#include <ttnn/operations/core/core.hpp>
-#include <ttnn/operations/creation.hpp>
-#include <ttnn/operations/data_movement/data_movement.hpp>
-#include <ttnn/tensor/tensor.hpp>
-
+// #include <ttnn/distributed/distributed.hpp>
+#include <ttnn/operations/core/core.hpp> // Covers to_device, to_layout, to_dtype
+#include <ttnn/operations/creation.hpp>  // Covers empty()
+#include <ttnn/operations/data_movement/tilize/tilize.hpp>
+#include <ttnn/operations/data_movement/untilize/untilize.hpp>
+#include <ttnn/tensor/tensor.hpp>        // Core Tensor class
+#include <ttnn/tensor/tensor_utils.hpp> // Required for host-side data conversion helpers
 
 using namespace tt;
 using namespace tt::tt_metal;
@@ -165,12 +166,12 @@ void log_validation_sample_pairs(const std::string &tag,
 // Default values for benchmark parameters
 ////////////////////////////////////////////////////////////////////////////////////////
 
-constexpr uint32_t DEFAULT_ITERATIONS = 10000;
+// constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 // constexpr uint32_t DEFAULT_WARMUP_ITERATIONS = 100;
 // constexpr uint32_t MIN_KERNEL_SIZE_BYTES = 32;  // overhead
 // constexpr uint32_t DEFAULT_KERNEL_SIZE_K = 1;
 // constexpr uint32_t MAX_CBS = 32;
-constexpr uint32_t MAX_ARGS = 255;
+// constexpr uint32_t MAX_ARGS = 255;
 
 enum class TestType : uint32_t {
   EmptyKernelLaunch = 0,
@@ -197,6 +198,7 @@ struct TestParams {
   bool bypass_check;
   uint32_t num_rt_args;
   uint32_t cpu_id;
+  uint32_t cpu_range;
   uint32_t clean_mode;
   TestType test;
   bool unpack_device; // true: device, false: cpu
@@ -222,6 +224,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t cpu_id;
+  uint32_t cpu_range;
   uint32_t clean_mode;
   TestType test;
   bool unpack_device = false;
@@ -273,6 +276,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(cpu_id, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
             input_args, "--cpu", 0xFFFFFFFF);
+    std::tie(cpu_range, input_args) =
+        test_args::get_command_option_uint32_and_remaining_args(
+            input_args, "--cpu-range", 4);
 
     std::tie(clean_mode, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
@@ -339,6 +345,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .bypass_check = bypass_check,
                     .num_rt_args = num_rt_args,
                     .cpu_id = cpu_id,
+                    .cpu_range = cpu_range,
                     .clean_mode = clean_mode,
                     .test = test,
                     .unpack_device = unpack_device};
@@ -1021,7 +1028,7 @@ std::vector<float> matmul_reference(const std::vector<float> &a,
 std::vector<uint32_t>
 pack_tilized_fp32_to_device_format(const std::vector<float> &fp32_vec,
                                    uint32_t rows, uint32_t cols,
-                                   tt::DataFormat data_format) {
+                                   const tt::DataFormat data_format) {
   if (data_format == tt::DataFormat::Bfp8_b) {
     auto tilized = tilize_swizzled(fp32_vec, rows, cols);
     return pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
@@ -1031,8 +1038,9 @@ pack_tilized_fp32_to_device_format(const std::vector<float> &fp32_vec,
     // Float16_b (BFLOAT16) path
     std::vector<bfloat16> bf16_vec;
     bf16_vec.reserve(fp32_vec.size());
-    for (float f : fp32_vec)
-      bf16_vec.push_back(bfloat16(f));
+    std::transform(fp32_vec.begin(), fp32_vec.end(),
+                   std::back_inserter(bf16_vec),
+                   [](float f) { return bfloat16(f); });
     auto tilized = tilize_swizzled(bf16_vec, rows, cols);
     auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
         tt::stl::make_const_span(tilized));
@@ -1042,7 +1050,7 @@ pack_tilized_fp32_to_device_format(const std::vector<float> &fp32_vec,
 
 std::vector<float>
 unpack_device_tiles_to_fp32(const std::vector<uint32_t> &packed, uint32_t rows,
-                            uint32_t cols, tt::DataFormat data_format) {
+                            uint32_t cols, const tt::DataFormat data_format) {
   if (data_format == tt::DataFormat::Bfp8_b) {
     auto unpacked = unpack_bfp8_tiles_into_float_vec(
         packed, /*row_major_output=*/true, /*is_exp_a=*/false);
@@ -1055,8 +1063,9 @@ unpack_device_tiles_to_fp32(const std::vector<uint32_t> &packed, uint32_t rows,
     auto untilized = untilize_swizzled(swizzled, rows, cols);
     std::vector<float> result;
     result.reserve(untilized.size());
-    for (const auto &v : untilized)
-      result.push_back(static_cast<float>(v));
+    std::transform(untilized.begin(), untilized.end(),
+                   std::back_inserter(result),
+                   [](const bfloat16 &v) { return static_cast<float>(v); });
     return result;
   }
 }
@@ -1097,41 +1106,34 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) on device ----
     {
       ZoneScopedN("ttnn::IN0_Prepare");
-      // Use rank 4 shape for ttnn compatibility (1, 1, H, W)
       ttnn::Shape shape({1, 1, Mt * 32, Kt * 32});
-      
-      auto host_tensor_a = ttnn::Tensor(
-          tt::tt_metal::HostBuffer(inputs.in0_vec), // Not moving to keep for validation
-          shape,
-          ttnn::DataType::FLOAT32,
-          ttnn::Layout::ROW_MAJOR
-      );
+      auto host_tensor_a =
+          ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in0_vec), shape,
+                       ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
 
       auto device_tensor_a_rm = host_tensor_a.to_device(device);
-      auto device_tensor_a_tiled = device_tensor_a_rm.to_layout(ttnn::Layout::TILE);
-      auto device_tensor_a_final = ttnn::to_dtype(device_tensor_a_tiled, output_dtype);
+      auto device_tensor_a_final =
+          ttnn::tilize(device_tensor_a_rm, std::nullopt, output_dtype);
 
-      inputs.in0_buffer = device_tensor_a_final.device_storage().get_mesh_buffer();
+      inputs.in0_buffer =
+          device_tensor_a_final.device_storage().get_mesh_buffer();
       inputs.ttnn_tensors.push_back(device_tensor_a_final);
     }
 
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) on device ----
     {
       ZoneScopedN("ttnn::IN1_Prepare");
-      ttnn::Shape shape({1, 1, Kt * 32, Nt * 32});
-
-      auto host_tensor_b = ttnn::Tensor(
-          tt::tt_metal::HostBuffer(inputs.in1_vec), // Not moving to keep for validation
-          shape,
-          ttnn::DataType::FLOAT32,
-          ttnn::Layout::ROW_MAJOR
-      );
+      ttnn::Shape shape_b({1, 1, Kt * 32, Nt * 32});
+      auto host_tensor_b =
+          ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in1_vec), shape_b,
+                       ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
 
       auto device_tensor_b_rm = host_tensor_b.to_device(device);
-      auto device_tensor_b_tiled = device_tensor_b_rm.to_layout(ttnn::Layout::TILE);
-      auto device_tensor_b_final = ttnn::to_dtype(device_tensor_b_tiled, output_dtype);
+      auto device_tensor_b_final =
+          ttnn::tilize(device_tensor_b_rm, std::nullopt, output_dtype);
 
-      inputs.in1_buffer = device_tensor_b_final.device_storage().get_mesh_buffer();
+      inputs.in1_buffer =
+          device_tensor_b_final.device_storage().get_mesh_buffer();
       inputs.ttnn_tensors.push_back(device_tensor_b_final);
     }
 
@@ -1146,14 +1148,15 @@ BenchmarkInputs prepare_inputs_compute_mm(
       ZoneScopedN("ttnn::Output_Prepare");
       ttnn::Shape shape({1, 1, Mt * 32, Nt * 32});
 
-      auto device_tensor_out = ttnn::empty(shape, output_dtype, ttnn::Layout::TILE,
-                                           device, ttnn::DRAM_MEMORY_CONFIG);
+      auto device_tensor_out =
+          ttnn::empty(shape, output_dtype, ttnn::Layout::TILE, device,
+                      ttnn::DRAM_MEMORY_CONFIG);
 
       inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
       inputs.ttnn_tensors.push_back(device_tensor_out);
     }
 
-    // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
+    // ---- DRAM Step 5: Initialize per-core L1 zero tile for in2 ----
     {
       ZoneScopedN("ComputeMM Host CPU: MMIO L1 Zero Padding Setup");
       uint32_t num_cores_y = core_range.y;
@@ -2030,27 +2033,29 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         if (params.use_dram) {
           if (params.unpack_device) {
             ZoneScopedN("ComputeMM Host Device Unpack (ttnn)");
-            // Retrieve output tensor from ttnn_tensors (it's the last one added)
+            // Retrieve output tensor from ttnn_tensors (it's the last one
+            // added)
             auto &device_tensor_out = inputs.ttnn_tensors.back();
 
-            // 1. Convert to ROW_MAJOR layout on device
+            // 1. Convert to ROW_MAJOR layout on device using ttnn::untilize
             ttnn::Tensor device_tensor_rm;
             {
-                ZoneScopedN("ttnn::to_layout(ROW_MAJOR)");
-                device_tensor_rm = device_tensor_out.to_layout(ttnn::Layout::ROW_MAJOR);
+              ZoneScopedN("ttnn::untilize");
+              device_tensor_rm = ttnn::untilize(device_tensor_out);
             }
 
             // 2. Typecast to FLOAT32 on device
             ttnn::Tensor device_tensor_fp32;
             {
-                ZoneScopedN("ttnn::to_dtype(FLOAT32)");
-                device_tensor_fp32 = ttnn::to_dtype(device_tensor_rm, ttnn::DataType::FLOAT32);
+              ZoneScopedN("ttnn::to_dtype(FLOAT32)");
+              device_tensor_fp32 =
+                  ttnn::to_dtype(device_tensor_rm, ttnn::DataType::FLOAT32);
             }
 
             // 3. Bring to host as vector<float>
             {
-                ZoneScopedN("ttnn::to_vector<float> (Readback)");
-                device_vec = device_tensor_fp32.to_vector<float>();
+              ZoneScopedN("ttnn::to_vector<float> (Readback)");
+              device_vec = device_tensor_fp32.to_vector<float>();
             }
 
             // Trim to actual M x N if needed
@@ -2074,8 +2079,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             {
               ZoneScopedN("ComputeMM Host Decode DRAM");
               // Unpack and untilize the full output
-              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
-                                                       data_format);
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                       Nt * 32, data_format);
               // Trim to actual M x N if needed
               if (device_vec.size() > (size_t)(params.M * params.N)) {
                 std::vector<float> trimmed(params.M * params.N, 0.0f);
@@ -2771,15 +2776,30 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
   return pass;
 }
 
-void pin_to_cpu(int cpu) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  if (sched_setaffinity(0, sizeof(set), &set) != 0) {
-    log_warning(tt::LogTest, "Failed to pin to CPU {}: {}", cpu,
-                std::strerror(errno));
+// Pins the process to a range of CPUs to reduce jitter while allowing for
+// internal parallelism (OpenMP, metal worker threads).
+// Binding to a single core causes severe contention in parallel regions.
+void pin_to_cpu(uint32_t start_cpu_id, uint32_t num_cores_to_pin) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+
+  uint32_t total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+  for (uint32_t i = 0; i < num_cores_to_pin; ++i) {
+    uint32_t target_cpu = (start_cpu_id + i) % total_cpus;
+    CPU_SET(target_cpu, &mask);
+  }
+
+  int result = sched_setaffinity(0, sizeof(mask), &mask);
+  if (result == 0) {
+    log_info(
+        LogTest,
+        "Successfully pinned to CPU range {}-{} (Requested start={}, range={}, "
+        "total={})",
+        start_cpu_id, (start_cpu_id + num_cores_to_pin - 1) % total_cpus,
+        start_cpu_id, num_cores_to_pin, total_cpus);
   } else {
-    log_info(tt::LogTest, "Pinned to CPU {}", cpu);
+    log_warning(LogTest, "Failed to pin to CPU range: {}", strerror(errno));
   }
 }
 
@@ -2847,7 +2867,7 @@ int main(int argc, char **argv) {
   uint32_t max_y = device_params.grid_coord.y;
 
   if (params.cpu_id != 0xFFFFFFFF) {
-    pin_to_cpu(params.cpu_id);
+    pin_to_cpu(params.cpu_id, params.cpu_range);
   }
 
   //// Print test summary

@@ -14,26 +14,34 @@ The benchmark supports the following test types, selected via the `--test` argum
 
 2. **Compute MM (`--test 1`)**:
     * **Purpose**: Benchmarks the "Host Overhead" (Data Generation, Tiling, Transfer) and "Dispatch Overhead" for a standard Matrix Multiplication.
-    * **Mechanism**: Runs a dense MatMul (M x N x K).
-    * **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
-    * **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
+1.  **Empty Kernel Launch (`--test 0`)**:
+    *   **Purpose**: Measures the pure overhead of dispatching and launching kernels with minimal compute/data movement.
+    *   **Mechanism**: Launches empty reader/writer/compute kernels.
 
-3. **Sub-Device Parallelism (`--test 2`)**:
-    * **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
-    * **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
-    * **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
-        * You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
-        * Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
+2.  **Compute MM (`--test 1`)**:
+    *   **Purpose**: Benchmarks the "Host Overhead" (Data Generation, Tiling, Transfer) and "Dispatch Overhead" for a standard Matrix Multiplication.
+    *   **Mechanism**: Runs a dense MatMul (M x N x K).
+    *   **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
+    *   **Acceleration**: Supports on-device data preparation (tilization/packing) and readback (untilization/unpacking) via the `ttnn` C++ API (`--unpack-tile device`).
+    *   **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
+    *   **Datatypes**: Supports BFP8 (`--dtype 0`), BF16 (`--dtype 1`), and FP32 (`--dtype 2`).
 
-4. **Host Pipeline ComputeMM (`--test 3`)**:
-    * **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
-    * **Mechanism**: FP32 generation → tilize → BFP8 pack → DRAM write → DRAM read → BFP8 unpack → untilize.
-    * **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
+3.  **Sub-Device Parallelism (`--test 2`)**:
+    *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
+    *   **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
+    *   **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
+        *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
+        *   Example: Group 1 could use a 4x4 block while Group 2 uses the remaining L-shaped set of cores. This allows modifying `test_full_charac.cpp` to support specific heterogeneous workload scenarios if needed.
 
-5. **Host Pipeline Empty Tensor (`--test 4`)**:
-    * **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
-    * **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
-    * **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
+4.  **Host Pipeline ComputeMM (`--test 3`)**:
+    *   **Purpose**: Measures host-only overhead for the ComputeMM-style tensor pipeline without creating/dispatching any kernels.
+    *   **Mechanism**: FP32 generation → tilize → Pack (BFP8/BF16) → DRAM write → DRAM read → Unpack → untilize.
+    *   **Output**: Per-stage timing (`generate`, `transform`, `write`, `read`, `inverse_transform`, `end_to_end`) and transfer throughput.
+
+5.  **Host Pipeline Empty Tensor (`--test 4`)**:
+    *   **Purpose**: Measures host-only overhead using a single tensor pipeline as a lightweight baseline, with no kernel dispatch.
+    *   **Mechanism**: Same host transform + DRAM write/read + inverse transform path, but for one tensor only.
+    *   **Output**: Stage timing and throughput to isolate pure host/data-path scaling behavior.
 
 ## Host-Only Tests Deep Dive (`--test 3` vs `--test 4`)
 
@@ -44,10 +52,10 @@ Both tests are **host-only data-path benchmarks**. They do not create a `Program
 Each iteration executes:
 
 1. Generate FP32 tensor(s) on host.
-2. Transform to device-ready layout (`tilize_swizzled` + `pack_as_bfp8_tiles`).
-3. Write packed tensor(s) to DRAM (`WriteToBuffer`).
+2. Transform to device-ready layout (tilize + pack to BFP8/BF16).
+3. Write packed tensor(s) to DRAM (`EnqueueWriteBuffer`).
 4. Read packed tensor(s) back from DRAM (`ReadFromBuffer`).
-5. Inverse-transform (`unpack_bfp8_tiles_into_float_vec` + `untilize_swizzled`).
+5. Inverse-transform (unpack + untilize back to row-major FP32).
 6. Optionally validate roundtrip correlation (disabled with `--bypass-check`).
 
 ### What Differentiates Them
@@ -72,7 +80,7 @@ Each iteration executes:
 
 Current constraints:
 
-* Host-only tests currently use the BFP8 pipeline path (`--dtype 0`).
+* Host-only tests support BFP8 (`--dtype 0`) and BF16 (`--dtype 1`).
 * `--num-iters` must be greater than 0.
 
 ### Partitioning Logic Examples
@@ -166,7 +174,7 @@ All currently parsed options are listed below.
 | Matrix | `--m <N>` | `11264` | test 1,2,3,4 | Matrix/tensor M dimension. |
 | Matrix | `--n <N>` | `3072` | test 1,2,3,4 | Matrix/tensor N dimension. |
 | Matrix | `--k <N>` | `768` | test 1,2,3,4 | Matrix/tensor K dimension. |
-| Precision | `--dtype <0-1>` | `0` | test 1,2,3,4 | Data format selector (`0` BFP8, `1` FP16). Host-only paths currently enforce `0`. |
+| Precision | `--dtype <0-2>` | `0` | test 1,2,3,4 | Data format selector (`0` BFP8, `1` BF16, `2` FP32). |
 | Precision | `--fidel <0-1>` | `0` | test 1,2 | Math fidelity selector. |
 | Layout/IO | `--dram` | off | test 1 | Enable DRAM-backed tensor path/kernels for ComputeMM. |
 | Cache | `--cache` | off | all | Enable program cache + persistent kernel cache lifecycle in benchmark run. |
@@ -176,7 +184,9 @@ All currently parsed options are listed below.
 | Grid | `--core_groups <N>` | `1` | test 0,2 | Number of core groups (sub-partitions). Must be `> 0`. |
 | Runtime | `--num-iters <N>` | `15` | all | Benchmark iteration count. |
 | Runtime | `--num-rt-args <N>` | `255` | test 0 | Number of runtime args used by empty-kernel setup path. |
-| Runtime | `--cpu <id>` | `0xFFFFFFFF` | all | Optional CPU affinity pinning. Sentinel means no pinning. |
+| Runtime | `--cpu <id>` | `0xFFFFFFFF` | all | Optional CPU affinity pinning (first core of range). |
+| Runtime | `--cpu-range <N>` | `4` | all | Number of consecutive CPUs to pin to (default 4). Avoids contention with OpenMP. |
+| Runtime | `--unpack-tile <cpu\|device>` | `cpu` | test 1 | Offload data preparation (tilization/packing) and readback (untilization/unpacking) to hardware via `ttnn`. |
 | Validation | `--bypass-check` | off | test 1,3,4 | Skip correctness checks (PCC/RMSE and visual validation samples). |
 
 </details>
@@ -208,6 +218,9 @@ Notes:
 
 # DRAM mode + cache enabled
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --cache --x_size 8 --y_size 8 --m 4096 --n 4096 --k 4096
+
+# On-device tilization/unpacking (ttnn path)
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --unpack-tile device
 ```
 
 #### Sub-Device
@@ -229,7 +242,11 @@ Notes:
 #### CPU pinning (optional)
 
 ```bash
-./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3
+# Pin to 4 cores starting from CPU 3
+./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3 --cpu-range 4
+
+# Pin to exact single core (use cautiously, may cause contention)
+./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 50 --cpu 3 --cpu-range 1
 ```
 
 </details>

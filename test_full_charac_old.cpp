@@ -175,6 +175,7 @@ struct TestParams {
   bool bypass_check;
   uint32_t num_rt_args;
   uint32_t cpu_id;
+  uint32_t cpu_range;
   uint32_t clean_mode;
   TestType test;
 };
@@ -199,6 +200,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t cpu_id;
+  uint32_t cpu_range;
   uint32_t clean_mode;
   TestType test;
   uint32_t test_uint;
@@ -249,6 +251,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(cpu_id, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
             input_args, "--cpu", 0xFFFFFFFF);
+    std::tie(cpu_range, input_args) =
+        test_args::get_command_option_uint32_and_remaining_args(
+            input_args, "--cpu-range", 4);
 
     std::tie(clean_mode, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
@@ -302,6 +307,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .bypass_check = bypass_check,
                     .num_rt_args = num_rt_args,
                     .cpu_id = cpu_id,
+                    .cpu_range = cpu_range,
                     .clean_mode = clean_mode,
                     .test = test};
   return params;
@@ -390,30 +396,66 @@ std::vector<T> untilize_compat(const std::vector<T> &input, uint32_t rows,
   return output;
 }
 
-std::vector<float> decode_bfp8_row_major_compat(const std::vector<uint32_t> &tiles,
-                                                uint32_t rows,
-                                                uint32_t cols,
-                                                const std::string &tag) {
-  const uint32_t bfp8_tile_words = tt::tile_size(tt::DataFormat::Bfp8_b) /
-                                   static_cast<uint32_t>(sizeof(uint32_t));
-  if (bfp8_tile_words == 0) {
-    throw std::runtime_error(tag +
-                             " decode invalid BFP8 tile geometry: tile_words=0");
+std::vector<uint32_t>
+pack_tilized_fp32_to_device_format(const std::vector<float> &fp32_vec,
+                                   uint32_t rows, uint32_t cols,
+                                   const tt::DataFormat data_format) {
+  if (data_format == tt::DataFormat::Bfp8_b) {
+#if HAS_SWIZZLED_TILIZE_UTILS
+    auto tilized = tilize_swizzled(fp32_vec, rows, cols);
+#else
+    auto tilized = tilize_compat(fp32_vec, rows, cols);
+#endif
+    return pack_as_bfp8_tiles(tt::stl::make_const_span(tilized),
+                              /*row_major_input=*/true,
+                              /*is_exp_a=*/false);
+  } else {
+    // Float16_b (BFLOAT16) path
+    std::vector<bfloat16> bf16_vec;
+    bf16_vec.reserve(fp32_vec.size());
+    std::transform(fp32_vec.begin(), fp32_vec.end(), std::back_inserter(bf16_vec),
+                   [](float f) { return bfloat16(f); });
+#if HAS_SWIZZLED_TILIZE_UTILS
+    auto tilized = tilize_swizzled(bf16_vec, rows, cols);
+    auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
+        tt::stl::make_const_span(tilized));
+    return pack_bfloat16_vec_into_uint32_vec(nfaces);
+#else
+    auto tilized = tilize_compat(bf16_vec, rows, cols);
+    auto nfaces = convert_layout_row_major_to_tile_nfaces(tilized);
+    return pack_bfloat16_vec_into_uint32_vec(nfaces);
+#endif
   }
-  if (tiles.empty()) {
-    throw std::runtime_error(tag + " decode received empty tile payload");
+}
+
+std::vector<float>
+unpack_device_tiles_to_fp32(const std::vector<uint32_t> &packed, uint32_t rows,
+                            uint32_t cols, const tt::DataFormat data_format) {
+  if (data_format == tt::DataFormat::Bfp8_b) {
+    auto unpacked = unpack_bfp8_tiles_into_float_vec(
+        packed, /*row_major_output=*/true, /*is_exp_a=*/false);
+#if HAS_SWIZZLED_TILIZE_UTILS
+    return untilize_swizzled(unpacked, rows, cols);
+#else
+    return untilize_compat(unpacked, rows, cols);
+#endif
+  } else {
+    // Float16_b (BFLOAT16) path
+    auto bf16_vec = unpack_uint32_vec_into_bfloat16_vec(packed);
+#if HAS_SWIZZLED_TILIZE_UTILS
+    auto swizzled = convert_layout_tile_nfaces_to_tile_swizzled(
+        tt::stl::make_const_span(bf16_vec));
+    auto untilized = untilize_swizzled(swizzled, rows, cols);
+#else
+    auto rm = convert_layout_tile_nfaces_to_row_major(bf16_vec, rows, cols);
+    auto untilized = untilize_compat(rm, rows, cols);
+#endif
+    std::vector<float> result;
+    result.reserve(untilized.size());
+    std::transform(untilized.begin(), untilized.end(), std::back_inserter(result),
+                   [](const bfloat16 &v) { return static_cast<float>(v); });
+    return result;
   }
-  if (tiles.size() % bfp8_tile_words != 0) {
-    throw std::runtime_error(
-        tag + " decode payload size mismatch: tiles_u32=" +
-        std::to_string(tiles.size()) +
-        ", expected multiple of bfp8_tile_words=" +
-        std::to_string(bfp8_tile_words));
-  }
-  auto unpacked =
-      unpack_bfp8_tiles_into_float_vec(tiles, /*row_major_output=*/true,
-                                       /*is_exp_a=*/false);
-  return untilize_compat(unpacked, rows, cols);
 }
 
 float get_pcc(const std::vector<float> &x, const std::vector<float> &y) {
@@ -889,25 +931,20 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     tt::tt_metal::IDevice *device, CoreCoord core_range, uint32_t Mt,
     uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in0_block_w, uint32_t single_tile_size, uint32_t in0_addr,
-    uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram) {
+    uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
+    const tt::DataFormat data_format = tt::DataFormat::Bfp8_b) {
   BenchmarkInputsLegacy inputs;
   inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
   inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, 5.0f);
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
   if (use_dram) {
-    std::vector<float> in0_tilized;
     std::vector<uint32_t> in0_packed;
     try {
-      in0_tilized = tilize_compat(inputs.in0_vec, Mt * 32, Kt * 32);
-      in0_packed =
-          pack_fp32_vec_as_bfp8_tiles(in0_tilized, /*row_major_input=*/true,
-                                      /*is_exp_a=*/false);
-      // Match new-API validation semantics: golden uses effective quantized
-      // values actually written to device.
-      inputs.in0_vec = decode_bfp8_row_major_compat(
-          in0_packed, Mt * 32, Kt * 32,
-          "ComputeMM DRAM IN0 quantized roundtrip");
+      in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
+                                                      Kt * 32, data_format);
+      inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed, Mt * 32, Kt * 32,
+                                                   data_format);
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN0 transform failed: Mt=" +
@@ -926,16 +963,12 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     tt_metal::EnqueueWriteBuffer(device->command_queue(), inputs.in0_buffer, in0_packed, false);
     tt_metal::Finish(device->command_queue());
 
-    std::vector<float> in1_tilized;
     std::vector<uint32_t> in1_packed;
     try {
-      in1_tilized = tilize_compat(inputs.in1_vec, Kt * 32, Nt * 32);
-      in1_packed =
-          pack_fp32_vec_as_bfp8_tiles(in1_tilized, /*row_major_input=*/true,
-                                      /*is_exp_a=*/false);
-      inputs.in1_vec = decode_bfp8_row_major_compat(
-          in1_packed, Kt * 32, Nt * 32,
-          "ComputeMM DRAM IN1 quantized roundtrip");
+      in1_packed = pack_tilized_fp32_to_device_format(inputs.in1_vec, Kt * 32,
+                                                      Nt * 32, data_format);
+      inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed, Kt * 32, Nt * 32,
+                                                   data_format);
     } catch (const std::exception &e) {
       throw std::runtime_error(
           "Legacy ComputeMM DRAM IN1 transform failed: Kt=" +
@@ -984,27 +1017,21 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
 
     for (int r = 0; r < (int)core_range.y; r++) {
       int num_r = (r == (int)core_range.y - 1) ? (last_block_h) : (per_core_Mt);
-      std::vector<float> in0_slice =
-          get_row_slice(inputs.in0_vec, r * per_core_Mt * 32, num_r * 32,
-                        Mt * 32, Kt * 32);
-      auto in0_block_slice =
-          get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
-          std::vector<float> in0_block_tilized;
-          std::vector<uint32_t> in0;
-          try {
-          in0_block_tilized =
-            tilize_compat(in0_block_slice, num_r * 32, in0_block_w * 32);
-          in0 = pack_fp32_vec_as_bfp8_tiles(in0_block_tilized,
-                            /*row_major_input=*/true,
-                            /*is_exp_a=*/false);
-          } catch (const std::exception &e) {
-          throw std::runtime_error(
+      std::vector<uint32_t> in0;
+      try {
+        std::vector<float> in0_slice = get_row_slice(
+            inputs.in0_vec, r * per_core_Mt * 32, num_r * 32, Mt * 32, Kt * 32);
+        auto in0_block_slice =
+            get_col_slice(in0_slice, 0, in0_block_w * 32, num_r * 32, Kt * 32);
+        in0 = pack_tilized_fp32_to_device_format(in0_block_slice, num_r * 32,
+                                                 in0_block_w * 32, data_format);
+      } catch (const std::exception &e) {
+        throw std::runtime_error(
             "Legacy ComputeMM L1 IN0 transform failed: num_r=" +
             std::to_string(num_r) + ", in0_block_w=" +
             std::to_string(in0_block_w) + ", Kt=" + std::to_string(Kt) +
-            ", in0_block_slice_size=" + std::to_string(in0_block_slice.size()) +
             ", what=" + e.what());
-          }
+      }
 
       for (int c = 0; c < (int)core_range.x; c++) {
         int num_c =
@@ -1029,20 +1056,15 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
           in1_block_slice[idx] = (float)1;
         }
 
-        std::vector<float> in1_block_tilized;
         std::vector<uint32_t> in1;
         try {
-            in1_block_tilized =
-              tilize_compat(in1_block_slice, in0_block_w * 32, num_c * 32);
-          in1 = pack_fp32_vec_as_bfp8_tiles(in1_block_tilized,
-                          /*row_major_input=*/true,
-                          /*is_exp_a=*/false);
+          in1 = pack_tilized_fp32_to_device_format(
+              in1_block_slice, in0_block_w * 32, num_c * 32, data_format);
         } catch (const std::exception &e) {
           throw std::runtime_error(
-            "Legacy ComputeMM L1 IN1 transform failed: in0_block_w=" +
-            std::to_string(in0_block_w) + ", num_c=" +
-            std::to_string(num_c) + ", in1_block_slice_size=" +
-            std::to_string(in1_block_slice.size()) + ", what=" + e.what());
+              "Legacy ComputeMM L1 IN1 transform failed: in0_block_w=" +
+              std::to_string(in0_block_w) + ", num_c=" + std::to_string(num_c) +
+              ", what=" + e.what());
         }
 
         CoreCoord core = {(std::size_t)c, (std::size_t)r};
@@ -1495,7 +1517,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         inputs = prepare_inputs_compute_mm_legacy(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-            params.use_dram);
+            params.use_dram, data_format);
       }
 
       {
@@ -1564,9 +1586,8 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         if (params.use_dram) {
           std::vector<uint32_t> out_data;
           tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer, out_data, true);
-          device_vec = decode_bfp8_row_major_compat(
-              out_data, Mt * 32, Nt * 32,
-              "ComputeMM DRAM output readback");
+          device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
+                                                   data_format);
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
             for (uint32_t r = 0; r < params.M; ++r) {
@@ -1587,9 +1608,9 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               tt_metal::detail::ReadFromDeviceL1(device, core, out_addr,
                                                  read_size, core_data_tiles);
 
-                auto core_data_untilized = decode_bfp8_row_major_compat(
+                auto core_data_untilized = unpack_device_tiles_to_fp32(
                   core_data_tiles, per_core_Mt * 32, per_core_Nt * 32,
-                  "ComputeMM L1 output readback");
+                  data_format);
 
               uint32_t global_r_start = y * per_core_Mt * 32;
               uint32_t global_c_start = x * per_core_Nt * 32;
@@ -1657,18 +1678,6 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     ZoneScopedN("HostPipeline ComputeMM Functional Blocks");
     log_info(LogTest,
              "Starting Host-Only ComputeMM Pipeline Test (no kernel dispatch)");
-    if (params.num_iters == 0) {
-      log_error(LogTest, "Host-only ComputeMM requires --num-iters > 0");
-      return false;
-    }
-    if (params.dtype != 0) {
-      log_error(LogTest,
-                "Host-only ComputeMM currently supports only --dtype 0 "
-                "(BFP8 path), requested dtype={}",
-                params.dtype);
-      return false;
-    }
-
     uint32_t Mt = 0, Nt = 0, Kt = 0;
     uint32_t single_tile_size = 0;
     uint32_t in0_size_bytes = 0;
@@ -1676,12 +1685,14 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     std::shared_ptr<tt_metal::Buffer> in0_buffer;
     std::shared_ptr<tt_metal::Buffer> in1_buffer;
 
+    tt::DataFormat pipeline_data_format =
+        (params.dtype == 0) ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
+
     {
       ZoneScopedN("HostPipeline ComputeMM Input Data Processing");
       std::tie(Mt, Nt, Kt) =
-        get_aligned_input_tile_num(params.M, params.N, params.K);
+          get_aligned_input_tile_num(params.M, params.N, params.K);
 
-      tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
       single_tile_size = tt::tile_size(pipeline_data_format);
       uint32_t in0_num_tiles = Mt * Kt;
       uint32_t in1_num_tiles = Kt * Nt;
@@ -1729,15 +1740,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline ComputeMM Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto in0_tilized = tilize_compat(in0_vec, Mt * 32, Kt * 32);
-        in0_packed = pack_fp32_vec_as_bfp8_tiles(in0_tilized,
-                                                 /*row_major_input=*/true,
-                                                 /*is_exp_a=*/false);
+        in0_packed = pack_tilized_fp32_to_device_format(
+            in0_vec, Mt * 32, Kt * 32, pipeline_data_format);
 
-        auto in1_tilized = tilize_compat(in1_vec, Kt * 32, Nt * 32);
-        in1_packed = pack_fp32_vec_as_bfp8_tiles(in1_tilized,
-                                                 /*row_major_input=*/true,
-                                                 /*is_exp_a=*/false);
+        in1_packed = pack_tilized_fp32_to_device_format(
+            in1_vec, Kt * 32, Nt * 32, pipeline_data_format);
         auto t1 = std::chrono::steady_clock::now();
         stats.transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1784,13 +1791,11 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
       if (i == 0 && !params.bypass_check) {
         ZoneScopedN("HostPipeline ComputeMM Validation");
         auto t0_post = std::chrono::steady_clock::now();
-        auto in0_roundtrip = decode_bfp8_row_major_compat(
-          in0_readback, Mt * 32, Kt * 32,
-          "HostPipeline ComputeMM IN0 readback");
+        auto in0_roundtrip = unpack_device_tiles_to_fp32(
+            in0_readback, Mt * 32, Kt * 32, pipeline_data_format);
 
-        auto in1_roundtrip = decode_bfp8_row_major_compat(
-          in1_readback, Kt * 32, Nt * 32,
-          "HostPipeline ComputeMM IN1 readback");
+        auto in1_roundtrip = unpack_device_tiles_to_fp32(
+            in1_readback, Kt * 32, Nt * 32, pipeline_data_format);
         auto t1_post = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
@@ -1849,19 +1854,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       log_error(LogTest, "Host-only Empty requires --num-iters > 0");
       return false;
     }
-    if (params.dtype != 0) {
-      log_error(LogTest,
-                "Host-only Empty currently supports only --dtype 0 "
-                "(BFP8 path), requested dtype={}",
-                params.dtype);
-      return false;
-    }
-
-    auto [Mt, Nt, Kt] =
-        get_aligned_input_tile_num(params.M, params.N, params.K);
-    (void)Kt;
-
-    tt::DataFormat pipeline_data_format = tt::DataFormat::Bfp8_b;
+    tt::DataFormat pipeline_data_format =
+        (params.dtype == 0) ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
     uint32_t tensor_size_bytes = num_tiles * single_tile_size;
@@ -1910,10 +1904,8 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
       {
         ZoneScopedN("HostPipeline Empty Transform Inputs");
         auto t0 = std::chrono::steady_clock::now();
-        auto tilized = tilize_compat(tensor_vec, Mt * 32, Nt * 32);
-        packed = pack_fp32_vec_as_bfp8_tiles(tilized,
-                                             /*row_major_input=*/true,
-                                             /*is_exp_a=*/false);
+        packed = pack_tilized_fp32_to_device_format(
+            tensor_vec, Mt * 32, Nt * 32, pipeline_data_format);
         auto t1 = std::chrono::steady_clock::now();
         stats.transform_us +=
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -1977,16 +1969,17 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
               .count();
       completed_iters++;
 
-      // We break validation out of the loop timing, executing it only on the FIRST iteration
+      // We break validation out of the loop timing, executing it only on the FIRST
+      // iteration
       if (i == 0 && !params.bypass_check) {
         ZoneScopedN("HostPipeline Empty Validation Processing");
         auto t0_post = std::chrono::steady_clock::now();
-        auto roundtrip = decode_bfp8_row_major_compat(
-          readback, Mt * 32, Nt * 32,
-          "HostPipeline Empty readback");
+        auto roundtrip = unpack_device_tiles_to_fp32(
+            readback, Mt * 32, Nt * 32, pipeline_data_format);
         auto t1_post = std::chrono::steady_clock::now();
         stats.inverse_transform_us +=
-            std::chrono::duration_cast<std::chrono::microseconds>(t1_post - t0_post)
+            std::chrono::duration_cast<std::chrono::microseconds>(t1_post -
+                                                                   t0_post)
                 .count();
 
         float pcc = get_pcc(tensor_vec, roundtrip);
@@ -2010,18 +2003,20 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
     log_info(LogTest,
              "Host-only Empty pipeline dims: Mt={}, Nt={}, completed_iters={}",
              Mt, Nt, completed_iters);
-    double transfer_seconds = transfer_window_us / 1e6;
-    double effective_bw_mb_s =
-      (transfer_seconds > 0.0)
-        ? (static_cast<double>(transfer_window_bytes) / transfer_seconds) /
-            1e6
-        : 0.0;
-    log_info(LogTest,
-         "Host-only Empty effective transfer BW: total_bytes={}, "
-         "transfer_time={:.2f}us, bw={:.3f} MB/s",
-         transfer_window_bytes, transfer_window_us, effective_bw_mb_s);
     log_host_pipeline_stats("Test 4 (Host-Only Empty Tensor Pipeline)", stats,
-                completed_iters);
+                            completed_iters);
+
+    // Legacy combined metric for Test 4 compat
+    double total_bytes =
+        static_cast<double>(stats.bytes_written + stats.bytes_read);
+    double total_time_us = stats.write_us + stats.read_us;
+    double bw =
+        (total_time_us > 0) ? (total_bytes / (total_time_us / 1e6)) / 1e6 : 0;
+    log_info(LogTest,
+             "Test 4 (Host-Only Empty Tensor Pipeline) overall PCIe results: "
+             "total_bytes={}, total_transfer_time={:.2f}us, combined_bw={:.2f} "
+             "MB/s",
+             total_bytes, total_time_us, bw);
   } catch (const std::exception &e) {
     pass = false;
     log_error(LogTest, "{}", e.what());
@@ -2208,15 +2203,30 @@ bool test_empty_kernel_launch(tt::tt_metal::IDevice *device,
   return pass;
 }
 
-void pin_to_cpu(int cpu) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  if (sched_setaffinity(0, sizeof(set), &set) != 0) {
-    log_warning(tt::LogTest, "Failed to pin to CPU {}: {}", cpu,
-                std::strerror(errno));
+// Pins the process to a range of CPUs to reduce jitter while allowing for
+// internal parallelism (OpenMP, metal worker threads).
+// Binding to a single core causes severe contention in parallel regions.
+void pin_to_cpu(uint32_t start_cpu_id, uint32_t num_cores_to_pin) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+
+  uint32_t total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+  for (uint32_t i = 0; i < num_cores_to_pin; ++i) {
+    uint32_t target_cpu = (start_cpu_id + i) % total_cpus;
+    CPU_SET(target_cpu, &mask);
+  }
+
+  int result = sched_setaffinity(0, sizeof(mask), &mask);
+  if (result == 0) {
+    log_info(
+        LogTest,
+        "Successfully pinned to CPU range {}-{} (Requested start={}, range={}, "
+        "total={})",
+        start_cpu_id, (start_cpu_id + num_cores_to_pin - 1) % total_cpus,
+        start_cpu_id, num_cores_to_pin, total_cpus);
   } else {
-    log_info(tt::LogTest, "Pinned to CPU {}", cpu);
+    log_warning(LogTest, "Failed to pin to CPU range: {}", strerror(errno));
   }
 }
 
@@ -2256,7 +2266,7 @@ int main(int argc, char **argv) {
   uint32_t max_y = device_params.grid_coord.y;
 
   if (params.cpu_id != 0xFFFFFFFF) {
-    pin_to_cpu(params.cpu_id);
+    pin_to_cpu(params.cpu_id, params.cpu_range);
   }
 
   //// Print test summary
