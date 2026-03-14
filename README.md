@@ -299,6 +299,10 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `ttnn::Sync` | new | Synchronization after on-device tilize/pack operations. |
 | `ttnn::Output_Prepare` | new | Wrapper for output tensor allocation path in on-device mode. |
 | `ttnn::Output_CreateTensor` | new | Device output tensor allocation in DRAM tile layout. |
+| `ComputeMM Host Validation: Read Packed IN0 (Device Pack)` | new | Reads packed IN0 back from DRAM for rigorous effective-input golden reconstruction. |
+| `ComputeMM Host Validation: Decode Effective IN0 (Device Pack)` | new | Decodes packed IN0 into effective FP32 values used for golden-reference alignment. |
+| `ComputeMM Host Validation: Read Packed IN1 (Device Pack)` | new | Reads packed IN1 back from DRAM for rigorous effective-input golden reconstruction. |
+| `ComputeMM Host Validation: Decode Effective IN1 (Device Pack)` | new | Decodes packed IN1 into effective FP32 values used for golden-reference alignment. |
 | `Prepare DRAM Inputs` | new | DRAM-specific branch inside ComputeMM input preparation. |
 | `Tilize and Pack IN0 (DRAM)` | new | IN0 tilize + BFP8 pack + buffer write path setup. |
 | `Tilize and Pack IN1 (DRAM)` | new | IN1 tilize + BFP8 pack + buffer write path setup. |
@@ -397,6 +401,19 @@ Validation-zone policy currently enforced:
 * PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation`, `HostPipeline Empty Validation Processing`).
 * This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
 * Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
+* For DRAM + device-pack runs, effective packed IN0/IN1 are reconstructed before golden reference so validation remains apples-to-apples with the actual compute inputs.
+
+### Runtime Configuration Print (Resolved)
+
+At startup, the benchmark now prints a resolved configuration block that includes:
+
+* Selected test ID and test name.
+* Device architecture and max grid.
+* CLI dtype and resolved effective compute dtype (current mapping in this benchmark is `--dtype 0 -> BFP8_B`, `--dtype 1/2 -> BF16`).
+* Resolved `pack_tile` / `unpack_tile` modes after default mapping.
+* Validation mode (`effective-input-golden` when DRAM validation is enabled).
+
+This is intended to make defaults and CLI-to-runtime mapping explicit for reproducible experiments.
 
 ### Dispatch Mode Requirement (Critical)
 

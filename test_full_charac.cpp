@@ -211,6 +211,131 @@ struct DeviceParams {
   CoreCoord grid_coord;
 };
 
+void log_validation_pipeline_steps(const TestParams &params) {
+  uint32_t step = 1;
+  log_info(LogTest, "Validation Pipeline (resolved steps)");
+  log_info(LogTest, "----------------------------------");
+
+  if (params.use_dram) {
+    log_info(LogTest,
+             "Step {}: Golden input policy = effective-input-golden (DRAM)",
+             step++);
+
+    if (params.pack_device) {
+      log_info(LogTest,
+               "Step {}: Input prep = on-device ttnn tilize/pack for IN0/IN1",
+               step++);
+      log_info(LogTest,
+               "Step {}: Reconstruct effective IN0/IN1 from packed DRAM buffers "
+               "for golden-reference alignment",
+               step++);
+    } else {
+      log_info(LogTest,
+               "Step {}: Input prep = host tilize/pack for IN0/IN1 with "
+               "effective-input decode for golden-reference alignment",
+               step++);
+    }
+
+    if (params.unpack_device) {
+      log_info(LogTest,
+               "Step {}: Output readback = device unpack path "
+               "(typecast(TILE)->Finish->untilize->to_vector)",
+               step++);
+    } else {
+      log_info(LogTest,
+               "Step {}: Output readback = host unpack path "
+               "(ReadShard packed -> host decode/untilize)",
+               step++);
+    }
+  } else {
+    log_info(LogTest,
+             "Step {}: L1 mode uses per-core slicing/identity IN1 path; "
+             "validation is best-effort and may not be academically rigorous",
+             step++);
+    log_info(LogTest,
+             "Step {}: Output readback = per-core L1 read + host decode/stitch",
+             step++);
+  }
+
+  log_info(LogTest,
+           "Step {}: Metrics = PCC + RMSE + Relative RMSE on aligned vectors",
+           step++);
+}
+
+const char *test_type_to_string(TestType test) {
+  switch (test) {
+  case TestType::EmptyKernelLaunch:
+    return "EmptyKernelLaunch";
+  case TestType::ComputeMM:
+    return "ComputeMM";
+  case TestType::SubDeviceMM:
+    return "SubDeviceMM";
+  case TestType::HostPipelineComputeMM:
+    return "HostPipelineComputeMM";
+  case TestType::HostPipelineEmpty:
+    return "HostPipelineEmpty";
+  case TestType::InvalidTest:
+    return "InvalidTest";
+  default:
+    return "Unknown";
+  }
+}
+
+const char *arch_to_string(tt::ARCH arch) {
+  switch (arch) {
+  case tt::ARCH::GRAYSKULL:
+    return "GRAYSKULL";
+  case tt::ARCH::WORMHOLE_B0:
+    return "WORMHOLE_B0";
+  case tt::ARCH::BLACKHOLE:
+    return "BLACKHOLE";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+const char *effective_compute_dtype_string(uint32_t dtype_cli) {
+  // Current benchmark behavior: dtype=0 -> BFP8, dtype=1/2 -> BF16.
+  return (dtype_cli == 0) ? "BFP8_B" : "BF16";
+}
+
+void log_effective_configuration(const TestParams &params,
+                                 const DeviceParams &device_params,
+                                 uint32_t max_x, uint32_t max_y) {
+  const char *pack_mode = params.pack_device ? "device" : "cpu";
+  const char *unpack_mode = params.unpack_device ? "device" : "cpu";
+  const char *effective_dtype = effective_compute_dtype_string(params.dtype);
+  const char *validation_mode =
+      (params.use_dram && !params.bypass_check) ? "effective-input-golden"
+                                                 : "best-effort";
+
+  log_info(LogTest, "Resolved Test Configuration");
+  log_info(LogTest, "===========================");
+  log_info(LogTest, "test={} ({})", static_cast<uint32_t>(params.test),
+           test_type_to_string(params.test));
+  log_info(LogTest, "arch={}, grid_max={}x{}",
+           arch_to_string(device_params.device->arch()), max_x, max_y);
+  log_info(LogTest,
+           "M={}, N={}, K={}, dtype_cli={}, effective_compute_dtype={}, "
+           "fidel={}, dram={}, pack_tile={}, unpack_tile={}",
+           params.M, params.N, params.K, params.dtype, effective_dtype,
+           params.fidel, params.use_dram ? "on" : "off", pack_mode,
+           unpack_mode);
+  log_info(LogTest,
+           "core_x={}, core_y={}, core_groups={}, num_iters={}, "
+           "bypass_check={}, cache={}, clean_mode={}, cpu_id={}, cpu_range={}",
+           params.core_x, params.core_y, params.core_groups, params.num_iters,
+           params.bypass_check ? "on" : "off", params.use_cache ? "on" : "off",
+           params.clean_mode, params.cpu_id, params.cpu_range);
+  log_info(LogTest, "validation_mode={}", validation_mode);
+
+  if (params.dtype == 2) {
+    log_warning(LogTest,
+                "dtype_cli=2 currently maps to effective_compute_dtype=BF16 "
+                "in this benchmark path.");
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////
 /// Input Argument Parsing
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -248,6 +373,11 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(dtype, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--dtype", 0);
+    if (dtype > 2) {
+      throw std::runtime_error("Invalid --dtype value: " +
+                               std::to_string(dtype) +
+                               ". Must be 0 (BFP8), 1 (BF16), or 2 (FP32)");
+    }
     std::tie(fidel, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--fidel", 0);
@@ -621,7 +751,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
     uint32_t start_core_y = 0,
     tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
-    bool pack_device = false);
+    bool pack_device = false,
+    bool reconstruct_effective_inputs = false);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -1121,7 +1252,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t Mt, uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt,
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
-    uint32_t start_core_y, tt::DataFormat data_format, bool pack_device) {
+    uint32_t start_core_y, tt::DataFormat data_format, bool pack_device,
+    bool reconstruct_effective_inputs) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   BenchmarkInputs inputs;
@@ -1212,6 +1344,38 @@ BenchmarkInputs prepare_inputs_compute_mm(
     {
       ZoneScopedN("ttnn::Sync");
       tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+    }
+
+    if (reconstruct_effective_inputs) {
+      // Reconstruct effective packed inputs for rigorous golden-reference
+      // validation. This aligns device-pack path with cpu-pack semantics.
+      std::vector<uint32_t> in0_packed_effective;
+      {
+        ZoneScopedN("ComputeMM Host Validation: Read Packed IN0 (Device Pack)");
+        tt::tt_metal::distributed::ReadShard(
+            device->mesh_command_queue(), in0_packed_effective, inputs.in0_buffer,
+            tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+      }
+      {
+        ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
+        inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
+                                                     Mt * 32, Kt * 32,
+                                                     data_format);
+      }
+
+      std::vector<uint32_t> in1_packed_effective;
+      {
+        ZoneScopedN("ComputeMM Host Validation: Read Packed IN1 (Device Pack)");
+        tt::tt_metal::distributed::ReadShard(
+            device->mesh_command_queue(), in1_packed_effective, inputs.in1_buffer,
+            tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+      }
+      {
+        ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
+        inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
+                                                     Kt * 32, Nt * 32,
+                                                     data_format);
+      }
     }
 
     // ---- DRAM Step 4: Create empty output buffer via ttnn ----
@@ -2024,7 +2188,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         inputs = prepare_inputs_compute_mm(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          params.use_dram, 0, data_format, params.pack_device);
+          params.use_dram, 0, data_format, params.pack_device,
+          !params.bypass_check);
       }
 
       {
@@ -2088,6 +2253,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
     if (!params.bypass_check) {
       ZoneScopedN("ComputeMM Host Post Processing");
       log_info(LogTest, "Validation Started...");
+      log_validation_pipeline_steps(params);
 
       // Compute Golden Reference
       std::vector<float> golden_vec;
@@ -2954,14 +3120,7 @@ int main(int argc, char **argv) {
   //// Print test summary
   log_info(LogTest, "Full Characterization Benchmarking Test");
   log_info(LogTest, "=======================================");
-  log_info(LogTest, "Selectec Test: {}", static_cast<uint32_t>(params.test));
-  log_info(LogTest,
-           "Starting with parameters: M={}, N={}, K={}, dtype={}, fidel={}, "
-           "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}, "
-           "cache={}",
-           params.M, params.N, params.K, params.dtype, params.fidel,
-           params.core_x, params.core_y, params.core_groups, params.num_iters,
-           params.clean_mode, params.use_cache);
+  log_effective_configuration(params, device_params, max_x, max_y);
 
   if (params.core_x > max_x || params.core_y > max_y) {
     log_error(
