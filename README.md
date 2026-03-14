@@ -174,7 +174,9 @@ All currently parsed options are listed below.
 | Matrix | `--m <N>` | `11264` | test 1,2,3,4 | Matrix/tensor M dimension. |
 | Matrix | `--n <N>` | `3072` | test 1,2,3,4 | Matrix/tensor N dimension. |
 | Matrix | `--k <N>` | `768` | test 1,2,3,4 | Matrix/tensor K dimension. |
-| Precision | `--dtype <0-2>` | `0` | test 1,2,3,4 | Data format selector (`0` BFP8, `1` BF16, `2` FP32). |
+| Precision | `--dtype <0-2>` | `0` | test 1,2,3,4 | Legacy input dtype selector (`0` BFP8, `1` BF16, `2` FP32 request). Kept for backward compatibility. |
+| Precision | `--input-dtype <bfp8\|bf16\|fp32\|inherit>` | `inherit` | test 1,2,3,4 | Explicit input dtype control. `inherit` follows `--dtype`. Current kernel path maps effective compute format to BFP8/BF16 (FP32 request maps to BF16). |
+| Precision | `--output-dtype <native\|bf16\|fp32>` | `native` | test 1 | Output export dtype control for ComputeMM readback path without changing kernels. |
 | Precision | `--fidel <0-1>` | `0` | test 1,2 | Math fidelity selector. |
 | Layout/IO | `--dram` | off | test 1 | Enable DRAM-backed tensor path/kernels for ComputeMM. |
 | Cache | `--cache` | off | all | Enable program cache + persistent kernel cache lifecycle in benchmark run. |
@@ -222,6 +224,9 @@ Notes:
 
 # On-device tilization/packing + readback unpacking (ttnn path)
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --pack-tile device --unpack-tile device
+
+# Explicit split dtype control (input/export)
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --input-dtype bfp8 --output-dtype fp32 --pack-tile device --unpack-tile device
 
 # Pack/unpack mode matrix (for isolation and debugging)
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --pack-tile cpu --unpack-tile cpu
@@ -409,7 +414,8 @@ At startup, the benchmark now prints a resolved configuration block that include
 
 * Selected test ID and test name.
 * Device architecture and max grid.
-* CLI dtype and resolved effective compute dtype (current mapping in this benchmark is `--dtype 0 -> BFP8_B`, `--dtype 1/2 -> BF16`).
+* Legacy CLI dtype (`--dtype`) plus resolved split dtype controls (`--input-dtype`, `--output-dtype`).
+* Resolved effective compute dtype (current mapping in this benchmark is `input-dtype bfp8 -> BFP8_B`, `input-dtype bf16/fp32 -> BF16`).
 * Resolved `pack_tile` / `unpack_tile` modes after default mapping.
 * Validation mode (`effective-input-golden` when DRAM validation is enabled).
 

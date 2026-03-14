@@ -183,12 +183,20 @@ enum class TestType : uint32_t {
   InvalidTest = 5
 };
 
+enum class OutputDTypeMode : uint32_t {
+  Native = 0,
+  Bf16 = 1,
+  Fp32 = 2,
+};
+
 // Definition of test parameters structure
 struct TestParams {
   uint32_t M;
   uint32_t N;
   uint32_t K;
-  uint32_t dtype; // 0: BFP8, 1: FP16
+  uint32_t dtype; // Legacy selector: 0 BFP8, 1 BF16, 2 FP32 (mapped)
+  uint32_t input_dtype; // Effective input selector for compute path
+  OutputDTypeMode output_dtype_mode;
   uint32_t fidel; // 0: low, 1: high
   bool use_dram;  // Enable DRAM input buffers
   bool use_cache; // Enable program cache
@@ -211,6 +219,10 @@ struct DeviceParams {
   CoreCoord grid_coord;
 };
 
+const char *input_dtype_cli_to_string(uint32_t input_dtype_cli);
+const char *output_dtype_mode_to_string(OutputDTypeMode mode);
+const char *effective_compute_dtype_string(uint32_t input_dtype_cli);
+
 void log_validation_pipeline_steps(const TestParams &params) {
   uint32_t step = 1;
   log_info(LogTest, "Validation Pipeline (resolved steps)");
@@ -220,6 +232,12 @@ void log_validation_pipeline_steps(const TestParams &params) {
     log_info(LogTest,
              "Step {}: Golden input policy = effective-input-golden (DRAM)",
              step++);
+    log_info(LogTest,
+             "Step {}: DType policy = input_cli={} (effective_compute_dtype={}), "
+             "output_dtype={}",
+             step++, input_dtype_cli_to_string(params.input_dtype),
+             effective_compute_dtype_string(params.input_dtype),
+             output_dtype_mode_to_string(params.output_dtype_mode));
 
     if (params.pack_device) {
       log_info(LogTest,
@@ -237,10 +255,17 @@ void log_validation_pipeline_steps(const TestParams &params) {
     }
 
     if (params.unpack_device) {
-      log_info(LogTest,
-               "Step {}: Output readback = device unpack path "
-               "(typecast(TILE)->Finish->untilize->to_vector)",
-               step++);
+      if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
+        log_info(LogTest,
+                 "Step {}: Output readback = device unpack path "
+                 "(typecast(TILE)->Finish->untilize->to_vector)",
+                 step++);
+      } else {
+        log_info(LogTest,
+                 "Step {}: Output readback = device unpack path "
+                 "(untilize->to_vector, no explicit FP32 cast)",
+                 step++);
+      }
     } else {
       log_info(LogTest,
                "Step {}: Output readback = host unpack path "
@@ -252,6 +277,12 @@ void log_validation_pipeline_steps(const TestParams &params) {
              "Step {}: L1 mode uses per-core slicing/identity IN1 path; "
              "validation is best-effort and may not be academically rigorous",
              step++);
+    log_info(LogTest,
+             "Step {}: DType policy = input_cli={} (effective_compute_dtype={}), "
+             "output_dtype={}",
+             step++, input_dtype_cli_to_string(params.input_dtype),
+             effective_compute_dtype_string(params.input_dtype),
+             output_dtype_mode_to_string(params.output_dtype_mode));
     log_info(LogTest,
              "Step {}: Output readback = per-core L1 read + host decode/stitch",
              step++);
@@ -294,9 +325,58 @@ const char *arch_to_string(tt::ARCH arch) {
   }
 }
 
-const char *effective_compute_dtype_string(uint32_t dtype_cli) {
-  // Current benchmark behavior: dtype=0 -> BFP8, dtype=1/2 -> BF16.
-  return (dtype_cli == 0) ? "BFP8_B" : "BF16";
+const char *input_dtype_cli_to_string(uint32_t input_dtype_cli) {
+  switch (input_dtype_cli) {
+  case 0:
+    return "BFP8";
+  case 1:
+    return "BF16";
+  case 2:
+    return "FP32";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+OutputDTypeMode parse_output_dtype_mode(const std::string &output_dtype_str) {
+  if (output_dtype_str == "native") {
+    return OutputDTypeMode::Native;
+  }
+  if (output_dtype_str == "bf16") {
+    return OutputDTypeMode::Bf16;
+  }
+  if (output_dtype_str == "fp32") {
+    return OutputDTypeMode::Fp32;
+  }
+  throw std::runtime_error("Invalid --output-dtype value: " +
+                           output_dtype_str +
+                           ". Must be 'native', 'bf16', or 'fp32'");
+}
+
+const char *output_dtype_mode_to_string(OutputDTypeMode mode) {
+  switch (mode) {
+  case OutputDTypeMode::Native:
+    return "native";
+  case OutputDTypeMode::Bf16:
+    return "bf16";
+  case OutputDTypeMode::Fp32:
+    return "fp32";
+  default:
+    return "unknown";
+  }
+}
+
+tt::DataFormat compute_data_format_from_input_dtype(uint32_t input_dtype) {
+  // Current kernel contract supports BFP8/BF16 CB formats in this benchmark.
+  // Input FP32 is accepted as CLI intent but maps to BF16 compute format.
+  return (input_dtype == 0) ? tt::DataFormat::Bfp8_b : tt::DataFormat::Float16_b;
+}
+
+const char *effective_compute_dtype_string(uint32_t input_dtype_cli) {
+  return (compute_data_format_from_input_dtype(input_dtype_cli) ==
+          tt::DataFormat::Bfp8_b)
+             ? "BFP8_B"
+             : "BF16";
 }
 
 void log_effective_configuration(const TestParams &params,
@@ -304,7 +384,9 @@ void log_effective_configuration(const TestParams &params,
                                  uint32_t max_x, uint32_t max_y) {
   const char *pack_mode = params.pack_device ? "device" : "cpu";
   const char *unpack_mode = params.unpack_device ? "device" : "cpu";
-  const char *effective_dtype = effective_compute_dtype_string(params.dtype);
+  const char *input_dtype_cli = input_dtype_cli_to_string(params.input_dtype);
+  const char *effective_dtype = effective_compute_dtype_string(params.input_dtype);
+  const char *output_dtype = output_dtype_mode_to_string(params.output_dtype_mode);
   const char *validation_mode =
       (params.use_dram && !params.bypass_check) ? "effective-input-golden"
                                                  : "best-effort";
@@ -316,9 +398,11 @@ void log_effective_configuration(const TestParams &params,
   log_info(LogTest, "arch={}, grid_max={}x{}",
            arch_to_string(device_params.device->arch()), max_x, max_y);
   log_info(LogTest,
-           "M={}, N={}, K={}, dtype_cli={}, effective_compute_dtype={}, "
+           "M={}, N={}, K={}, dtype_cli={}, input_dtype_cli={}, "
+           "effective_compute_dtype={}, output_dtype={}, "
            "fidel={}, dram={}, pack_tile={}, unpack_tile={}",
-           params.M, params.N, params.K, params.dtype, effective_dtype,
+           params.M, params.N, params.K, params.dtype, input_dtype_cli,
+           effective_dtype, output_dtype,
            params.fidel, params.use_dram ? "on" : "off", pack_mode,
            unpack_mode);
   log_info(LogTest,
@@ -329,9 +413,9 @@ void log_effective_configuration(const TestParams &params,
            params.clean_mode, params.cpu_id, params.cpu_range);
   log_info(LogTest, "validation_mode={}", validation_mode);
 
-  if (params.dtype == 2) {
+  if (params.input_dtype == 2) {
     log_warning(LogTest,
-                "dtype_cli=2 currently maps to effective_compute_dtype=BF16 "
+                "input_dtype_cli=FP32 currently maps to effective_compute_dtype=BF16 "
                 "in this benchmark path.");
   }
 }
@@ -356,7 +440,11 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   TestType test;
   bool pack_device = false;
   bool unpack_device = false;
+  uint32_t input_dtype = 0;
+  OutputDTypeMode output_dtype_mode = OutputDTypeMode::Native;
   uint32_t test_uint;
+  std::string input_dtype_str;
+  std::string output_dtype_str;
   std::string pack_tile_str;
   std::string unpack_tile_str;
   try {
@@ -381,6 +469,30 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(fidel, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--fidel", 0);
+
+    // New split dtype controls (backward-compatible with --dtype)
+    std::tie(input_dtype_str, input_args) =
+        test_args::get_command_option_and_remaining_args(
+            input_args, "--input-dtype", "inherit");
+    if (input_dtype_str == "inherit") {
+      input_dtype = dtype;
+    } else if (input_dtype_str == "bfp8") {
+      input_dtype = 0;
+    } else if (input_dtype_str == "bf16") {
+      input_dtype = 1;
+    } else if (input_dtype_str == "fp32") {
+      input_dtype = 2;
+    } else {
+      throw std::runtime_error("Invalid --input-dtype value: " +
+                               input_dtype_str +
+                               ". Must be 'bfp8', 'bf16', 'fp32', or 'inherit'");
+    }
+
+    std::tie(output_dtype_str, input_args) =
+        test_args::get_command_option_and_remaining_args(
+            input_args, "--output-dtype", "native");
+    output_dtype_mode = parse_output_dtype_mode(output_dtype_str);
+
     std::tie(use_dram, input_args) =
         test_args::has_command_option_and_remaining_args(input_args, "--dram");
     std::tie(use_cache, input_args) =
@@ -486,6 +598,8 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .N = N,
                     .K = K,
                     .dtype = dtype,
+                    .input_dtype = input_dtype,
+                    .output_dtype_mode = output_dtype_mode,
                     .fidel = fidel,
                     .use_dram = use_dram,
                     .use_cache = use_cache,
@@ -798,9 +912,8 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
     uint32_t l1_unreserved_base =
         device->allocator()->get_base_allocator_addr(HalMemType::L1);
     auto [math_fidelity, fp32_dest_acc_en] = get_compute_params(arch);
-    tt::DataFormat data_format = (params.dtype == 0)
-                                     ? tt::DataFormat::Bfp8_b
-                                     : tt::DataFormat::Float16_b;
+    tt::DataFormat data_format =
+      compute_data_format_from_input_dtype(params.input_dtype);
     uint32_t single_tile_size = tt::tile_size(data_format);
 
     // 2. Prepare Program with Loop over Splits
@@ -2132,8 +2245,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
         per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
 
-        data_format = (params.dtype == 0) ? tt::DataFormat::Bfp8_b
-                                          : tt::DataFormat::Float16_b;
+        data_format = compute_data_format_from_input_dtype(params.input_dtype);
         single_tile_size = tt::tile_size(data_format);
 
         if (params.use_dram) {
@@ -2188,8 +2300,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         inputs = prepare_inputs_compute_mm(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          params.use_dram, 0, data_format, params.pack_device,
-          !params.bypass_check);
+            params.use_dram, 0, data_format, params.pack_device,
+            !params.bypass_check);
       }
 
       {
@@ -2278,31 +2390,44 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             // added)
             auto &device_tensor_out = inputs.ttnn_tensors.back();
 
-            // 1. Typecast to FLOAT32 while still in TILE layout
-            ttnn::Tensor device_tensor_fp32_tile;
-            {
-              ZoneScopedN("ttnn::typecast(FLOAT32)");
-              device_tensor_fp32_tile =
-                  ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
-            }
+            if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
+              // 1. Typecast to FLOAT32 while still in TILE layout
+              ttnn::Tensor device_tensor_fp32_tile;
+              {
+                ZoneScopedN("ttnn::typecast(FLOAT32)");
+                device_tensor_fp32_tile =
+                    ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
+              }
 
-            // Ensure the final cast is complete before host readback.
-            {
-              ZoneScopedN("ttnn::typecast(FLOAT32)_Finish");
-              tt::tt_metal::distributed::Finish(device->mesh_command_queue());
-            }
+              // Ensure the final cast is complete before host readback.
+              {
+                ZoneScopedN("ttnn::typecast(FLOAT32)_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
 
-            // 2. Convert to ROW_MAJOR layout on device
-            ttnn::Tensor device_tensor_fp32_rm;
-            {
-              ZoneScopedN("ttnn::untilize");
-              device_tensor_fp32_rm = ttnn::untilize(device_tensor_fp32_tile);
-            }
+              // 2. Convert to ROW_MAJOR layout on device
+              ttnn::Tensor device_tensor_fp32_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_fp32_rm = ttnn::untilize(device_tensor_fp32_tile);
+              }
 
-            // 3. Bring to host as vector<float>
-            {
-              ZoneScopedN("ttnn::to_vector<float> (Readback)");
-              device_vec = device_tensor_fp32_rm.to_vector<float>();
+              // 3. Bring to host as vector<float>
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_fp32_rm.to_vector<float>();
+              }
+            } else {
+              // Native/BF16 export path: untilize directly, no explicit FP32 cast.
+              ttnn::Tensor device_tensor_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_rm = ttnn::untilize(device_tensor_out);
+              }
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_rm.to_vector<float>();
+              }
             }
 
             // Trim to actual M x N if needed
@@ -2383,6 +2508,13 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
               }
             }
           }
+        }
+      }
+
+      if (params.output_dtype_mode == OutputDTypeMode::Bf16) {
+        ZoneScopedN("ComputeMM Host Output DType Postprocess BF16");
+        for (auto &v : device_vec) {
+          v = static_cast<float>(bfloat16(v));
         }
       }
 
@@ -2490,9 +2622,8 @@ bool test_host_pipeline_compute_mm(
       return false;
     }
 
-    tt::DataFormat pipeline_data_format = (params.dtype == 0)
-                                              ? tt::DataFormat::Bfp8_b
-                                              : tt::DataFormat::Float16_b;
+    tt::DataFormat pipeline_data_format =
+      compute_data_format_from_input_dtype(params.input_dtype);
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t in0_num_tiles = Mt * Kt;
@@ -2663,9 +2794,8 @@ bool test_host_pipeline_empty_tensor(
       return false;
     }
 
-    tt::DataFormat pipeline_data_format = (params.dtype == 0)
-                                              ? tt::DataFormat::Bfp8_b
-                                              : tt::DataFormat::Float16_b;
+    tt::DataFormat pipeline_data_format =
+      compute_data_format_from_input_dtype(params.input_dtype);
 
     uint32_t single_tile_size = tt::tile_size(pipeline_data_format);
     uint32_t num_tiles = Mt * Nt;
