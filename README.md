@@ -22,12 +22,12 @@ The benchmark supports the following test types, selected via the `--test` argum
     *   **Purpose**: Benchmarks the "Host Overhead" (Data Generation, Tiling, Transfer) and "Dispatch Overhead" for a standard Matrix Multiplication.
     *   **Mechanism**: Runs a dense MatMul (M x N x K).
     *   **Kernels**: Uses `tile_layout` kernels for reading/writing and `bmm_large_block...` for compute.
-    *   **Acceleration**: Supports on-device data preparation (tilization/packing) and readback (untilization/unpacking) via the `ttnn` C++ API (`--unpack-tile device`).
+    *   **Acceleration**: Supports on-device data preparation (tilization/packing) and readback (untilization/unpacking) via the `ttnn` C++ API (`--pack-tile device --unpack-tile device`).
     *   **Supports**: Single-Core (1x1) or Multi-Core execution (kernels are unified).
     *   **Datatypes**: Supports BFP8 (`--dtype 0`), BF16 (`--dtype 1`), and FP32 (`--dtype 2`).
 
 3.  **Sub-Device Parallelism (`--test 2`)**:
-    *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core-groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
+  *   **Mechanism**: Splits the grid into N "Sub-Devices" (via `--core_groups`, default 2) and dispatches independent MatMul workloads to each using a single Program with disjoint `CoreRange`s.
     *   **Requirement**: Requires at least N rows of cores (`--y_size >= core_groups`).
     *   **Advanced Capabilities**: While this benchmark calculates uniform divisions (e.g., 8 rows / 4 groups = 2 rows/group), Tenstorrent architectures natively support **fully uneven and non-contiguous partitions**.
         *   You can define arbitrary `CoreRangeSet`s (collections of disjoint `CoreRange` rectangles) to create sub-devices of varying sizes and shapes.
@@ -85,11 +85,11 @@ Current constraints:
 
 ### Partitioning Logic Examples
 
-The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core-groups`:
+The current logic uses integer division (`rows / groups`) to assign rows. Any remainder rows are assigned to the **last group**. Here is how an **8x8 Grid** (64 cores) is partitioned with different `--core_groups`:
 
 #### 1. Perfect Split (2 Groups)
 
-* `--y_size 8 --core-groups 2`
+* `--y_size 8 --core_groups 2`
 * **Math**: `8 / 2 = 4` rows per group.
 * **Result**:
   * **Group 0**: Rows 0-3 (8x4 grid, 32 cores)
@@ -97,7 +97,7 @@ The current logic uses integer division (`rows / groups`) to assign rows. Any re
 
 #### 2. Uneven Split (3 Groups)
 
-* `--y_size 8 --core-groups 3`
+* `--y_size 8 --core_groups 3`
 * **Math**: `8 / 3 = 2` rows per group (integer division). Remainder goes to the last group.
 * **Result**:
   * **Group 0**: Rows 0-1 (8x2 grid, 16 cores)
@@ -106,7 +106,7 @@ The current logic uses integer division (`rows / groups`) to assign rows. Any re
 
 #### 3. Row-Level Turn (8 Groups)
 
-* `--y_size 8 --core-groups 8`
+* `--y_size 8 --core_groups 8`
 * **Math**: `8 / 8 = 1` row per group.
 * **Result**:
   * **Groups 0-7**: Each gets exactly 1 row (8x1 grid, 8 cores each).
@@ -186,7 +186,8 @@ All currently parsed options are listed below.
 | Runtime | `--num-rt-args <N>` | `255` | test 0 | Number of runtime args used by empty-kernel setup path. |
 | Runtime | `--cpu <id>` | `0xFFFFFFFF` | all | Optional CPU affinity pinning (first core of range). |
 | Runtime | `--cpu-range <N>` | `4` | all | Number of consecutive CPUs to pin to (default 4). Avoids contention with OpenMP. |
-| Runtime | `--unpack-tile <cpu\|device>` | `cpu` | test 1 | Offload data preparation (tilization/packing) and readback (untilization/unpacking) to hardware via `ttnn`. |
+| Runtime | `--pack-tile <cpu\|device\|inherit>` | `inherit` | test 1 | Offload data preparation (tilization/packing) to hardware via `ttnn`. `inherit` keeps backward compatibility by following `--unpack-tile`. |
+| Runtime | `--unpack-tile <cpu\|device>` | `cpu` | test 1 | Offload readback inverse transform (untilization/unpacking) to hardware via `ttnn`. |
 | Validation | `--bypass-check` | off | test 1,3,4 | Skip correctness checks (PCC/RMSE and visual validation samples). |
 
 </details>
@@ -219,8 +220,14 @@ Notes:
 # DRAM mode + cache enabled
 ./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --cache --x_size 8 --y_size 8 --m 4096 --n 4096 --k 4096
 
-# On-device tilization/unpacking (ttnn path)
-./run_full_charac.sh ./build/test/test_full_charac --test 1 --unpack-tile device
+# On-device tilization/packing + readback unpacking (ttnn path)
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --pack-tile device --unpack-tile device
+
+# Pack/unpack mode matrix (for isolation and debugging)
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --pack-tile cpu --unpack-tile cpu
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --pack-tile device --unpack-tile cpu
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --pack-tile cpu --unpack-tile device
+./run_full_charac.sh ./build/test/test_full_charac --test 1 --dram --pack-tile device --unpack-tile device
 ```
 
 #### Sub-Device
@@ -280,6 +287,18 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | Tracy Zone (exact string) | Present In | Scope Contents (what is timed) |
 | :--- | :--- | :--- |
 | `Prepare Inputs Compute MM` | new | Full input-preparation function for ComputeMM. |
+| `Prepare Inputs On-Device (ttnn)` | new | DRAM path where input transforms are offloaded to `ttnn` on-device ops. |
+| `ttnn::IN0_Prepare` | new | High-level IN0 (A) preparation wrapper in on-device pack mode. |
+| `ttnn::IN0_CreateTensor` | new | Host tensor object creation for IN0. |
+| `ttnn::IN0_ToDevice` | new | Host-to-device transfer for IN0 row-major tensor. |
+| `ttnn::IN0_TilizePack` | new | On-device tilize + pack for IN0 into target output dtype. |
+| `ttnn::IN1_Prepare` | new | High-level IN1 (B) preparation wrapper in on-device pack mode. |
+| `ttnn::IN1_CreateTensor` | new | Host tensor object creation for IN1. |
+| `ttnn::IN1_ToDevice` | new | Host-to-device transfer for IN1 row-major tensor. |
+| `ttnn::IN1_TilizePack` | new | On-device tilize + pack for IN1 into target output dtype. |
+| `ttnn::Sync` | new | Synchronization after on-device tilize/pack operations. |
+| `ttnn::Output_Prepare` | new | Wrapper for output tensor allocation path in on-device mode. |
+| `ttnn::Output_CreateTensor` | new | Device output tensor allocation in DRAM tile layout. |
 | `Prepare DRAM Inputs` | new | DRAM-specific branch inside ComputeMM input preparation. |
 | `Tilize and Pack IN0 (DRAM)` | new | IN0 tilize + BFP8 pack + buffer write path setup. |
 | `Tilize and Pack IN1 (DRAM)` | new | IN1 tilize + BFP8 pack + buffer write path setup. |
@@ -299,7 +318,21 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `ComputeMM Host FinishWait` | new, old | Queue/device finish synchronization wait. |
 | `ComputeMM Host Post Processing` | new, old | Post-dispatch validation/readback wrapper scope. |
 | `ComputeMM Host Golden Reference` | new, old | FP32 golden matmul reference computation. |
-| `ComputeMM Host Device Readback and Decode` | new, old | Device output readback + unpack/untilize/decode path. |
+| `ComputeMM Host Device Readback` | new | Device output readback wrapper. |
+| `ComputeMM Host Device Unpack (ttnn)` | new | On-device readback transform path using `ttnn` ops. |
+| `ttnn::typecast(FLOAT32)` | new | Converts output tensor to FLOAT32 on device while still in TILE layout. |
+| `ttnn::typecast(FLOAT32)_Finish` | new | Explicit queue `Finish` to ensure cast completion before host readback. |
+| `ttnn::untilize` | new | Converts FLOAT32 output tensor from TILE to ROW_MAJOR on device. |
+| `ttnn::to_vector<float> (Readback)` | new | Materializes casted output tensor to host FP32 vector. |
+| `ComputeMM Host Decode DRAM` | new | Host decode path for DRAM readback when `--unpack-tile cpu`. |
+| `ComputeMM Host Decode L1` | new | Host decode path for L1 readback when DRAM mode is disabled. |
+| `Unpack Device Tiles to FP32` | new | Shared unpack helper wrapper for host decode path. |
+| `Unpack BFP8 Tiles` | new | BFP8 tile unpacking stage inside helper. |
+| `Untilize BFP8 Tiles` | new | BFP8 untilization from tile/swizzled to row-major. |
+| `Unpack BF16 Tiles` | new | BF16 tile unpacking stage inside helper. |
+| `BF16 Nfaces to Swizzled` | new | BF16 layout conversion from nfaces to swizzled organization. |
+| `Untilize BF16 Tiles` | new | BF16 untilization from tile/swizzled to row-major. |
+| `BF16 to FP32` | new | Final BF16-to-FP32 conversion stage in helper. |
 | `ComputeMM Host Validation Metrics` | new, old | PCC/RMSE validation metric computation/checking block. |
 
 </details>
@@ -325,8 +358,7 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `HostPipeline ComputeMM Transform Inputs` | new, old | Tilize + BFP8 pack stage for both input tensors. |
 | `HostPipeline ComputeMM Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for both tensors. |
 | `HostPipeline ComputeMM Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for both tensors. |
-| `HostPipeline ComputeMM Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
-| `HostPipeline ComputeMM Validation Metrics` | new, old | PCC checks for host-only ComputeMM pipeline roundtrip. |
+| `HostPipeline ComputeMM Validation` | new | First-iteration validation stage (inverse transform + PCC checks). |
 
 </details>
 
@@ -342,8 +374,7 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 | `HostPipeline Empty Transform Inputs` | new, old | Tilize + BFP8 pack stage for single tensor. |
 | `HostPipeline Empty Host Enqueue` | new, old | Host write stage (`WriteToBuffer`) for tensor. |
 | `HostPipeline Empty Host FinishWait` | new, old | Host read stage (`ReadFromBuffer`) for tensor. |
-| `HostPipeline Empty Host Post Processing` | new, old | BFP8 unpack + untilize reconstruction stage. |
-| `HostPipeline Empty Validation Metrics` | new, old | PCC checks for host-only empty-tensor pipeline roundtrip. |
+| `HostPipeline Empty Validation Processing` | new | First-iteration validation stage (inverse transform + PCC checks). |
 
 </details>
 
@@ -363,7 +394,7 @@ Inventory is grouped by test area using collapsible sections to keep this docume
 
 Validation-zone policy currently enforced:
 
-* PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation Metrics`, `HostPipeline Empty Validation Metrics`).
+* PCC/RMSE metric calculation/checking is in dedicated validation zones (`ComputeMM Host Validation Metrics`, `HostPipeline ComputeMM Validation`, `HostPipeline Empty Validation Processing`).
 * This keeps validation math out of enqueue/wait timing zones so dispatch overhead analysis remains clean.
 * Visual sanity samples are also emitted during validation (12 aligned elements), printing `ref`, `obs`, and `abs_err` to help quick manual inspection alongside PCC/RMSE.
 
