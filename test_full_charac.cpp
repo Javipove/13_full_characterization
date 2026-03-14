@@ -806,6 +806,11 @@ struct BenchmarkInputs {
   std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>
       out_buffer; // Output (C matrix) in DRAM
 
+  // Dedicated handle for output device tensor when device-side unpack/readback
+  // is requested. This avoids relying on positional assumptions in
+  // ttnn_tensors.
+  std::optional<ttnn::Tensor> output_ttnn_tensor;
+
   // Keep ttnn tensors alive if used for on-device tilization
   std::vector<ttnn::Tensor> ttnn_tensors;
 };
@@ -866,7 +871,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t start_core_y = 0,
     tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
     bool pack_device = false,
-    bool reconstruct_effective_inputs = false);
+  bool reconstruct_effective_inputs = false,
+  bool create_output_ttnn_tensor = false);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -1366,7 +1372,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
     uint32_t start_core_y, tt::DataFormat data_format, bool pack_device,
-    bool reconstruct_effective_inputs) {
+  bool reconstruct_effective_inputs, bool create_output_ttnn_tensor) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   BenchmarkInputs inputs;
@@ -1386,12 +1392,13 @@ BenchmarkInputs prepare_inputs_compute_mm(
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
   auto *target_device = device->get_devices()[0];
 
+  const bool need_output_ttnn_tensor = use_dram && create_output_ttnn_tensor;
+  const ttnn::DataType output_ttnn_dtype =
+      (data_format == tt::DataFormat::Bfp8_b) ? ttnn::DataType::BFLOAT8_B
+                                              : ttnn::DataType::BFLOAT16;
+
   if (pack_device && use_dram) {
     ZoneScopedN("Prepare Inputs On-Device (ttnn)");
-
-    ttnn::DataType output_dtype = (data_format == tt::DataFormat::Bfp8_b)
-                                      ? ttnn::DataType::BFLOAT8_B
-                                      : ttnn::DataType::BFLOAT16;
 
     // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) on device ----
     {
@@ -1415,7 +1422,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
       {
         ZoneScopedN("ttnn::IN0_TilizePack");
         device_tensor_a_final =
-            ttnn::tilize(device_tensor_a_rm, std::nullopt, output_dtype);
+          ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
       }
 
       inputs.in0_buffer =
@@ -1445,7 +1452,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
       {
         ZoneScopedN("ttnn::IN1_TilizePack");
         device_tensor_b_final =
-            ttnn::tilize(device_tensor_b_rm, std::nullopt, output_dtype);
+          ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
       }
 
       inputs.in1_buffer =
@@ -1500,11 +1507,12 @@ BenchmarkInputs prepare_inputs_compute_mm(
       {
         ZoneScopedN("ttnn::Output_CreateTensor");
         device_tensor_out =
-            ttnn::empty(shape, output_dtype, ttnn::Layout::TILE, device,
+            ttnn::empty(shape, output_ttnn_dtype, ttnn::Layout::TILE, device,
                         ttnn::DRAM_MEMORY_CONFIG);
       }
 
       inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
+      inputs.output_ttnn_tensor = device_tensor_out;
       inputs.ttnn_tensors.push_back(device_tensor_out);
     }
 
@@ -1615,17 +1623,29 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // The kernel will write to this buffer using InterleavedAddrGenFast<true>
     // and noc_async_write_tile().
     {
-      uint32_t out_num_tiles = Mt * Nt;
-      uint32_t out_size_bytes = out_num_tiles * single_tile_size;
-      tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
-          .page_size = single_tile_size,
-          .buffer_type = tt_metal::BufferType::DRAM,
-      };
-      tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
-          .size = out_size_bytes};
+      if (need_output_ttnn_tensor) {
+        ZoneScopedN("ttnn::Output_CreateTensor (Unpack Device Bootstrap)");
+        ttnn::Shape shape({1, 1, Mt * 32, Nt * 32});
+        ttnn::Tensor device_tensor_out =
+            ttnn::empty(shape, output_ttnn_dtype, ttnn::Layout::TILE, device,
+                        ttnn::DRAM_MEMORY_CONFIG);
+        inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
+        inputs.output_ttnn_tensor = device_tensor_out;
+        inputs.ttnn_tensors.push_back(device_tensor_out);
+      } else {
+        ZoneScopedN("tt-metal::Output_CreateTensor DRAM Buffer (Manual)");
+        uint32_t out_num_tiles = Mt * Nt;
+        uint32_t out_size_bytes = out_num_tiles * single_tile_size;
+        tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
+            .page_size = single_tile_size,
+            .buffer_type = tt_metal::BufferType::DRAM,
+        };
+        tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
+            .size = out_size_bytes};
 
-      inputs.out_buffer = tt::tt_metal::distributed::MeshBuffer::create(
-          global_buf, device_local, device);
+        inputs.out_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+            global_buf, device_local, device);
+      }
     }
 
     // ---- DRAM Step 4: Initialize per-core L1 zero tile for in2 ----
@@ -2301,7 +2321,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
             params.use_dram, 0, data_format, params.pack_device,
-            !params.bypass_check);
+          !params.bypass_check,
+          params.unpack_device);
       }
 
       {
@@ -2386,9 +2407,12 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         if (params.use_dram) {
           if (params.unpack_device) {
             ZoneScopedN("ComputeMM Host Device Unpack (ttnn)");
-            // Retrieve output tensor from ttnn_tensors (it's the last one
-            // added)
-            auto &device_tensor_out = inputs.ttnn_tensors.back();
+            if (!inputs.output_ttnn_tensor.has_value()) {
+              throw std::runtime_error(
+                  "Device unpack requested, but no output TTNN tensor was "
+                  "created. Ensure output tensor bootstrap is enabled.");
+            }
+            auto &device_tensor_out = inputs.output_ttnn_tensor.value();
 
             if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
               // 1. Typecast to FLOAT32 while still in TILE layout
