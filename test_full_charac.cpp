@@ -1488,9 +1488,12 @@ BenchmarkInputs prepare_inputs_compute_mm(
           ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
       }
 
-      inputs.in0_buffer =
-          device_tensor_a_final.device_storage().get_mesh_buffer();
-      inputs.ttnn_tensors.push_back(device_tensor_a_final);
+      {
+        ZoneScopedN("ttnn::IN0_CaptureBufferAndRetainTensor");
+        inputs.in0_buffer =
+            device_tensor_a_final.device_storage().get_mesh_buffer();
+        inputs.ttnn_tensors.push_back(device_tensor_a_final);
+      }
     }
 
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) on device ----
@@ -1518,9 +1521,12 @@ BenchmarkInputs prepare_inputs_compute_mm(
           ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
       }
 
-      inputs.in1_buffer =
-          device_tensor_b_final.device_storage().get_mesh_buffer();
-      inputs.ttnn_tensors.push_back(device_tensor_b_final);
+      {
+        ZoneScopedN("ttnn::IN1_CaptureBufferAndRetainTensor");
+        inputs.in1_buffer =
+            device_tensor_b_final.device_storage().get_mesh_buffer();
+        inputs.ttnn_tensors.push_back(device_tensor_b_final);
+      }
     }
 
     // ---- DRAM Step 3: Wait for all on-device operations to finish ----
