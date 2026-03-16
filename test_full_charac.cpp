@@ -2508,12 +2508,6 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                     ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
               }
 
-              // Ensure the final cast is complete before host readback.
-              {
-                ZoneScopedN("ttnn::typecast(FLOAT32)_Finish");
-                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
-              }
-
               // 2. Convert to ROW_MAJOR layout on device
               ttnn::Tensor device_tensor_fp32_rm;
               {
