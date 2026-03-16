@@ -10,6 +10,7 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 - [Command Playbook](#command-playbook)
 - [Validation and Precision Model](#validation-and-precision-model)
 - [Execution Matrix (Tried)](#execution-matrix-tried)
+- [Test 2 DRAM Support (Final Scope)](#test-2-dram-support-final-scope)
 - [Profiling with Tracy](#profiling-with-tracy)
 - [Architecture and Grid Notes](#architecture-and-grid-notes)
 - [Troubleshooting](#troubleshooting)
@@ -185,6 +186,40 @@ This table tracks practical configurations that have been exercised in the curre
 | Test 1 DRAM large shape | `--m 4096 --n 4096 --k 4096` | Verified | Used as representative stress case. |
 | Test 3 host-only | Host pipeline ComputeMM | Verified | Host transform and DRAM transfer flow used for overhead isolation. |
 | Test 4 host-only | Host pipeline Empty | Verified | Single-tensor host baseline flow available. |
+
+## Test 2 DRAM Support (Final Scope)
+The Test 2 DRAM adoption is intentionally isolated from other tests and uses a pragmatic scope to reduce integration risk.
+
+### Supported now
+- `--test 2 --dram` is supported for execution/dispatch.
+- DRAM addressing is resolved per split from MeshBuffer device addresses.
+- Per-split input/output buffer lifetimes are retained for the full dispatch loop.
+- Dynamic DRAM blocking is used in Test 2 when DRAM is enabled.
+
+### Compromises and constraints
+- For Test 2 + DRAM, `M` must be divisible by `core_groups`.
+- For Test 2 + DRAM, device pack is currently forced to CPU pack (risk-reduction compromise).
+- Test 2 does not perform output readback/export; `--unpack-tile` and `--output-dtype` are ignored in this test.
+
+These constraints are local to Test 2 and do not modify behavior of Test 0/1/3/4.
+
+### Recommended commands
+```bash
+# DRAM smoke, single split
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 2 --dram --x_size 4 --y_size 4 --core_groups 1 \
+  --m 1024 --n 1024 --k 1024 --num-iters 20
+
+# DRAM multi-split (M divisible by core_groups)
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 2 --dram --x_size 8 --y_size 8 --core_groups 2 \
+  --m 4096 --n 4096 --k 4096 --num-iters 20
+
+# L1 regression check (unchanged behavior expected)
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 2 --x_size 8 --y_size 8 --core_groups 2 \
+  --m 4096 --n 4096 --k 4096 --num-iters 20
+```
 
 ## Profiling with Tracy
 This project is instrumented with Tracy zones for:

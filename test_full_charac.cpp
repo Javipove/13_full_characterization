@@ -912,6 +912,32 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
 
     uint32_t rows_per_sub_device = params.core_y / num_sub_devices;
 
+    // Test 2 DRAM compromise policy (isolated to this test only):
+    // keep split math and runtime-arg generation simple/safe by requiring
+    // equal M partitioning across sub-devices.
+    if (params.use_dram && (params.M % num_sub_devices != 0)) {
+      log_error(LogTest,
+                "Test 2 DRAM currently requires M ({}) divisible by "
+                "core_groups ({}).",
+                params.M, num_sub_devices);
+      return false;
+    }
+
+    if (params.use_dram && params.pack_device) {
+      log_warning(LogTest,
+                  "Test 2 DRAM: --pack-tile device is currently not enabled; "
+                  "falling back to CPU pack for this test.");
+    }
+
+    if (params.unpack_device ||
+        params.output_dtype_mode != OutputDTypeMode::Native) {
+      log_warning(LogTest,
+                  "Test 2 does not perform output readback/export. "
+                  "--unpack-tile/--output-dtype are ignored for this test.");
+    }
+
+    const bool test2_pack_device = params.use_dram ? false : params.pack_device;
+
     // 1. Get Common Params
     auto arch = device->arch();
     uint32_t l1_size = get_l1_size(arch);
@@ -925,6 +951,8 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
     // 2. Prepare Program with Loop over Splits
     tt_metal::Program program;
     uint32_t M_split = params.M / num_sub_devices;
+    std::vector<BenchmarkInputs> split_inputs;
+    split_inputs.reserve(num_sub_devices);
 
     for (uint32_t i = 0; i < num_sub_devices; i++) {
       // Define Core Range for this Split
@@ -945,36 +973,71 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
       uint32_t per_core_Mt = ((Mt - 1) / split_grid_size.y) + 1;
       uint32_t per_core_Nt = ((Nt - 1) / split_grid_size.x) + 1;
 
+      uint32_t out_block_h = per_core_Mt;
+      uint32_t out_block_w = per_core_Nt;
+      uint32_t num_blocks_h = 1;
+      uint32_t num_blocks_w = 1;
+
       uint32_t in0_block_w =
           get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
-                          l1_size, l1_unreserved_base);
+                          l1_size, l1_unreserved_base, params.use_dram);
       if (in0_block_w == 0)
         throw std::runtime_error("Insufficient L1 for SubDevice split");
 
+      if (params.use_dram) {
+        auto [dram_out_block_h, dram_out_block_w, dram_in0_block_w] =
+            get_dynamic_l1_block_params(per_core_Mt, per_core_Nt, Kt,
+                                        single_tile_size, l1_size,
+                                        l1_unreserved_base);
+        out_block_h = dram_out_block_h;
+        out_block_w = dram_out_block_w;
+        in0_block_w = dram_in0_block_w;
+        num_blocks_h = per_core_Mt / out_block_h;
+        num_blocks_w = per_core_Nt / out_block_w;
+      }
+
       auto [out_subblock_h, out_subblock_w] =
-          get_out_subblock_params(per_core_Mt, per_core_Nt);
+          get_out_subblock_params(out_block_h, out_block_w);
 
       auto [in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr, interm_cb_addr,
             in0_addr, in1_addr, out_addr] =
-          get_all_buffers_addresses(per_core_Mt, per_core_Nt, in0_block_w,
-                                    single_tile_size, l1_unreserved_base);
+          get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
+                                    single_tile_size, l1_unreserved_base,
+                                    params.use_dram);
 
-      // Create Kernels/Buffers (Appends to program using strict CoreRange)
-      // L1 mode: out_block_h/w == per_core_Mt/Nt, num_blocks = 1
-      create_program_compute_mm(
-          device, data_format, math_fidelity, fp32_dest_acc_en,
-          single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
-          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, per_core_Mt,
-          per_core_Nt, 1, 1, in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
-          interm_cb_addr, in0_addr, in1_addr, out_addr,
-          /*use_dram=*/false, program, start_y);
-
-      // Prepare Inputs for this split
       // Prepare Inputs for this split
       auto inputs_split = prepare_inputs_compute_mm(
           device, split_grid_size, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
           in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-          /*use_dram=*/false, start_y, data_format, params.pack_device);
+          params.use_dram, start_y, data_format, test2_pack_device,
+          /*reconstruct_effective_inputs=*/false,
+          /*create_output_ttnn_tensor=*/false);
+
+      uint32_t effective_in0_addr = in0_addr;
+      uint32_t effective_in1_addr = in1_addr;
+      uint32_t effective_out_addr = out_addr;
+      if (params.use_dram) {
+        auto coord = tt::tt_metal::distributed::MeshCoordinate(0, 0);
+        effective_in0_addr =
+            inputs_split.in0_buffer->get_device_buffer(coord)->address();
+        effective_in1_addr =
+            inputs_split.in1_buffer->get_device_buffer(coord)->address();
+        effective_out_addr =
+            inputs_split.out_buffer->get_device_buffer(coord)->address();
+      }
+
+      // Create kernels/buffers for this split after addresses are resolved.
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, split_grid_size, Mt, Nt, Kt, in0_block_w,
+          out_subblock_h, out_subblock_w, per_core_Mt, per_core_Nt, out_block_h,
+          out_block_w, num_blocks_h, num_blocks_w, in0_cb_addr, in1_cb_addr,
+          in2_cb_addr, out_cb_addr, interm_cb_addr, effective_in0_addr,
+          effective_in1_addr, effective_out_addr, params.use_dram, program,
+          start_y);
+
+      // Keep per-split buffers/tensors alive across the whole dispatch loop.
+      split_inputs.push_back(std::move(inputs_split));
     }
 
     // 3. Profiling Loop (Standard Dispatch)
