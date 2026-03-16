@@ -91,6 +91,19 @@
 #endif
 #include <tt-metalium/persistent_kernel_cache.hpp>
 
+#if __has_include(<ttnn/operations/core/core.hpp>) &&                               \
+  __has_include(<ttnn/operations/creation.hpp>) &&                                \
+  __has_include(<ttnn/operations/data_movement/tilize/tilize.hpp>) &&             \
+  __has_include(<ttnn/tensor/tensor.hpp>)
+#include <ttnn/operations/core/core.hpp>
+#include <ttnn/operations/creation.hpp>
+#include <ttnn/operations/data_movement/tilize/tilize.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#define HAS_TTNN_DEVICE_TRANSFORMS 1
+#else
+#define HAS_TTNN_DEVICE_TRANSFORMS 0
+#endif
+
 // Utility / test helpers
 // #include "test_common.hpp"
 #include "hostdevcommon/common_values.hpp"
@@ -178,6 +191,8 @@ struct TestParams {
   uint32_t cpu_range;
   uint32_t clean_mode;
   TestType test;
+  bool pack_device;   // true: device, false: cpu
+  bool unpack_device; // true: device, false: cpu
 };
 
 struct DeviceParams {
@@ -202,6 +217,10 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   uint32_t cpu_id;
   uint32_t cpu_range;
   uint32_t clean_mode;
+  bool pack_device = false;
+  bool unpack_device = false;
+  std::string pack_tile_str;
+  std::string unpack_tile_str;
   TestType test;
   uint32_t test_uint;
   try {
@@ -262,6 +281,34 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
                                                                 "--test", 5);
+
+    std::tie(unpack_tile_str, input_args) =
+        test_args::get_command_option_and_remaining_args(
+            input_args, "--unpack-tile", "cpu");
+    if (unpack_tile_str == "device") {
+      unpack_device = true;
+    } else if (unpack_tile_str == "cpu") {
+      unpack_device = false;
+    } else {
+      throw std::runtime_error("Invalid --unpack-tile value: " +
+                               unpack_tile_str +
+                               ". Must be 'cpu' or 'device'");
+    }
+
+    std::tie(pack_tile_str, input_args) =
+        test_args::get_command_option_and_remaining_args(
+            input_args, "--pack-tile", "inherit");
+    if (pack_tile_str == "inherit") {
+      pack_device = unpack_device;
+    } else if (pack_tile_str == "device") {
+      pack_device = true;
+    } else if (pack_tile_str == "cpu") {
+      pack_device = false;
+    } else {
+      throw std::runtime_error("Invalid --pack-tile value: " + pack_tile_str +
+                               ". Must be 'cpu', 'device', or 'inherit'");
+    }
+
     if (test_uint > static_cast<uint32_t>(TestType::InvalidTest)) {
       throw std::runtime_error("Invalid --test value");
     }
@@ -309,7 +356,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .cpu_id = cpu_id,
                     .cpu_range = cpu_range,
                     .clean_mode = clean_mode,
-                    .test = test};
+                    .test = test,
+                    .pack_device = pack_device,
+                    .unpack_device = unpack_device};
   return params;
 }
 
@@ -925,6 +974,16 @@ struct BenchmarkInputsLegacy {
   std::shared_ptr<tt_metal::Buffer> in0_buffer;
   std::shared_ptr<tt_metal::Buffer> in1_buffer;
   std::shared_ptr<tt_metal::Buffer> out_buffer;
+  bool used_device_pack = false;
+  bool used_device_unpack = false;
+  uint32_t in0_device_addr = 0;
+  uint32_t in1_device_addr = 0;
+  uint32_t out_device_addr = 0;
+#if HAS_TTNN_DEVICE_TRANSFORMS
+  std::optional<ttnn::Tensor> in0_device_tensor;
+  std::optional<ttnn::Tensor> in1_device_tensor;
+  std::optional<ttnn::Tensor> out_device_tensor;
+#endif
 };
 
 BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
@@ -932,67 +991,135 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     uint32_t Nt, uint32_t Kt, uint32_t per_core_Mt, uint32_t per_core_Nt,
     uint32_t in0_block_w, uint32_t single_tile_size, uint32_t in0_addr,
     uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
-    const tt::DataFormat data_format = tt::DataFormat::Bfp8_b) {
+    const tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
+    bool pack_device = false, bool unpack_device = false) {
   BenchmarkInputsLegacy inputs;
   inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
   inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, 5.0f);
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
 
+  inputs.used_device_pack = use_dram && pack_device;
+  inputs.used_device_unpack = use_dram && unpack_device;
+
+#if !HAS_TTNN_DEVICE_TRANSFORMS
+  if (inputs.used_device_pack || inputs.used_device_unpack) {
+    log_warning(LogTest,
+                "Device pack/unpack requested but TTNN C++ headers are "
+                "unavailable in this legacy build. Falling back to CPU "
+                "pack/unpack path.");
+    inputs.used_device_pack = false;
+    inputs.used_device_unpack = false;
+  }
+#endif
+
   if (use_dram) {
-    std::vector<uint32_t> in0_packed;
-    try {
-      in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
-                                                      Kt * 32, data_format);
-      inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed, Mt * 32, Kt * 32,
-                                                   data_format);
-    } catch (const std::exception &e) {
-      throw std::runtime_error(
-          "Legacy ComputeMM DRAM IN0 transform failed: Mt=" +
-          std::to_string(Mt) + ", Kt=" + std::to_string(Kt) +
-          ", in0_vec_size=" + std::to_string(inputs.in0_vec.size()) +
-          ", what=" + e.what());
-    }
+    if (inputs.used_device_pack) {
+#if HAS_TTNN_DEVICE_TRANSFORMS
+      const ttnn::DataType output_ttnn_dtype =
+          (data_format == tt::DataFormat::Bfp8_b) ? ttnn::DataType::BFLOAT8_B
+                                                  : ttnn::DataType::BFLOAT16;
 
-    uint32_t in0_num_tiles = Mt * Kt;
-    uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
-    inputs.in0_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = device,
-        .size = in0_size_bytes,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
-    tt_metal::EnqueueWriteBuffer(device->command_queue(), inputs.in0_buffer, in0_packed, false);
-    tt_metal::Finish(device->command_queue());
+      {
+        ttnn::Shape shape_a({1, 1, Mt * 32, Kt * 32});
+        auto host_tensor_a =
+            ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in0_vec), shape_a,
+                         ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
+        auto device_tensor_a_rm = ttnn::to_device(host_tensor_a, device);
+        auto device_tensor_a_tiled =
+            ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
+        inputs.in0_device_addr = device_tensor_a_tiled.buffer_address();
+        inputs.in0_device_tensor = std::move(device_tensor_a_tiled);
+        inputs.in0_vec = inputs.in0_device_tensor->to_vector<float>();
+      }
 
-    std::vector<uint32_t> in1_packed;
-    try {
-      in1_packed = pack_tilized_fp32_to_device_format(inputs.in1_vec, Kt * 32,
-                                                      Nt * 32, data_format);
-      inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed, Kt * 32, Nt * 32,
-                                                   data_format);
-    } catch (const std::exception &e) {
-      throw std::runtime_error(
-          "Legacy ComputeMM DRAM IN1 transform failed: Kt=" +
-          std::to_string(Kt) + ", Nt=" + std::to_string(Nt) +
-          ", in1_vec_size=" + std::to_string(inputs.in1_vec.size()) +
-          ", what=" + e.what());
+      {
+        ttnn::Shape shape_b({1, 1, Kt * 32, Nt * 32});
+        auto host_tensor_b =
+            ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in1_vec), shape_b,
+                         ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
+        auto device_tensor_b_rm = ttnn::to_device(host_tensor_b, device);
+        auto device_tensor_b_tiled =
+            ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
+        inputs.in1_device_addr = device_tensor_b_tiled.buffer_address();
+        inputs.in1_device_tensor = std::move(device_tensor_b_tiled);
+        inputs.in1_vec = inputs.in1_device_tensor->to_vector<float>();
+      }
+#endif
+    } else {
+      std::vector<uint32_t> in0_packed;
+      try {
+        in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
+                                                        Kt * 32, data_format);
+        inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed, Mt * 32,
+                                                     Kt * 32, data_format);
+      } catch (const std::exception &e) {
+        throw std::runtime_error(
+            "Legacy ComputeMM DRAM IN0 transform failed: Mt=" +
+            std::to_string(Mt) + ", Kt=" + std::to_string(Kt) +
+            ", in0_vec_size=" + std::to_string(inputs.in0_vec.size()) +
+            ", what=" + e.what());
+      }
+
+      uint32_t in0_num_tiles = Mt * Kt;
+      uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
+      inputs.in0_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = device,
+              .size = in0_size_bytes,
+              .page_size = single_tile_size,
+              .buffer_type = tt_metal::BufferType::DRAM});
+      tt_metal::EnqueueWriteBuffer(device->command_queue(), inputs.in0_buffer,
+                                   in0_packed, false);
+      tt_metal::Finish(device->command_queue());
+
+      std::vector<uint32_t> in1_packed;
+      try {
+        in1_packed = pack_tilized_fp32_to_device_format(inputs.in1_vec, Kt * 32,
+                                                        Nt * 32, data_format);
+        inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed, Kt * 32,
+                                                     Nt * 32, data_format);
+      } catch (const std::exception &e) {
+        throw std::runtime_error(
+            "Legacy ComputeMM DRAM IN1 transform failed: Kt=" +
+            std::to_string(Kt) + ", Nt=" + std::to_string(Nt) +
+            ", in1_vec_size=" + std::to_string(inputs.in1_vec.size()) +
+            ", what=" + e.what());
+      }
+      uint32_t in1_num_tiles = Kt * Nt;
+      uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+      inputs.in1_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = device,
+              .size = in1_size_bytes,
+              .page_size = single_tile_size,
+              .buffer_type = tt_metal::BufferType::DRAM});
+      tt_metal::EnqueueWriteBuffer(device->command_queue(), inputs.in1_buffer,
+                                   in1_packed, false);
+      tt_metal::Finish(device->command_queue());
     }
-    uint32_t in1_num_tiles = Kt * Nt;
-    uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
-    inputs.in1_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = device,
-        .size = in1_size_bytes,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
-    tt_metal::EnqueueWriteBuffer(device->command_queue(), inputs.in1_buffer, in1_packed, false);
-    tt_metal::Finish(device->command_queue());
 
     uint32_t out_num_tiles = Mt * Nt;
     uint32_t out_size_bytes = out_num_tiles * single_tile_size;
-    inputs.out_buffer = tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
-        .device = device,
-        .size = out_size_bytes,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM});
+    if (inputs.used_device_unpack) {
+#if HAS_TTNN_DEVICE_TRANSFORMS
+      const ttnn::DataType output_ttnn_dtype =
+          (data_format == tt::DataFormat::Bfp8_b) ? ttnn::DataType::BFLOAT8_B
+                                                  : ttnn::DataType::BFLOAT16;
+      ttnn::Shape out_shape({1, 1, Mt * 32, Nt * 32});
+      auto out_tensor =
+          ttnn::empty(out_shape, output_ttnn_dtype, ttnn::Layout::TILE, device,
+                      ttnn::DRAM_MEMORY_CONFIG);
+      inputs.out_device_addr = out_tensor.buffer_address();
+      inputs.out_device_tensor = std::move(out_tensor);
+#endif
+    } else {
+      inputs.out_buffer =
+          tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
+              .device = device,
+              .size = out_size_bytes,
+              .page_size = single_tile_size,
+              .buffer_type = tt_metal::BufferType::DRAM});
+    }
 
     for (uint32_t y = 0; y < core_range.y; y++) {
       for (uint32_t x = 0; x < core_range.x; x++) {
@@ -1517,7 +1644,8 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         inputs = prepare_inputs_compute_mm_legacy(
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
-            params.use_dram, data_format);
+            params.use_dram, data_format, params.pack_device,
+            params.unpack_device);
       }
 
       {
@@ -1526,12 +1654,21 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
         effective_in1_addr = in1_addr;
         effective_out_addr = out_addr;
         if (params.use_dram) {
-          effective_in0_addr = inputs.in0_buffer->address();
-          effective_in1_addr = inputs.in1_buffer->address();
-          effective_out_addr = inputs.out_buffer->address();
-          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
-                   effective_in0_addr, effective_in1_addr,
-                   effective_out_addr);
+          effective_in0_addr =
+              inputs.used_device_pack ? inputs.in0_device_addr
+                                      : inputs.in0_buffer->address();
+          effective_in1_addr =
+              inputs.used_device_pack ? inputs.in1_device_addr
+                                      : inputs.in1_buffer->address();
+          effective_out_addr =
+              inputs.used_device_unpack ? inputs.out_device_addr
+                                        : inputs.out_buffer->address();
+          log_info(LogTest,
+                   "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}, "
+                   "pack_mode={}, unpack_mode={}",
+                   effective_in0_addr, effective_in1_addr, effective_out_addr,
+                   inputs.used_device_pack ? "device" : "cpu",
+                   inputs.used_device_unpack ? "device" : "cpu");
         }
       }
     }
@@ -1584,10 +1721,29 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
       {
         ZoneScopedN("ComputeMM Host Device Readback and Decode");
         if (params.use_dram) {
-          std::vector<uint32_t> out_data;
-          tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer, out_data, true);
-          device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32, Nt * 32,
-                                                   data_format);
+          if (inputs.used_device_unpack) {
+#if HAS_TTNN_DEVICE_TRANSFORMS
+            if (!inputs.out_device_tensor.has_value()) {
+              throw std::runtime_error(
+                  "Device unpack mode requested but no output TTNN tensor was "
+                  "created.");
+            }
+            device_vec = inputs.out_device_tensor->to_vector<float>();
+#else
+            std::vector<uint32_t> out_data;
+            tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer,
+                                        out_data, true);
+            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                     Nt * 32, data_format);
+#endif
+          } else {
+            std::vector<uint32_t> out_data;
+            tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer,
+                                        out_data, true);
+            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                     Nt * 32, data_format);
+          }
+
           if (device_vec.size() > (size_t)(params.M * params.N)) {
             std::vector<float> trimmed(params.M * params.N, 0.0f);
             for (uint32_t r = 0; r < params.M; ++r) {
@@ -2269,6 +2425,12 @@ int main(int argc, char **argv) {
     pin_to_cpu(params.cpu_id, params.cpu_range);
   }
 
+  if (!params.use_dram && (params.pack_device || params.unpack_device)) {
+    log_warning(LogTest,
+                "--pack-tile/--unpack-tile are only active in DRAM ComputeMM. "
+                "Current configuration uses L1 or non-ComputeMM path.");
+  }
+
   //// Print test summary
   log_info(LogTest, "Full Characterization Benchmarking Test (LEGACY)");
   log_info(LogTest, "==============================================");
@@ -2276,10 +2438,12 @@ int main(int argc, char **argv) {
   log_info(LogTest,
            "Starting with parameters: M={}, N={}, K={}, dtype={}, fidel={}, "
            "core_x={}, core_y={}, core_groups={}, num_iters={}, clean_mode={}, "
-           "cache={}",
+           "cache={}, pack_tile={}, unpack_tile={}",
            params.M, params.N, params.K, params.dtype, params.fidel,
            params.core_x, params.core_y, params.core_groups, params.num_iters,
-           params.clean_mode, params.use_cache);
+           params.clean_mode, params.use_cache,
+           params.pack_device ? "device" : "cpu",
+           params.unpack_device ? "device" : "cpu");
 
   if (params.core_x > max_x || params.core_y > max_y) {
     log_error(
