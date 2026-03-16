@@ -1454,6 +1454,7 @@ BenchmarkInputs prepare_inputs_compute_mm(
   // we fill it with zeros since we don't use bias in this benchmark.
   std::vector<uint32_t> in2(single_tile_size / sizeof(uint32_t), 0);
   auto *target_device = device->get_devices()[0];
+  (void)reconstruct_effective_inputs;
 
   const bool need_output_ttnn_tensor = use_dram && create_output_ttnn_tensor;
   const ttnn::DataType output_ttnn_dtype =
@@ -1463,18 +1464,24 @@ BenchmarkInputs prepare_inputs_compute_mm(
   if (pack_device && use_dram) {
     ZoneScopedN("Prepare Inputs On-Device (ttnn)");
 
+    ttnn::Tensor host_tensor_a;
+    ttnn::Tensor host_tensor_b;
+    {
+      ZoneScopedN("ttnn::CreateHostTensors(IN0+IN1)");
+      ttnn::Shape shape_a({1, 1, Mt * 32, Kt * 32});
+      host_tensor_a =
+          ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in0_vec), shape_a,
+                       ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
+
+      ttnn::Shape shape_b({1, 1, Kt * 32, Nt * 32});
+      host_tensor_b =
+          ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in1_vec), shape_b,
+                       ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
+    }
+
     // ---- DRAM Step 1: Tilize and pack IN0 (full matrix A) on device ----
     {
       ZoneScopedN("ttnn::IN0_Prepare");
-      ttnn::Shape shape({1, 1, Mt * 32, Kt * 32});
-      ttnn::Tensor host_tensor_a;
-      {
-        ZoneScopedN("ttnn::IN0_CreateTensor");
-        host_tensor_a =
-            ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in0_vec), shape,
-                         ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
-      }
-
       ttnn::Tensor device_tensor_a_rm;
       {
         ZoneScopedN("ttnn::IN0_ToDevice");
@@ -1499,15 +1506,6 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // ---- DRAM Step 2: Tilize and pack IN1 (full matrix B) on device ----
     {
       ZoneScopedN("ttnn::IN1_Prepare");
-      ttnn::Shape shape_b({1, 1, Kt * 32, Nt * 32});
-      ttnn::Tensor host_tensor_b;
-      {
-        ZoneScopedN("ttnn::IN1_CreateTensor");
-        host_tensor_b =
-            ttnn::Tensor(tt::tt_metal::HostBuffer(inputs.in1_vec), shape_b,
-                         ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
-      }
-
       ttnn::Tensor device_tensor_b_rm;
       {
         ZoneScopedN("ttnn::IN1_ToDevice");
@@ -1535,38 +1533,6 @@ BenchmarkInputs prepare_inputs_compute_mm(
       tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
-    if (reconstruct_effective_inputs) {
-      // Reconstruct effective packed inputs for rigorous golden-reference
-      // validation. This aligns device-pack path with cpu-pack semantics.
-      std::vector<uint32_t> in0_packed_effective;
-      {
-        ZoneScopedN("ComputeMM Host Validation: Read Packed IN0 (Device Pack)");
-        tt::tt_metal::distributed::ReadShard(
-            device->mesh_command_queue(), in0_packed_effective, inputs.in0_buffer,
-            tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
-      }
-      {
-        ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
-        inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
-                                                     Mt * 32, Kt * 32,
-                                                     data_format);
-      }
-
-      std::vector<uint32_t> in1_packed_effective;
-      {
-        ZoneScopedN("ComputeMM Host Validation: Read Packed IN1 (Device Pack)");
-        tt::tt_metal::distributed::ReadShard(
-            device->mesh_command_queue(), in1_packed_effective, inputs.in1_buffer,
-            tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
-      }
-      {
-        ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
-        inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
-                                                     Kt * 32, Nt * 32,
-                                                     data_format);
-      }
-    }
-
     // ---- DRAM Step 4: Create empty output buffer via ttnn ----
     {
       ZoneScopedN("ttnn::Output_Prepare");
@@ -1578,6 +1544,11 @@ BenchmarkInputs prepare_inputs_compute_mm(
         device_tensor_out =
             ttnn::empty(shape, output_ttnn_dtype, ttnn::Layout::TILE, device,
                         ttnn::DRAM_MEMORY_CONFIG);
+      }
+
+      {
+        ZoneScopedN("ttnn::Output_CreateTensor_Finish");
+        tt::tt_metal::distributed::Finish(device->mesh_command_queue());
       }
 
       inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
@@ -1698,6 +1669,12 @@ BenchmarkInputs prepare_inputs_compute_mm(
         ttnn::Tensor device_tensor_out =
             ttnn::empty(shape, output_ttnn_dtype, ttnn::Layout::TILE, device,
                         ttnn::DRAM_MEMORY_CONFIG);
+
+        {
+          ZoneScopedN("ttnn::Output_CreateTensor_Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+        }
+
         inputs.out_buffer = device_tensor_out.device_storage().get_mesh_buffer();
         inputs.output_ttnn_tensor = device_tensor_out;
         inputs.ttnn_tensors.push_back(device_tensor_out);
@@ -2457,6 +2434,42 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       log_info(LogTest, "Validation Started...");
       log_validation_pipeline_steps(params);
 
+      if (params.use_dram && params.pack_device) {
+        ZoneScopedN("ComputeMM Host Validation: Reconstruct Effective Inputs");
+
+        // Reconstruct effective packed inputs for rigorous golden-reference
+        // validation. This aligns device-pack path with cpu-pack semantics.
+        std::vector<uint32_t> in0_packed_effective;
+        {
+          ZoneScopedN("ComputeMM Host Validation: Read Packed IN0 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in0_packed_effective,
+              inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
+          inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
+                                                       Mt * 32, Kt * 32,
+                                                       data_format);
+        }
+
+        std::vector<uint32_t> in1_packed_effective;
+        {
+          ZoneScopedN("ComputeMM Host Validation: Read Packed IN1 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in1_packed_effective,
+              inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
+          inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
+                                                       Kt * 32, Nt * 32,
+                                                       data_format);
+        }
+      }
+
       // Compute Golden Reference
       std::vector<float> golden_vec;
       {
@@ -2553,9 +2566,12 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             // === DRAM Readback ===
             // Read entire output buffer from DRAM
             std::vector<uint32_t> out_data;
-            tt::tt_metal::distributed::ReadShard(
-                device->mesh_command_queue(), out_data, inputs.out_buffer,
-                tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+            {
+              ZoneScopedN("ComputeMM Host ReadShard DRAM Output");
+              tt::tt_metal::distributed::ReadShard(
+                  device->mesh_command_queue(), out_data, inputs.out_buffer,
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+            }
 
             {
               ZoneScopedN("ComputeMM Host Decode DRAM");
@@ -2582,15 +2598,18 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           // === L1 Readback (per-core: read all raw tiles first) ===
           std::vector<std::vector<uint32_t>> all_core_tiles(num_cores_y *
                                                             num_cores_x);
-          for (int y = 0; y < (int)num_cores_y; y++) {
-            for (int x = 0; x < (int)num_cores_x; x++) {
-              CoreCoord core = {(std::size_t)x, (std::size_t)y};
-              uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
-              uint32_t read_size = core_n_tiles * single_tile_size;
+          {
+            ZoneScopedN("ComputeMM Host ReadFromDeviceL1 All Cores");
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                CoreCoord core = {(std::size_t)x, (std::size_t)y};
+                uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+                uint32_t read_size = core_n_tiles * single_tile_size;
 
-              tt_metal::detail::ReadFromDeviceL1(
-                  target_device, core, out_addr, read_size,
-                  all_core_tiles[y * num_cores_x + x]);
+                tt_metal::detail::ReadFromDeviceL1(
+                    target_device, core, out_addr, read_size,
+                    all_core_tiles[y * num_cores_x + x]);
+              }
             }
           }
 
@@ -2750,8 +2769,12 @@ bool test_host_pipeline_compute_mm(
     };
     tt::tt_metal::distributed::ReplicatedBufferConfig global_in0{
         .size = in0_size_bytes};
-    auto in0_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> in0_buffer;
+    {
+      ZoneScopedN("HostPipeline ComputeMM Create IN0 MeshBuffer");
+      in0_buffer = tt::tt_metal::distributed::MeshBuffer::create(
         global_in0, device_local_in0, device);
+    }
 
     tt::tt_metal::distributed::DeviceLocalBufferConfig device_local_in1{
         .page_size = single_tile_size,
@@ -2759,8 +2782,12 @@ bool test_host_pipeline_compute_mm(
     };
     tt::tt_metal::distributed::ReplicatedBufferConfig global_in1{
         .size = in1_size_bytes};
-    auto in1_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> in1_buffer;
+    {
+      ZoneScopedN("HostPipeline ComputeMM Create IN1 MeshBuffer");
+      in1_buffer = tt::tt_metal::distributed::MeshBuffer::create(
         global_in1, device_local_in1, device);
+    }
 
     HostPipelineStats stats;
     uint32_t completed_iters = 0;
@@ -2924,9 +2951,12 @@ bool test_host_pipeline_empty_tensor(
     };
     tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
         .size = tensor_size_bytes};
-
-    auto tensor_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+    std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> tensor_buffer;
+    {
+      ZoneScopedN("HostPipeline Empty Create MeshBuffer");
+      tensor_buffer = tt::tt_metal::distributed::MeshBuffer::create(
         global_buf, device_local, device);
+    }
 
     HostPipelineStats stats;
     double transfer_window_us = 0.0;
