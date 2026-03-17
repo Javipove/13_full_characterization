@@ -1001,6 +1001,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     const tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
   bool pack_device = false, bool unpack_device = false,
   bool reconstruct_effective_inputs = false) {
+  ZoneScopedN("Prepare Inputs Compute MM (leg)");
   BenchmarkInputsLegacy inputs;
   inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
   inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, 5.0f);
@@ -1029,6 +1030,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
 
   if (use_dram) {
     if (inputs.used_device_pack) {
+      ZoneScopedN("Prepare Inputs On-Device (ttnn) (leg)");
 #if HAS_TTNN_DEVICE_TRANSFORMS
       try {
         const ttnn::DataType output_ttnn_dtype =
@@ -1057,19 +1059,6 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
             inputs.in0_device_addr = device_tensor_a_tiled.buffer_address();
             inputs.in0_device_tensor = std::move(device_tensor_a_tiled);
           }
-          if (reconstruct_effective_inputs) {
-#if HAS_TTNN_DEVICE_UNTILIZE
-            ttnn::Tensor in0_rm;
-            {
-              ZoneScopedN("ttnn::untilize");
-              in0_rm = ttnn::untilize(inputs.in0_device_tensor.value());
-            }
-            {
-              ZoneScopedN("ttnn::to_vector<float> (Readback)");
-              inputs.in0_vec = in0_rm.to_vector<float>();
-            }
-#endif
-          }
         }
 
         {
@@ -1093,19 +1082,6 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
             ZoneScopedN("ttnn::IN1_CaptureBufferAndRetainTensor");
             inputs.in1_device_addr = device_tensor_b_tiled.buffer_address();
             inputs.in1_device_tensor = std::move(device_tensor_b_tiled);
-          }
-          if (reconstruct_effective_inputs) {
-#if HAS_TTNN_DEVICE_UNTILIZE
-            ttnn::Tensor in1_rm;
-            {
-              ZoneScopedN("ttnn::untilize");
-              in1_rm = ttnn::untilize(inputs.in1_device_tensor.value());
-            }
-            {
-              ZoneScopedN("ttnn::to_vector<float> (Readback)");
-              inputs.in1_vec = in1_rm.to_vector<float>();
-            }
-#endif
           }
         }
 
@@ -1182,6 +1158,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     uint32_t out_size_bytes = out_num_tiles * single_tile_size;
     if (inputs.used_device_unpack) {
 #if HAS_TTNN_DEVICE_TRANSFORMS
+      ZoneScopedN("ttnn::Output_CreateTensor (Unpack Device Bootstrap) (leg)");
       try {
         const ttnn::DataType output_ttnn_dtype =
             (data_format == tt::DataFormat::Bfp8_b) ? ttnn::DataType::BFLOAT8_B
@@ -1201,6 +1178,7 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
     }
 
     if (!inputs.used_device_unpack) {
+      ZoneScopedN("tt-metal::Output_CreateTensor DRAM Buffer (Manual) (leg)");
       inputs.out_buffer =
           tt_metal::CreateBuffer(tt_metal::InterleavedBufferConfig{
               .device = device,
@@ -1733,7 +1711,8 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
             device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
             params.use_dram, data_format, params.pack_device,
-          params.unpack_device, !params.bypass_check);
+          params.unpack_device,
+          (!params.bypass_check) && (!params.pack_device));
       }
 
       {
@@ -1796,6 +1775,42 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
       ZoneScopedN("ComputeMM Host Post Processing");
       log_info(LogTest, "Validation Started...");
 
+      if (params.use_dram && inputs.used_device_pack) {
+        ZoneScopedN("ComputeMM Host Validation: Reconstruct Effective Inputs (leg)");
+#if HAS_TTNN_DEVICE_TRANSFORMS && HAS_TTNN_DEVICE_UNTILIZE
+        if (!inputs.in0_device_tensor.has_value() ||
+            !inputs.in1_device_tensor.has_value()) {
+          throw std::runtime_error(
+              "Device pack validation reconstruction requires retained input "
+              "TTNN tensors, but they are missing.");
+        }
+
+        ttnn::Tensor in0_rm;
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 (Device Pack) (leg)");
+          in0_rm = ttnn::untilize(inputs.in0_device_tensor.value());
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 Readback (leg)");
+          inputs.in0_vec = in0_rm.to_vector<float>();
+        }
+
+        ttnn::Tensor in1_rm;
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 (Device Pack) (leg)");
+          in1_rm = ttnn::untilize(inputs.in1_device_tensor.value());
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 Readback (leg)");
+          inputs.in1_vec = in1_rm.to_vector<float>();
+        }
+#else
+        throw std::runtime_error(
+            "Device pack validation reconstruction requires TTNN device "
+            "transform and untilize support.");
+#endif
+      }
+
       std::vector<float> golden_vec;
       {
         ZoneScopedN("ComputeMM Host Golden Reference");
@@ -1807,18 +1822,17 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
       log_info(LogTest, "Reading Device Results...");
       std::vector<float> device_vec(params.M * params.N, 0.0f);
       {
-        ZoneScopedN("ComputeMM Host Device Readback and Decode");
+        ZoneScopedN("ComputeMM Host Device Readback");
         if (params.use_dram) {
           if (inputs.used_device_unpack) {
 #if HAS_TTNN_DEVICE_TRANSFORMS
+            ZoneScopedN("ComputeMM Host Device Unpack (ttnn) (leg)");
             if (!inputs.out_device_tensor.has_value()) {
               throw std::runtime_error(
                   "Device unpack mode requested but no output TTNN tensor was "
                   "created.");
             }
 #if HAS_TTNN_DEVICE_UNTILIZE
-            // Mirror the new API validation pipeline: TILE output -> untilize on
-            // device -> host readback.
             ttnn::Tensor device_tensor_rm;
             {
               ZoneScopedN("ttnn::untilize");
@@ -1844,22 +1858,32 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
 #endif
           } else {
             std::vector<uint32_t> out_data;
-            tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer,
-                                        out_data, true);
-            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
-                                                     Nt * 32, data_format);
+            {
+              ZoneScopedN("ComputeMM Host ReadShard DRAM Output (leg)");
+              tt_metal::EnqueueReadBuffer(device->command_queue(),
+                                          inputs.out_buffer, out_data, true);
+            }
+            {
+              ZoneScopedN("ComputeMM Host Decode DRAM (leg)");
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                       Nt * 32, data_format);
+            }
           }
 
           if (device_vec.size() > (size_t)(params.M * params.N)) {
-            std::vector<float> trimmed(params.M * params.N, 0.0f);
-            for (uint32_t r = 0; r < params.M; ++r) {
-              for (uint32_t c = 0; c < params.N; ++c) {
-                trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+            {
+              ZoneScopedN("ComputeMM Host Trim Device Readback to MxN (leg)");
+              std::vector<float> trimmed(params.M * params.N, 0.0f);
+              for (uint32_t r = 0; r < params.M; ++r) {
+                for (uint32_t c = 0; c < params.N; ++c) {
+                  trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                }
               }
+              device_vec = trimmed;
             }
-            device_vec = trimmed;
           }
         } else {
+          ZoneScopedN("ComputeMM Host ReadFromDeviceL1 All Cores (leg)");
           for (int y = 0; y < (int)num_cores_y; y++) {
             for (int x = 0; x < (int)num_cores_x; x++) {
               CoreCoord core = {(std::size_t)x, (std::size_t)y};
@@ -1870,6 +1894,7 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
               tt_metal::detail::ReadFromDeviceL1(device, core, out_addr,
                                                  read_size, core_data_tiles);
 
+              ZoneScopedN("ComputeMM Host Decode L1 (leg)");
                 auto core_data_untilized = unpack_device_tiles_to_fp32(
                   core_data_tiles, per_core_Mt * 32, per_core_Nt * 32,
                   data_format);
@@ -2083,15 +2108,6 @@ bool test_host_pipeline_compute_mm(tt::tt_metal::IDevice *device,
     }
     }
 
-      auto t_iter_end = std::chrono::steady_clock::now();
-      stats.end_to_end_us +=
-          std::chrono::duration_cast<std::chrono::microseconds>(t_iter_end -
-                                                                 t_iter_start)
-              .count();
-      completed_iters++;
-    }
-    }
-
     log_info(LogTest,
              "Host-only ComputeMM pipeline dims: Mt={}, Nt={}, Kt={}, "
              "completed_iters={}",
@@ -2109,9 +2125,15 @@ bool test_host_pipeline_empty_tensor(tt::tt_metal::IDevice *device,
                                      const TestParams &params) {
   bool pass = true;
   try {
-  ZoneScopedN("HostPipeline Empty Functional Blocks");
-  log_info(LogTest,
-       "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
+    ZoneScopedN("HostPipeline Empty Functional Blocks");
+    log_info(LogTest,
+             "Starting Host-Only Empty Tensor Pipeline Test (no kernel dispatch)");
+
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    std::tie(Mt, Nt, Kt) =
+        get_aligned_input_tile_num(params.M, params.N, params.K);
+    (void)Kt;
+
     if (params.num_iters == 0) {
       log_error(LogTest, "Host-only Empty requires --num-iters > 0");
       return false;
@@ -2538,6 +2560,19 @@ int main(int argc, char **argv) {
     log_error(LogTest,
               "--pack-tile/--unpack-tile are supported only for --test 1 with "
               "--dram. Deterministic mode forbids ignoring these requests.");
+    if (params.use_cache) {
+      disable_persistent_kernel_cache_if_available();
+    }
+    tt_metal::CloseDevice(device_params.device);
+    return -1;
+  }
+
+  if (params.test == TestType::ComputeMM && params.use_dram &&
+      (params.pack_device != params.unpack_device)) {
+    log_error(LogTest,
+              "Deterministic profiling mode requires a single selected DRAM "
+              "pipeline for test 1: either --pack-tile cpu --unpack-tile cpu "
+              "or --pack-tile device --unpack-tile device.");
     if (params.use_cache) {
       disable_persistent_kernel_cache_if_available();
     }

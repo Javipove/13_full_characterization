@@ -12,6 +12,7 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 - [Execution Matrix (Tried)](#execution-matrix-tried)
 - [Test 2 DRAM Support (Final Scope)](#test-2-dram-support-final-scope)
 - [Profiling with Tracy](#profiling-with-tracy)
+- [Test 1 Tracy Zone Mapping](#test-1-tracy-zone-mapping)
 - [Architecture and Grid Notes](#architecture-and-grid-notes)
 - [Troubleshooting](#troubleshooting)
 - [Project Layout](#project-layout)
@@ -233,6 +234,63 @@ Recommended workflow:
 2. Launch Tracy server.
 3. Run benchmark command from this README.
 4. Compare `Host Enqueue` and `Host FinishWait` regions across modes.
+
+## Test 1 Tracy Zone Mapping
+This mapping is for side-by-side trace analysis between [test_full_charac.cpp](test_full_charac.cpp) (new API) and [test_full_charac_old.cpp](test_full_charac_old.cpp) (legacy port).
+
+Rule used:
+- Exact same behavior and intent keeps the same zone name.
+- Equivalent legacy-only behavior is labeled with ` (leg)` in the legacy trace.
+
+| New API zone | Legacy zone | Mapping |
+| :-- | :-- | :-- |
+| `ComputeMM Functional Blocks` | `ComputeMM Functional Blocks` | Exact |
+| `ComputeMM Input Data Processing` | `ComputeMM Input Data Processing` | Exact |
+| `ComputeMM Host Setup and Blocking` | `ComputeMM Host Setup and Blocking` | Exact |
+| `ComputeMM Host Prepare Inputs` | `ComputeMM Host Prepare Inputs` | Exact |
+| `Prepare Inputs Compute MM` | `Prepare Inputs Compute MM (leg)` | Equivalent (legacy naming) |
+| `Prepare Inputs On-Device (ttnn)` | `Prepare Inputs On-Device (ttnn) (leg)` | Equivalent (legacy naming) |
+| `ttnn::IN0_Prepare` | `ttnn::IN0_Prepare` | Exact |
+| `ttnn::IN0_ToDevice` | `ttnn::IN0_ToDevice` | Exact |
+| `ttnn::IN0_TilizePack` | `ttnn::IN0_TilizePack` | Exact |
+| `ttnn::IN0_CaptureBufferAndRetainTensor` | `ttnn::IN0_CaptureBufferAndRetainTensor` | Exact |
+| `ttnn::IN1_Prepare` | `ttnn::IN1_Prepare` | Exact |
+| `ttnn::IN1_ToDevice` | `ttnn::IN1_ToDevice` | Exact |
+| `ttnn::IN1_TilizePack` | `ttnn::IN1_TilizePack` | Exact |
+| `ttnn::IN1_CaptureBufferAndRetainTensor` | `ttnn::IN1_CaptureBufferAndRetainTensor` | Exact |
+| `ttnn::Sync` | `ttnn::Sync` | Exact |
+| `ttnn::Output_CreateTensor (Unpack Device Bootstrap)` | `ttnn::Output_CreateTensor (Unpack Device Bootstrap) (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Resolve Buffer Addresses` | `ComputeMM Host Resolve Buffer Addresses` | Exact |
+| `ComputeMM Host Program Build` | `ComputeMM Host Program Build` | Exact |
+| `ComputeMM Host Dispatch` | `ComputeMM Host Dispatch` | Exact |
+| `ComputeMM Host Dispatch Iteration` | `ComputeMM Host Dispatch Iteration` | Exact |
+| `ComputeMM Host Enqueue` | `ComputeMM Host Enqueue` | Exact |
+| `ComputeMM Host FinishWait` | `ComputeMM Host FinishWait` | Exact |
+| `ComputeMM Host Post Processing` | `ComputeMM Host Post Processing` | Exact |
+| `ComputeMM Host Validation: Reconstruct Effective Inputs` | `ComputeMM Host Validation: Reconstruct Effective Inputs (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Validation: Decode Effective IN0 (Device Pack)` | `ComputeMM Host Validation: Decode Effective IN0 (Device Pack) (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Validation: Read Packed IN0 (Device Pack)` | `ComputeMM Host Validation: Decode Effective IN0 Readback (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Validation: Decode Effective IN1 (Device Pack)` | `ComputeMM Host Validation: Decode Effective IN1 (Device Pack) (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Validation: Read Packed IN1 (Device Pack)` | `ComputeMM Host Validation: Decode Effective IN1 Readback (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Golden Reference` | `ComputeMM Host Golden Reference` | Exact |
+| `ComputeMM Host Device Readback` | `ComputeMM Host Device Readback` | Exact |
+| `ComputeMM Host Device Unpack (ttnn)` | `ComputeMM Host Device Unpack (ttnn) (leg)` | Equivalent (legacy naming) |
+| `ttnn::untilize` | `ttnn::untilize` | Exact |
+| `ttnn::untilize_Finish` | `ttnn::untilize_Finish` | Exact |
+| `ttnn::to_vector<float> (Readback)` | `ttnn::to_vector<float> (Readback)` | Exact |
+| `tt-metal::Output_CreateTensor DRAM Buffer (Manual)` | `tt-metal::Output_CreateTensor DRAM Buffer (Manual) (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host ReadShard DRAM Output` | `ComputeMM Host ReadShard DRAM Output (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Decode DRAM` | `ComputeMM Host Decode DRAM (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Trim DRAM Decode to MxN` | `ComputeMM Host Trim Device Readback to MxN (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Trim Device Readback to MxN` | `ComputeMM Host Trim Device Readback to MxN (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host ReadFromDeviceL1 All Cores` | `ComputeMM Host ReadFromDeviceL1 All Cores (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Decode L1` | `ComputeMM Host Decode L1 (leg)` | Equivalent (legacy naming) |
+| `ComputeMM Host Validation Metrics` | `ComputeMM Host Validation Metrics` | Exact |
+
+Notes:
+- Legacy deterministic profiling mode for Test 1 DRAM supports two complete pipelines only: `cpu/cpu` or `device/device`; mixed mode is rejected.
+- Device-pack effective-input reconstruction in legacy now runs in post-processing validation (phase-aligned with new API) and is tracked with `(leg)`-suffixed zones.
+- The table is intentionally scoped to Test 1 ComputeMM flow.
 
 ## Architecture and Grid Notes
 - Always keep grid sizes within the device logical compute grid.
