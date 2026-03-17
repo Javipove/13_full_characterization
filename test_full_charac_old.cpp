@@ -104,6 +104,13 @@
 #define HAS_TTNN_DEVICE_TRANSFORMS 0
 #endif
 
+#if __has_include(<ttnn/operations/data_movement/untilize/untilize.hpp>)
+#include <ttnn/operations/data_movement/untilize/untilize.hpp>
+#define HAS_TTNN_DEVICE_UNTILIZE 1
+#else
+#define HAS_TTNN_DEVICE_UNTILIZE 0
+#endif
+
 // Utility / test helpers
 // #include "test_common.hpp"
 #include "hostdevcommon/common_values.hpp"
@@ -1004,18 +1011,23 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
 
 #if !HAS_TTNN_DEVICE_TRANSFORMS
   if (inputs.used_device_pack || inputs.used_device_unpack) {
-    log_warning(LogTest,
-                "Device pack/unpack requested but TTNN C++ headers are "
-                "unavailable in this legacy build. Falling back to CPU "
-                "pack/unpack path.");
-    inputs.used_device_pack = false;
-    inputs.used_device_unpack = false;
+    throw std::runtime_error(
+        "Device pack/unpack requested but TTNN C++ headers are unavailable "
+        "in this legacy build. Deterministic mode forbids CPU fallback.");
+  }
+#endif
+
+#if !HAS_TTNN_DEVICE_UNTILIZE
+  if (inputs.used_device_unpack ||
+      (inputs.used_device_pack && reconstruct_effective_inputs)) {
+    throw std::runtime_error(
+        "Requested execution path requires ttnn::untilize, but "
+        "ttnn/operations/data_movement/untilize/untilize.hpp is unavailable "
+        "in this legacy build.");
   }
 #endif
 
   if (use_dram) {
-    bool run_cpu_pack_path = !inputs.used_device_pack;
-
     if (inputs.used_device_pack) {
 #if HAS_TTNN_DEVICE_TRANSFORMS
       try {
@@ -1024,50 +1036,92 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
                                                     : ttnn::DataType::BFLOAT16;
 
         {
+          ZoneScopedN("ttnn::IN0_Prepare");
           ttnn::Shape shape_a({1, 1, Mt * 32, Kt * 32});
           auto host_tensor_a =
               ttnn::Tensor(inputs.in0_vec, shape_a,
                            ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
-          auto device_tensor_a_rm = ttnn::to_device(host_tensor_a, device);
-          auto device_tensor_a_tiled =
-              ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
-          inputs.in0_device_addr = device_tensor_a_tiled.buffer_address();
-          inputs.in0_device_tensor = std::move(device_tensor_a_tiled);
+          ttnn::Tensor device_tensor_a_rm;
+          {
+            ZoneScopedN("ttnn::IN0_ToDevice");
+            device_tensor_a_rm = ttnn::to_device(host_tensor_a, device);
+          }
+          ttnn::Tensor device_tensor_a_tiled;
+          {
+            ZoneScopedN("ttnn::IN0_TilizePack");
+            device_tensor_a_tiled =
+                ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
+          }
+          {
+            ZoneScopedN("ttnn::IN0_CaptureBufferAndRetainTensor");
+            inputs.in0_device_addr = device_tensor_a_tiled.buffer_address();
+            inputs.in0_device_tensor = std::move(device_tensor_a_tiled);
+          }
           if (reconstruct_effective_inputs) {
-            inputs.in0_vec = inputs.in0_device_tensor->to_vector<float>();
+#if HAS_TTNN_DEVICE_UNTILIZE
+            ttnn::Tensor in0_rm;
+            {
+              ZoneScopedN("ttnn::untilize");
+              in0_rm = ttnn::untilize(inputs.in0_device_tensor.value());
+            }
+            {
+              ZoneScopedN("ttnn::to_vector<float> (Readback)");
+              inputs.in0_vec = in0_rm.to_vector<float>();
+            }
+#endif
           }
         }
 
         {
+          ZoneScopedN("ttnn::IN1_Prepare");
           ttnn::Shape shape_b({1, 1, Kt * 32, Nt * 32});
           auto host_tensor_b =
               ttnn::Tensor(inputs.in1_vec, shape_b,
                            ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR);
-          auto device_tensor_b_rm = ttnn::to_device(host_tensor_b, device);
-          auto device_tensor_b_tiled =
-              ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
-          inputs.in1_device_addr = device_tensor_b_tiled.buffer_address();
-          inputs.in1_device_tensor = std::move(device_tensor_b_tiled);
+          ttnn::Tensor device_tensor_b_rm;
+          {
+            ZoneScopedN("ttnn::IN1_ToDevice");
+            device_tensor_b_rm = ttnn::to_device(host_tensor_b, device);
+          }
+          ttnn::Tensor device_tensor_b_tiled;
+          {
+            ZoneScopedN("ttnn::IN1_TilizePack");
+            device_tensor_b_tiled =
+                ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
+          }
+          {
+            ZoneScopedN("ttnn::IN1_CaptureBufferAndRetainTensor");
+            inputs.in1_device_addr = device_tensor_b_tiled.buffer_address();
+            inputs.in1_device_tensor = std::move(device_tensor_b_tiled);
+          }
           if (reconstruct_effective_inputs) {
-            inputs.in1_vec = inputs.in1_device_tensor->to_vector<float>();
+#if HAS_TTNN_DEVICE_UNTILIZE
+            ttnn::Tensor in1_rm;
+            {
+              ZoneScopedN("ttnn::untilize");
+              in1_rm = ttnn::untilize(inputs.in1_device_tensor.value());
+            }
+            {
+              ZoneScopedN("ttnn::to_vector<float> (Readback)");
+              inputs.in1_vec = in1_rm.to_vector<float>();
+            }
+#endif
           }
         }
+
+        {
+          ZoneScopedN("ttnn::Sync");
+          tt_metal::Finish(device->command_queue());
+        }
       } catch (const std::exception &e) {
-        log_warning(LogTest,
-                    "Device pack requested but TTNN path failed at runtime: {}. "
-                    "Falling back to CPU pack path.",
-                    e.what());
-        inputs.used_device_pack = false;
-        inputs.in0_device_tensor.reset();
-        inputs.in1_device_tensor.reset();
-        inputs.in0_device_addr = 0;
-        inputs.in1_device_addr = 0;
-        run_cpu_pack_path = true;
+        throw std::runtime_error(
+            std::string("Device pack path failed in deterministic mode: ") +
+            e.what());
       }
 #endif
     }
 
-    if (run_cpu_pack_path) {
+    if (!inputs.used_device_pack) {
       std::vector<uint32_t> in0_packed;
       try {
         in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
@@ -1139,13 +1193,9 @@ BenchmarkInputsLegacy prepare_inputs_compute_mm_legacy(
         inputs.out_device_addr = out_tensor.buffer_address();
         inputs.out_device_tensor = std::move(out_tensor);
       } catch (const std::exception &e) {
-        log_warning(LogTest,
-                    "Device unpack requested but TTNN output allocation failed "
-                    "at runtime: {}. Falling back to CPU unpack path.",
-                    e.what());
-        inputs.used_device_unpack = false;
-        inputs.out_device_tensor.reset();
-        inputs.out_device_addr = 0;
+        throw std::runtime_error(
+            std::string("Device unpack output allocation failed in deterministic mode: ") +
+            e.what());
       }
 #endif
     }
@@ -1766,13 +1816,31 @@ bool test_compute_mm(tt::tt_metal::IDevice *device, const TestParams &params) {
                   "Device unpack mode requested but no output TTNN tensor was "
                   "created.");
             }
-            device_vec = inputs.out_device_tensor->to_vector<float>();
+#if HAS_TTNN_DEVICE_UNTILIZE
+            // Mirror the new API validation pipeline: TILE output -> untilize on
+            // device -> host readback.
+            ttnn::Tensor device_tensor_rm;
+            {
+              ZoneScopedN("ttnn::untilize");
+              device_tensor_rm = ttnn::untilize(inputs.out_device_tensor.value());
+            }
+            {
+              ZoneScopedN("ttnn::untilize_Finish");
+              tt_metal::Finish(device->command_queue());
+            }
+            {
+              ZoneScopedN("ttnn::to_vector<float> (Readback)");
+              device_vec = device_tensor_rm.to_vector<float>();
+            }
 #else
-            std::vector<uint32_t> out_data;
-            tt_metal::EnqueueReadBuffer(device->command_queue(), inputs.out_buffer,
-                                        out_data, true);
-            device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
-                                                     Nt * 32, data_format);
+            throw std::runtime_error(
+                "Device unpack path requires ttnn::untilize, but it is not "
+                "available in this legacy build.");
+#endif
+#else
+            throw std::runtime_error(
+                "Device unpack path requested, but TTNN device transform APIs "
+                "are not available in this legacy build.");
 #endif
           } else {
             std::vector<uint32_t> out_data;
@@ -2467,9 +2535,14 @@ int main(int argc, char **argv) {
   const bool pack_unpack_active =
       (params.test == TestType::ComputeMM) && params.use_dram;
   if (pack_unpack_requested && !pack_unpack_active) {
-    log_warning(LogTest,
-                "--pack-tile/--unpack-tile are only active for --test 1 with "
-                "--dram. Current run will ignore these mode requests.");
+    log_error(LogTest,
+              "--pack-tile/--unpack-tile are supported only for --test 1 with "
+              "--dram. Deterministic mode forbids ignoring these requests.");
+    if (params.use_cache) {
+      disable_persistent_kernel_cache_if_available();
+    }
+    tt_metal::CloseDevice(device_params.device);
+    return -1;
   }
 
   //// Print test summary
