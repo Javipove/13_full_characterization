@@ -1,6 +1,8 @@
 # Porject specific folders
 kernels/
 Python/
+Python_Plots/
+Python_Plots/venv/
 
 # Generic build files
 build/
@@ -23,3 +25,4 @@ knowledge.md
 Deepwiki_large_matmuls.md
 Deepwiki_pack_tile_info.md
 .agents/
+.claude/
