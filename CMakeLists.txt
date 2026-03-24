@@ -17,6 +17,44 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 
+# Match tt-metal's build type and optimization flags
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DDEBUG -fno-omit-frame-pointer")
+
+# Match tt-metal's compile flags for equivalent binary output.
+# Excludes -Wall/-Werror (warnings-as-errors) intentionally.
+add_compile_options(
+    # Required when linking with libstdc++ with clang (aligned allocator support)
+    $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-fsized-deallocation>
+    # x86-64-v3 baseline (AVX2, BMI2, FMA, etc.) — matches tt-metal target arch
+    "$<$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>:-march=x86-64-v3>"
+    -fPIC
+    -fvisibility-inlines-hidden
+    # Clang-specific warning suppressions (matching tt-metal status quo)
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-deprecated-declarations>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-c++11-narrowing>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-deprecated-volatile>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-logical-op-parentheses>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-reorder-ctor>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unused-lambda-capture>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unused-private-field>"
+    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unknown-pragmas>"
+    -Wno-unused-but-set-variable
+)
+
+# Match tt-metal's linker flags
+add_link_options($<$<CXX_COMPILER_ID:Clang>:-Wl,--compress-debug-sections=zstd>)
+
+# Use mold linker if available (same as tt-metal default)
+if(NOT DEFINED CMAKE_LINKER_TYPE)
+    find_program(MOLD ld.mold)
+    if(MOLD)
+        message(STATUS "Using mold linker: ${MOLD}")
+        set(CMAKE_LINKER_TYPE MOLD)
+    endif()
+endif()
+
 if(NOT DEFINED ENV{TT_METAL_HOME})
     message(FATAL_ERROR "Please export TT_METAL_HOME")
 endif()
@@ -54,7 +92,7 @@ target_include_directories(test_full_charac BEFORE PRIVATE
     # Internal tt-metal source headers (for util.hpp transitive chain)
     ${TT_METAL_HOME}                          # "tt_metal/impl/dispatch/device_command.hpp"
     ${TT_METAL_HOME}/tt_metal/                # "impl/context/metal_context.hpp", "impl/program/..."
-    ${TT_METAL_HOME}/tt_metal/api/tt-metalium # bare includes like "core_coord.hpp" in internal headers
+    ${TT_BUILD_DIR}/include/tt-metalium        # bare includes like "core_coord.hpp" in internal headers
     ${TT_METAL_HOME}/tt_metal/llrt/           # "llrt.hpp"
     ${TT_METAL_HOME}/tt_metal/common/         # "env_lib.hpp"
     ${TT_METAL_HOME}/tt_stl/                  # non-exported tt_stl headers (enum.hpp, etc.)
