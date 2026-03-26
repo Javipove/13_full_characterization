@@ -8,6 +8,7 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 - [Test Catalog](#test-catalog)
 - [CLI Reference](#cli-reference)
 - [Command Playbook](#command-playbook)
+- [Test 6 Trace/Replay Engineering Decisions](#test-6-tracereplay-engineering-decisions)
 - [Validation and Precision Model](#validation-and-precision-model)
 - [Execution Matrix (Tried)](#execution-matrix-tried)
 - [Test 2 DRAM Support (Final Scope)](#test-2-dram-support-final-scope)
@@ -38,6 +39,9 @@ Design goals:
 ./run_full_charac.sh ./build/test/test_full_charac --test 0 --num-iters 20
 ```
 
+### 1.5) Standalone CMake build
+To run a standalone build via CMake, use CMakeLists in the project root and the default output path is usually `./build/test_full_charac`.
+
 ### 2) Dispatch mode requirement
 This suite is intended for fast dispatch.
 
@@ -57,12 +61,14 @@ If `--x_size 0 --y_size 0`, current code defaults to `1x1` execution.
 | `2` | SubDeviceMM | Split grid into core groups and dispatch independent partitions | Yes |
 | `3` | HostPipelineComputeMM | Host-only two-tensor transform + DRAM write/read loop | No |
 | `4` | HostPipelineEmpty | Host-only single-tensor baseline pipeline | No |
+| `5` | ComputeMMAsyncBatch | ComputeMM async batch enqueue with single finish for fair baseline | Yes |
+| `6` | ComputeMMTraceReplay | TTNN trace capture + replay (capture once, loop replay) | Yes |
 
 ## CLI Reference
 ### Core selection and runtime
 | Option | Default | Notes |
 | :-- | :-- | :-- |
-| `--test <0..5>` | `5` | `5` is invalid sentinel; use `0..4` for real tests. |
+| `--test <0..6>` | `7` | `0..4` standard tests; `5` = ComputeMMAsyncBatch, `6` = ComputeMMTraceReplay (`7` internal invalid sentinel). |
 | `--num-iters <N>` | `15` | Iteration count for all tests. |
 | `--x_size <N>` | `0` | Grid X. With `0,0`, code defaults to `1x1`. |
 | `--y_size <N>` | `0` | Grid Y. |
@@ -108,6 +114,20 @@ If `--x_size 0 --y_size 0`, current code defaults to `1x1` execution.
   --test 1 --dram --x_size 8 --y_size 7 \
   --m 4096 --n 4096 --k 4096 --num-iters 10
 ```
+### ComputeMM async batch baseline (new test 5)
+```bash
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 5 --num-iters 100 \
+  --x_size 1 --y_size 1 --m 512 --n 512 --k 512 --bypass-check
+```
+
+### ComputeMM trace capture/replay (new test 6)
+```bash
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 6 --num-iters 100 --num-rt-args 1 \
+  --x_size 1 --y_size 1 --m 512 --n 512 --k 512
+```
+
 
 ### Pack/Unpack path matrix (test 1 + DRAM)
 ```bash
@@ -153,6 +173,15 @@ If `--x_size 0 --y_size 0`, current code defaults to `1x1` execution.
 ./run_full_charac.sh ./build/test/test_full_charac \
   --test 4 --m 4096 --n 4096 --k 4096 --num-iters 20
 ```
+
+## Test 6 Trace/Replay Engineering Decisions
+This section documents the exact decisions used to make Test 6 (`ComputeMMTraceReplay`) reliable in this repository.
+
+- `MeshDevice` trace-region rule: trace capture/replay requires a non-zero trace region when opening the device. Upstream/default behavior is effectively `0` bytes unless explicitly set.
+- Chosen trace-region size for this repo: `256 KB` (`256 * 1024`) when `--test 6` is selected; otherwise `0`.
+- Chosen `num_command_queues`: `1` for this benchmark to keep ordering deterministic and avoid cross-CQ variance during capture/replay timing.
+- CQ consistency rule: warmup enqueue, capture enqueue, end-capture, replay, and finish all use the same trace CQ (`cq_id = 0`).
+- Script support: [run_full_charac.sh](run_full_charac.sh) routes both `--test 5` and `--test 6` through the same ComputeMM kernel-generation branch as tests `1` and `2`, then executes the benchmark command.
 
 ## Validation and Precision Model
 ### Validation flow
@@ -299,7 +328,7 @@ Notes:
 
 ## Troubleshooting
 ### Invalid test id
-Use `--test` in the `0..4` range.
+Use `--test` in the `0..6` range.
 
 ### `core_y < core_groups`
 Increase `--y_size` or reduce `--core_groups`.

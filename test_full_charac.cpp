@@ -180,7 +180,9 @@ enum class TestType : uint32_t {
   SubDeviceMM = 2,
   HostPipelineComputeMM = 3,
   HostPipelineEmpty = 4,
-  InvalidTest = 5
+  ComputeMMAsyncBatch = 5,
+  ComputeMMTraceReplay = 6,
+  InvalidTest = 7
 };
 
 enum class OutputDTypeMode : uint32_t {
@@ -305,6 +307,10 @@ const char *test_type_to_string(TestType test) {
     return "HostPipelineComputeMM";
   case TestType::HostPipelineEmpty:
     return "HostPipelineEmpty";
+  case TestType::ComputeMMAsyncBatch:
+    return "ComputeMMAsyncBatch";
+  case TestType::ComputeMMTraceReplay:
+    return "ComputeMMTraceReplay";
   case TestType::InvalidTest:
     return "InvalidTest";
   default:
@@ -532,7 +538,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
 
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
-                                                                "--test", 5);
+                    "--test", 7);
 
     std::tie(unpack_tile_str, input_args) =
         test_args::get_command_option_and_remaining_args(
@@ -1067,6 +1073,12 @@ bool test_host_pipeline_compute_mm(tt_metal::distributed::MeshDevice *device,
 
 bool test_host_pipeline_empty_tensor(tt_metal::distributed::MeshDevice *device,
                                      const TestParams &params);
+
+bool test_compute_mm_async(tt_metal::distributed::MeshDevice *device,
+                           const TestParams &params);
+
+bool test_compute_mm_trace(tt_metal::distributed::MeshDevice *device,
+                           const TestParams &params);
 
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
 // MODIFIED: FP32 ACCUM TO TRUE -> poor preceision
@@ -2271,6 +2283,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
     ZoneScopedN("ComputeMM Functional Blocks");
     log_info(LogTest, "Starting Compute MM Test");
     log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+    log_info(LogTest, "Dispatch mode: direct enqueue per iteration");
 
     auto arch = device->arch();
     uint32_t l1_size = 0;
@@ -2645,7 +2658,6 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       }
 
       // Comparison
-      // Comparison
       float pcc = 0.0f;
       float rmse = 0.0f;
       float relative_rmse = 0.0f;
@@ -2677,6 +2689,949 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
   }
   return pass;
 }
+
+bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
+                     const TestParams &params) {
+  bool pass = true;
+  try {
+    ZoneScopedN("ComputeMMAsync Functional Blocks");
+    log_info(LogTest, "Starting Compute MM Test");
+    log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+    log_info(LogTest, "Dispatch mode: async batch enqueue + single finish");
+
+    auto arch = device->arch();
+    uint32_t l1_size = 0;
+    uint32_t l1_unreserved_base = 0;
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    uint32_t num_cores_x = params.core_x;
+    uint32_t num_cores_y = params.core_y;
+    CoreCoord core_range(num_cores_x, num_cores_y);
+    uint32_t per_core_Mt = 0;
+    uint32_t per_core_Nt = 0;
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b;
+    uint32_t single_tile_size = 0;
+    uint32_t out_block_h = 0, out_block_w = 0, in0_block_w = 0;
+    uint32_t num_blocks_h = 1, num_blocks_w = 1;
+    uint32_t out_subblock_h = 0, out_subblock_w = 0;
+    uint32_t in0_cb_addr = 0, in1_cb_addr = 0, in2_cb_addr = 0, out_cb_addr = 0,
+             interm_cb_addr = 0, in0_addr = 0, in1_addr = 0, out_addr = 0;
+    BenchmarkInputs inputs;
+    uint32_t effective_in0_addr = 0;
+    uint32_t effective_in1_addr = 0;
+    uint32_t effective_out_addr = 0;
+
+    {
+      ZoneScopedN("ComputeMMAsync Input Data Processing");
+
+      {
+        ZoneScopedN("ComputeMMAsync Host Setup and Blocking");
+        l1_size = get_l1_size(arch);
+        l1_unreserved_base =
+            device->allocator()->get_base_allocator_addr(HalMemType::L1);
+        std::tie(math_fidelity, fp32_dest_acc_en) = get_compute_params(arch);
+
+        std::tie(Mt, Nt, Kt) =
+            get_aligned_input_tile_num(params.M, params.N, params.K);
+
+        per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+        per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
+
+        data_format = compute_data_format_from_input_dtype(params.input_dtype);
+        single_tile_size = tt::tile_size(data_format);
+
+        if (params.use_dram) {
+          auto [obh, obw, bw] = get_dynamic_l1_block_params(
+              per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+              l1_unreserved_base);
+          out_block_h = obh;
+          out_block_w = obw;
+          in0_block_w = bw;
+          num_blocks_h = per_core_Mt / out_block_h;
+          num_blocks_w = per_core_Nt / out_block_w;
+
+          log_info(LogTest,
+                   "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+                   "num_blocks={}x{}, in0_block_w={}",
+                   per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+                   num_blocks_h, num_blocks_w, in0_block_w);
+        } else {
+          out_block_h = per_core_Mt;
+          out_block_w = per_core_Nt;
+          in0_block_w =
+              get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                              l1_size, l1_unreserved_base, false);
+        }
+
+        if (in0_block_w == 0) {
+          uint32_t out_cb_tiles = out_block_h * out_block_w;
+          uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+          uint32_t avail_l1 = l1_size - l1_unreserved_base;
+          log_error(LogTest,
+                    "Insufficient L1 memory for M={}, N={}, K={} "
+                    "(out_block={}x{}, out_CB={}tiles={}KB, "
+                    "avail_L1={}KB, dram={})",
+                    params.M, params.N, params.K, out_block_h, out_block_w,
+                    out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                    params.use_dram ? "yes" : "no");
+          return false;
+        }
+
+        std::tie(out_subblock_h, out_subblock_w) =
+            get_out_subblock_params(out_block_h, out_block_w);
+
+        std::tie(in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+                 interm_cb_addr, in0_addr, in1_addr, out_addr) =
+            get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
+                                      single_tile_size, l1_unreserved_base,
+                                      params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMMAsync Host Prepare Inputs");
+        inputs = prepare_inputs_compute_mm(
+            device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+            in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+            params.use_dram, 0, data_format, params.pack_device,
+          !params.bypass_check,
+          params.unpack_device);
+      }
+
+      {
+        ZoneScopedN("ComputeMMAsync Host Resolve Buffer Addresses");
+        effective_in0_addr = in0_addr;
+        effective_in1_addr = in1_addr;
+        effective_out_addr = out_addr;
+        if (params.use_dram) {
+          // MeshBuffer doesn't expose address() directly; extract the
+          // underlying per-device Buffer* via get_device_buffer().
+          auto coord = tt::tt_metal::distributed::MeshCoordinate(0, 0);
+          effective_in0_addr =
+              inputs.in0_buffer->get_device_buffer(coord)->address();
+          effective_in1_addr =
+              inputs.in1_buffer->get_device_buffer(coord)->address();
+          effective_out_addr =
+              inputs.out_buffer->get_device_buffer(coord)->address();
+          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+                   effective_in0_addr, effective_in1_addr, effective_out_addr);
+        }
+      }
+    }
+
+    // 6. Create Program and Run (single program — kernel handles multi-block)
+    log_info(LogTest, "Num tests {}", params.num_iters);
+
+    tt_metal::Program program;
+    {
+      ZoneScopedN("ComputeMMAsync Host Program Build");
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h,
+          out_subblock_w, per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+          num_blocks_h, num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr,
+          out_cb_addr, interm_cb_addr, effective_in0_addr, effective_in1_addr,
+          effective_out_addr, params.use_dram, program);
+    }
+
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
+
+    {
+      ZoneScopedN("ComputeMMAsync Host Dispatch");
+      auto t_enqueue_begin = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("ComputeMMAsync Host Dispatch Iteration");
+        ZoneValue(i);
+        {
+          ZoneScopedN("ComputeMMAsync Host Enqueue");
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+      }
+      auto t_enqueue_end = std::chrono::steady_clock::now();
+
+      auto t_finish_begin = std::chrono::steady_clock::now();
+      {
+        ZoneScopedN("ComputeMMAsync Host FinishWait");
+        tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
+      auto t_finish_end = std::chrono::steady_clock::now();
+
+      auto enqueue_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(t_enqueue_end -
+                                                                t_enqueue_begin)
+              .count();
+      auto finish_wait_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(t_finish_end -
+                                                                t_finish_begin)
+              .count();
+      auto total_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(t_finish_end -
+                                                                t_enqueue_begin)
+              .count();
+      log_info(LogTest,
+               "Async batch timing: enqueue_window={}us, finish_wait={}us, "
+               "total={}us, iters={}",
+               enqueue_us, finish_wait_us, total_us, params.num_iters);
+    }
+
+    if (!params.bypass_check) {
+      ZoneScopedN("ComputeMMAsync Host Post Processing");
+      log_info(LogTest, "Validation Started...");
+      log_validation_pipeline_steps(params);
+
+      if (params.use_dram && params.pack_device) {
+        ZoneScopedN("ComputeMMAsync Host Validation: Reconstruct Effective Inputs");
+
+        // Reconstruct effective packed inputs for rigorous golden-reference
+        // validation. This aligns device-pack path with cpu-pack semantics.
+        std::vector<uint32_t> in0_packed_effective;
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Read Packed IN0 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in0_packed_effective,
+              inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Decode Effective IN0 (Device Pack)");
+          inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
+                                                       Mt * 32, Kt * 32,
+                                                       data_format);
+        }
+
+        std::vector<uint32_t> in1_packed_effective;
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Read Packed IN1 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in1_packed_effective,
+              inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Decode Effective IN1 (Device Pack)");
+          inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
+                                                       Kt * 32, Nt * 32,
+                                                       data_format);
+        }
+      }
+
+      // Compute Golden Reference
+      std::vector<float> golden_vec;
+      {
+        ZoneScopedN("ComputeMMAsync Host Golden Reference");
+        log_info(LogTest, "Computing Golden Reference (FP32)...");
+        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
+                                      params.N, params.K);
+      }
+
+      // Read Back Results
+      log_info(LogTest, "Reading Device Results...");
+      std::vector<float> device_vec(params.M * params.N, 0.0f);
+        const bool output_needs_trim =
+          ((params.M % constants::TILE_HEIGHT) != 0) ||
+          ((params.N % constants::TILE_WIDTH) != 0);
+      auto *target_device = device->get_devices()[0];
+
+      {
+        ZoneScopedN("ComputeMMAsync Host Device Readback");
+        if (params.use_dram) {
+          if (params.unpack_device) {
+            ZoneScopedN("ComputeMMAsync Host Device Unpack (ttnn)");
+            if (!inputs.output_ttnn_tensor.has_value()) {
+              throw std::runtime_error(
+                  "Device unpack requested, but no output TTNN tensor was "
+                  "created. Ensure output tensor bootstrap is enabled.");
+            }
+            auto &device_tensor_out = inputs.output_ttnn_tensor.value();
+
+            if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
+              // 1. Typecast to FLOAT32 while still in TILE layout
+              ttnn::Tensor device_tensor_fp32_tile;
+              {
+                ZoneScopedN("ttnn::typecast(FLOAT32)");
+                device_tensor_fp32_tile =
+                    ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
+              }
+
+              // 2. Convert to ROW_MAJOR layout on device
+              ttnn::Tensor device_tensor_fp32_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_fp32_rm = ttnn::untilize(device_tensor_fp32_tile);
+              }
+
+              {
+                ZoneScopedN("ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+
+              // 3. Bring to host as vector<float>
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_fp32_rm.to_vector<float>();
+              }
+            } else {
+              // Native/BF16 export path: untilize directly, no explicit FP32 cast.
+              ttnn::Tensor device_tensor_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_rm = ttnn::untilize(device_tensor_out);
+              }
+              {
+                ZoneScopedN("ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_rm.to_vector<float>();
+              }
+            }
+
+            // Trim to actual M x N if needed
+            if (output_needs_trim &&
+                device_vec.size() > (size_t)(params.M * params.N)) {
+              {
+                ZoneScopedN("ComputeMMAsync Host Trim Device Readback to MxN");
+                std::vector<float> trimmed(params.M * params.N, 0.0f);
+                for (uint32_t r = 0; r < params.M; ++r) {
+                  for (uint32_t c = 0; c < params.N; ++c) {
+                    trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                  }
+                }
+                device_vec = trimmed;
+              }
+            }
+          } else {
+            // === DRAM Readback ===
+            // Read entire output buffer from DRAM
+            std::vector<uint32_t> out_data;
+            {
+              ZoneScopedN("ComputeMMAsync Host ReadShard DRAM Output");
+              tt::tt_metal::distributed::ReadShard(
+                  device->mesh_command_queue(), out_data, inputs.out_buffer,
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+            }
+
+            {
+              ZoneScopedN("ComputeMMAsync Host Decode DRAM");
+              // Unpack and untilize the full output
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                       Nt * 32, data_format);
+              // Trim to actual M x N if needed
+              if (output_needs_trim &&
+                  device_vec.size() > (size_t)(params.M * params.N)) {
+                {
+                  ZoneScopedN("ComputeMMAsync Host Trim DRAM Decode to MxN");
+                  std::vector<float> trimmed(params.M * params.N, 0.0f);
+                  for (uint32_t r = 0; r < params.M; ++r) {
+                    for (uint32_t c = 0; c < params.N; ++c) {
+                      trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                    }
+                  }
+                  device_vec = trimmed;
+                }
+              }
+            }
+          }
+        } else {
+          // === L1 Readback (per-core: read all raw tiles first) ===
+          std::vector<std::vector<uint32_t>> all_core_tiles(num_cores_y *
+                                                            num_cores_x);
+          {
+            ZoneScopedN("ComputeMMAsync Host ReadFromDeviceL1 All Cores");
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                CoreCoord core = {(std::size_t)x, (std::size_t)y};
+                uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+                uint32_t read_size = core_n_tiles * single_tile_size;
+
+                tt_metal::detail::ReadFromDeviceL1(
+                    target_device, core, out_addr, read_size,
+                    all_core_tiles[y * num_cores_x + x]);
+              }
+            }
+          }
+
+          {
+            ZoneScopedN("ComputeMMAsync Host Decode L1");
+            // Unpack & stitch all cores
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                auto core_data_untilized = unpack_device_tiles_to_fp32(
+                    all_core_tiles[y * num_cores_x + x], per_core_Mt * 32,
+                    per_core_Nt * 32, data_format);
+
+                uint32_t global_r_start = y * per_core_Mt * 32;
+                uint32_t global_c_start = x * per_core_Nt * 32;
+                uint32_t r_len = per_core_Mt * 32;
+                uint32_t c_len = per_core_Nt * 32;
+
+                for (uint32_t r = 0; r < r_len; ++r) {
+                  for (uint32_t c = 0; c < c_len; ++c) {
+                    uint32_t global_idx = (global_r_start + r) * (params.N) +
+                                          (global_c_start + c);
+                    if (global_idx < device_vec.size()) {
+                      device_vec[global_idx] =
+                          core_data_untilized[r * c_len + c];
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (params.output_dtype_mode == OutputDTypeMode::Bf16) {
+        ZoneScopedN("ComputeMMAsync Host Output DType Postprocess BF16");
+        for (auto &v : device_vec) {
+          v = static_cast<float>(bfloat16(v));
+        }
+      }
+
+      // Comparison
+      float pcc = 0.0f;
+      float rmse = 0.0f;
+      float relative_rmse = 0.0f;
+      {
+        ZoneScopedN("ComputeMMAsync Host Validation Metrics");
+        pcc = get_pcc(golden_vec, device_vec);
+        rmse = get_rmse(golden_vec, device_vec);
+        relative_rmse = get_relative_rmse(device_vec, golden_vec);
+      }
+      log_validation_sample_pairs("ComputeMMAsync Validation", golden_vec,
+                                  device_vec, 12);
+
+      log_info(LogTest,
+               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+               "= {:.4f}",
+               pcc, rmse, relative_rmse);
+
+      if (pcc < 0.99f) {
+        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+        pass = false;
+      } else {
+        log_info(LogTest, "Validation PASSED");
+      }
+    }
+
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
+
+bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
+                           const TestParams &params) {
+  bool pass = true;
+  try {
+    ZoneScopedN("ComputeMMTrace: ComputeMM Functional Blocks");
+    log_info(LogTest, "Starting Compute MM Test");
+    log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+    log_info(LogTest, "Dispatch mode: trace capture + replay");
+
+    auto arch = device->arch();
+    uint32_t l1_size = 0;
+    uint32_t l1_unreserved_base = 0;
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    uint32_t num_cores_x = params.core_x;
+    uint32_t num_cores_y = params.core_y;
+    CoreCoord core_range(num_cores_x, num_cores_y);
+    uint32_t per_core_Mt = 0;
+    uint32_t per_core_Nt = 0;
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b;
+    uint32_t single_tile_size = 0;
+    uint32_t out_block_h = 0, out_block_w = 0, in0_block_w = 0;
+    uint32_t num_blocks_h = 1, num_blocks_w = 1;
+    uint32_t out_subblock_h = 0, out_subblock_w = 0;
+    uint32_t in0_cb_addr = 0, in1_cb_addr = 0, in2_cb_addr = 0, out_cb_addr = 0,
+             interm_cb_addr = 0, in0_addr = 0, in1_addr = 0, out_addr = 0;
+    BenchmarkInputs inputs;
+    uint32_t effective_in0_addr = 0;
+    uint32_t effective_in1_addr = 0;
+    uint32_t effective_out_addr = 0;
+
+    {
+      ZoneScopedN("ComputeMMTrace: ComputeMM Input Data Processing");
+
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Setup and Blocking");
+        l1_size = get_l1_size(arch);
+        l1_unreserved_base =
+            device->allocator()->get_base_allocator_addr(HalMemType::L1);
+        std::tie(math_fidelity, fp32_dest_acc_en) = get_compute_params(arch);
+
+        std::tie(Mt, Nt, Kt) =
+            get_aligned_input_tile_num(params.M, params.N, params.K);
+
+        per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+        per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
+
+        data_format = compute_data_format_from_input_dtype(params.input_dtype);
+        single_tile_size = tt::tile_size(data_format);
+
+        if (params.use_dram) {
+          auto [obh, obw, bw] = get_dynamic_l1_block_params(
+              per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+              l1_unreserved_base);
+          out_block_h = obh;
+          out_block_w = obw;
+          in0_block_w = bw;
+          num_blocks_h = per_core_Mt / out_block_h;
+          num_blocks_w = per_core_Nt / out_block_w;
+
+          log_info(LogTest,
+                   "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+                   "num_blocks={}x{}, in0_block_w={}",
+                   per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+                   num_blocks_h, num_blocks_w, in0_block_w);
+        } else {
+          out_block_h = per_core_Mt;
+          out_block_w = per_core_Nt;
+          in0_block_w =
+              get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                              l1_size, l1_unreserved_base, false);
+        }
+
+        if (in0_block_w == 0) {
+          uint32_t out_cb_tiles = out_block_h * out_block_w;
+          uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+          uint32_t avail_l1 = l1_size - l1_unreserved_base;
+          log_error(LogTest,
+                    "Insufficient L1 memory for M={}, N={}, K={} "
+                    "(out_block={}x{}, out_CB={}tiles={}KB, "
+                    "avail_L1={}KB, dram={})",
+                    params.M, params.N, params.K, out_block_h, out_block_w,
+                    out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                    params.use_dram ? "yes" : "no");
+          return false;
+        }
+
+        std::tie(out_subblock_h, out_subblock_w) =
+            get_out_subblock_params(out_block_h, out_block_w);
+
+        std::tie(in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+                 interm_cb_addr, in0_addr, in1_addr, out_addr) =
+            get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
+                                      single_tile_size, l1_unreserved_base,
+                                      params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Prepare Inputs");
+        inputs = prepare_inputs_compute_mm(
+            device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+            in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+            params.use_dram, 0, data_format, params.pack_device,
+          !params.bypass_check,
+          params.unpack_device);
+      }
+
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Resolve Buffer Addresses");
+        effective_in0_addr = in0_addr;
+        effective_in1_addr = in1_addr;
+        effective_out_addr = out_addr;
+        if (params.use_dram) {
+          // MeshBuffer doesn't expose address() directly; extract the
+          // underlying per-device Buffer* via get_device_buffer().
+          auto coord = tt::tt_metal::distributed::MeshCoordinate(0, 0);
+          effective_in0_addr =
+              inputs.in0_buffer->get_device_buffer(coord)->address();
+          effective_in1_addr =
+              inputs.in1_buffer->get_device_buffer(coord)->address();
+          effective_out_addr =
+              inputs.out_buffer->get_device_buffer(coord)->address();
+          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+                   effective_in0_addr, effective_in1_addr, effective_out_addr);
+        }
+      }
+    }
+
+    // 6. Create Program and Run (single program — kernel handles multi-block)
+    log_info(LogTest, "Num tests {}", params.num_iters);
+
+    tt_metal::Program program;
+    {
+      ZoneScopedN("ComputeMMTrace: ComputeMM Host Program Build");
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h,
+          out_subblock_w, per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+          num_blocks_h, num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr,
+          out_cb_addr, interm_cb_addr, effective_in0_addr, effective_in1_addr,
+          effective_out_addr, params.use_dram, program);
+    }
+
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
+
+    {
+      ZoneScopedN("ComputeMMTrace: ComputeMM Host Dispatch");
+      const uint8_t trace_cq_id = 0;
+      auto &trace_cq = device->mesh_command_queue(trace_cq_id);
+      uint32_t ops_per_capture = params.num_rt_args;
+      // Reuse existing CLI while avoiding legacy default behavior for this mode.
+      if (ops_per_capture == 0 || ops_per_capture == 255) {
+        ops_per_capture = 1;
+      }
+
+      log_info(LogTest,
+               "Trace replay config: capture_ops_per_trace={}, replay_iters={} "
+               "(--num-rt-args reused for capture ops)",
+               ops_per_capture, params.num_iters);
+
+      std::optional<tt::tt_metal::distributed::MeshTraceId> trace_id;
+      bool capture_ended = false;
+      try {
+        // Warmup once so compile/setup work is not included in trace replay.
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Trace Warmup");
+          tt_metal::distributed::EnqueueMeshWorkload(
+              trace_cq, mesh_workload, false);
+          tt_metal::distributed::Finish(trace_cq);
+        }
+
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Trace Capture");
+          auto t_capture_begin = std::chrono::steady_clock::now();
+          trace_id = tt_metal::distributed::BeginTraceCapture(device, trace_cq_id);
+          for (uint32_t op = 0; op < ops_per_capture; ++op) {
+            tt_metal::distributed::EnqueueMeshWorkload(
+                trace_cq, mesh_workload, false);
+          }
+          device->end_mesh_trace(trace_cq_id, trace_id.value());
+          auto t_capture_end = std::chrono::steady_clock::now();
+          auto capture_record_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  t_capture_end - t_capture_begin)
+                  .count();
+          log_info(LogTest,
+                   "Trace timing: capture_record_window={}us, capture_ops={}",
+                   capture_record_us, ops_per_capture);
+          capture_ended = true;
+        }
+
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Trace Replay Loop");
+          auto t_replay_issue_begin = std::chrono::steady_clock::now();
+          for (uint32_t i = 0; i < params.num_iters; ++i) {
+            ZoneScopedN("ComputeMMTrace: ComputeMM Trace Replay Iteration");
+            ZoneValue(i);
+            device->replay_mesh_trace(trace_cq_id, trace_id.value(), false);
+          }
+          auto t_replay_issue_end = std::chrono::steady_clock::now();
+
+          auto t_replay_finish_begin = std::chrono::steady_clock::now();
+          tt_metal::distributed::Finish(trace_cq);
+          auto t_replay_finish_end = std::chrono::steady_clock::now();
+
+          auto replay_issue_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  t_replay_issue_end - t_replay_issue_begin)
+                  .count();
+          auto replay_finish_wait_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  t_replay_finish_end - t_replay_finish_begin)
+                  .count();
+          auto replay_total_us =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  t_replay_finish_end - t_replay_issue_begin)
+                  .count();
+          log_info(LogTest,
+                   "Trace timing: replay_issue_window={}us, finish_wait={}us, "
+                   "replay_total={}us, replay_iters={}",
+                   replay_issue_us, replay_finish_wait_us, replay_total_us,
+                   params.num_iters);
+        }
+
+        {
+          ZoneScopedN("ComputeMMTrace: Trace Release");
+          device->release_mesh_trace(trace_id.value());
+        }
+        trace_id.reset();
+      } catch (...) {
+        if (trace_id.has_value()) {
+          if (!capture_ended) {
+            try {
+              ZoneScopedN("ComputeMMTrace: Trace Forced End (Exception)");
+              device->end_mesh_trace(trace_cq_id, trace_id.value());
+            } catch (...) {
+            }
+          }
+          try {
+            ZoneScopedN("ComputeMMTrace: Trace FinishWait (Exception)");
+            tt_metal::distributed::Finish(trace_cq);
+          } catch (...) {
+          }
+          try {
+            ZoneScopedN("ComputeMMTrace: Trace Release (Exception)");
+            device->release_mesh_trace(trace_id.value());
+          } catch (...) {
+          }
+        }
+        throw;
+      }
+    }
+
+    if (!params.bypass_check) {
+      ZoneScopedN("ComputeMMTrace: ComputeMM Host Post Processing");
+      log_info(LogTest, "Validation Started...");
+      log_validation_pipeline_steps(params);
+
+      if (params.use_dram && params.pack_device) {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Reconstruct Effective Inputs");
+
+        // Reconstruct effective packed inputs for rigorous golden-reference
+        // validation. This aligns device-pack path with cpu-pack semantics.
+        std::vector<uint32_t> in0_packed_effective;
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Read Packed IN0 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in0_packed_effective,
+              inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
+          inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
+                                                       Mt * 32, Kt * 32,
+                                                       data_format);
+        }
+
+        std::vector<uint32_t> in1_packed_effective;
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Read Packed IN1 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in1_packed_effective,
+              inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
+          inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
+                                                       Kt * 32, Nt * 32,
+                                                       data_format);
+        }
+      }
+
+      // Compute Golden Reference
+      std::vector<float> golden_vec;
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Golden Reference");
+        log_info(LogTest, "Computing Golden Reference (FP32)...");
+        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
+                                      params.N, params.K);
+      }
+
+      // Read Back Results
+      log_info(LogTest, "Reading Device Results...");
+      std::vector<float> device_vec(params.M * params.N, 0.0f);
+        const bool output_needs_trim =
+          ((params.M % constants::TILE_HEIGHT) != 0) ||
+          ((params.N % constants::TILE_WIDTH) != 0);
+      auto *target_device = device->get_devices()[0];
+
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Device Readback");
+        if (params.use_dram) {
+          if (params.unpack_device) {
+            ZoneScopedN("ComputeMMTrace: ComputeMM Host Device Unpack (ttnn)");
+            if (!inputs.output_ttnn_tensor.has_value()) {
+              throw std::runtime_error(
+                  "Device unpack requested, but no output TTNN tensor was "
+                  "created. Ensure output tensor bootstrap is enabled.");
+            }
+            auto &device_tensor_out = inputs.output_ttnn_tensor.value();
+
+            if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
+              // 1. Typecast to FLOAT32 while still in TILE layout
+              ttnn::Tensor device_tensor_fp32_tile;
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::typecast(FLOAT32)");
+                device_tensor_fp32_tile =
+                    ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
+              }
+
+              // 2. Convert to ROW_MAJOR layout on device
+              ttnn::Tensor device_tensor_fp32_rm;
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::untilize");
+                device_tensor_fp32_rm = ttnn::untilize(device_tensor_fp32_tile);
+              }
+
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+
+              // 3. Bring to host as vector<float>
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_fp32_rm.to_vector<float>();
+              }
+            } else {
+              // Native/BF16 export path: untilize directly, no explicit FP32 cast.
+              ttnn::Tensor device_tensor_rm;
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::untilize");
+                device_tensor_rm = ttnn::untilize(device_tensor_out);
+              }
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+              {
+                ZoneScopedN("ComputeMMTrace: ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_rm.to_vector<float>();
+              }
+            }
+
+            // Trim to actual M x N if needed
+            if (output_needs_trim &&
+                device_vec.size() > (size_t)(params.M * params.N)) {
+              {
+                ZoneScopedN("ComputeMMTrace: ComputeMM Host Trim Device Readback to MxN");
+                std::vector<float> trimmed(params.M * params.N, 0.0f);
+                for (uint32_t r = 0; r < params.M; ++r) {
+                  for (uint32_t c = 0; c < params.N; ++c) {
+                    trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                  }
+                }
+                device_vec = trimmed;
+              }
+            }
+          } else {
+            // === DRAM Readback ===
+            // Read entire output buffer from DRAM
+            std::vector<uint32_t> out_data;
+            {
+              ZoneScopedN("ComputeMMTrace: ComputeMM Host ReadShard DRAM Output");
+              tt::tt_metal::distributed::ReadShard(
+                  device->mesh_command_queue(), out_data, inputs.out_buffer,
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+            }
+
+            {
+              ZoneScopedN("ComputeMMTrace: ComputeMM Host Decode DRAM");
+              // Unpack and untilize the full output
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                       Nt * 32, data_format);
+              // Trim to actual M x N if needed
+              if (output_needs_trim &&
+                  device_vec.size() > (size_t)(params.M * params.N)) {
+                {
+                  ZoneScopedN("ComputeMMTrace: ComputeMM Host Trim DRAM Decode to MxN");
+                  std::vector<float> trimmed(params.M * params.N, 0.0f);
+                  for (uint32_t r = 0; r < params.M; ++r) {
+                    for (uint32_t c = 0; c < params.N; ++c) {
+                      trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                    }
+                  }
+                  device_vec = trimmed;
+                }
+              }
+            }
+          }
+        } else {
+          // === L1 Readback (per-core: read all raw tiles first) ===
+          std::vector<std::vector<uint32_t>> all_core_tiles(num_cores_y *
+                                                            num_cores_x);
+          {
+            ZoneScopedN("ComputeMMTrace: ComputeMM Host ReadFromDeviceL1 All Cores");
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                CoreCoord core = {(std::size_t)x, (std::size_t)y};
+                uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+                uint32_t read_size = core_n_tiles * single_tile_size;
+
+                tt_metal::detail::ReadFromDeviceL1(
+                    target_device, core, out_addr, read_size,
+                    all_core_tiles[y * num_cores_x + x]);
+              }
+            }
+          }
+
+          {
+            ZoneScopedN("ComputeMMTrace: ComputeMM Host Decode L1");
+            // Unpack & stitch all cores
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                auto core_data_untilized = unpack_device_tiles_to_fp32(
+                    all_core_tiles[y * num_cores_x + x], per_core_Mt * 32,
+                    per_core_Nt * 32, data_format);
+
+                uint32_t global_r_start = y * per_core_Mt * 32;
+                uint32_t global_c_start = x * per_core_Nt * 32;
+                uint32_t r_len = per_core_Mt * 32;
+                uint32_t c_len = per_core_Nt * 32;
+
+                for (uint32_t r = 0; r < r_len; ++r) {
+                  for (uint32_t c = 0; c < c_len; ++c) {
+                    uint32_t global_idx = (global_r_start + r) * (params.N) +
+                                          (global_c_start + c);
+                    if (global_idx < device_vec.size()) {
+                      device_vec[global_idx] =
+                          core_data_untilized[r * c_len + c];
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (params.output_dtype_mode == OutputDTypeMode::Bf16) {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Output DType Postprocess BF16");
+        for (auto &v : device_vec) {
+          v = static_cast<float>(bfloat16(v));
+        }
+      }
+
+      // Comparison
+      float pcc = 0.0f;
+      float rmse = 0.0f;
+      float relative_rmse = 0.0f;
+      {
+        ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation Metrics");
+        pcc = get_pcc(golden_vec, device_vec);
+        rmse = get_rmse(golden_vec, device_vec);
+        relative_rmse = get_relative_rmse(device_vec, golden_vec);
+      }
+      log_validation_sample_pairs("ComputeMMTrace Validation", golden_vec,
+                                  device_vec, 12);
+
+      log_info(LogTest,
+               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+               "= {:.4f}",
+               pcc, rmse, relative_rmse);
+
+      if (pcc < 0.99f) {
+        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+        pass = false;
+      } else {
+        log_info(LogTest, "Validation PASSED");
+      }
+    }
+
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
 
 struct HostPipelineStats {
   double generate_us = 0.0;
@@ -3368,10 +4323,18 @@ int main(int argc, char **argv) {
     enable_persistent_kernel_cache_if_available();
   }
 
-  // Create mesh device
+    // Create mesh device. Trace replay requires non-zero trace memory region.
   int device_id = 0;
-  device_params.device =
-      tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+    const bool enable_trace_mode = params.test == TestType::ComputeMMTraceReplay;
+    const size_t trace_region_size = enable_trace_mode ? (256 * 1024) : 0;
+    const size_t num_command_queues = 1;
+    device_params.device = tt_metal::distributed::MeshDevice::create_unit_mesh(
+      device_id, DEFAULT_L1_SMALL_SIZE, trace_region_size, num_command_queues);
+    if (enable_trace_mode) {
+    log_info(LogTest,
+         "Trace mode device config: trace_region_size={} bytes, num_cqs={}",
+         trace_region_size, num_command_queues);
+    }
   device_params.grid_coord =
       device_params.device->compute_with_storage_grid_size();
 
@@ -3414,6 +4377,12 @@ int main(int argc, char **argv) {
     break;
   case TestType::ComputeMM:
     pass = test_compute_mm(device_params.device.get(), params);
+    break;
+  case TestType::ComputeMMAsyncBatch:
+    pass = test_compute_mm_async(device_params.device.get(), params);
+    break;
+  case TestType::ComputeMMTraceReplay:
+    pass = test_compute_mm_trace(device_params.device.get(), params);
     break;
   case TestType::SubDeviceMM:
     pass = test_sub_device_manager_mm(device_params.device.get(), params);

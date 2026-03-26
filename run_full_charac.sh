@@ -7,12 +7,16 @@
 # 2: SubDevice MM
 # 3: Host Pipeline ComputeMM (no kernels)
 # 4: Host Pipeline Empty Tensor (no kernels)
-# 5: Invalid Test
+# 5: ComputeMMAsyncBatch (async batch enqueue + single finish)
+# 6: ComputeMMTraceReplay (trace capture + replay)
+# 7: Invalid Test
 
 NUM_RT_ARGS=255
 CLEAN_MODE=0
-TEST_TYPE=5
 USE_DRAM=0
+
+# Keep sentinel default invalid unless user explicitly provides --test
+TEST_TYPE=7
 
 # Search for arguments to generate correct kernels
 args=("$@")
@@ -109,8 +113,8 @@ EOF
 
     echo "}" >> $KERNEL_DIR/empty_writer.cpp
 
-elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" ]]; then
-    # Compute MM (1) or SubDevice MM (2)
+elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" || "$TEST_TYPE" == "5" || "$TEST_TYPE" == "6" ]]; then
+    # Compute MM (1) or SubDevice MM (2) or ComputeMMAsyncBatch (5) or ComputeMMTraceReplay (6)
     #
     # Always needed:
     #   - Compute kernel (Tensix FPU math engine): same for L1 and DRAM modes
@@ -153,9 +157,5 @@ fi
 
 # Execute the benchmark with all passed arguments
 # Usage example: ./run_full_charac.sh ./build/test/test_full_charac --num-rt-args 512 ...
-if [[ "$TEST_TYPE" != "5" ]]; then
 echo "Executing: $@"
 "$@"
-else
-    echo "Skipping execution for invalid test type $TEST_TYPE"
-fi
