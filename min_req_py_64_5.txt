@@ -1,0 +1,181 @@
+# Final minimal-plus requirements for TTNN on edge devices
+# Target use case:
+# - TTNN import/runtime
+# - Llama/decode demo tests (pytest)
+# - Eval demo tests (perplexity/evaluate style)
+#
+# Install with:
+#   pip install -r requirements_ttnn_edge_eval_final.txt
+#
+# Notes:
+# - Core TTNN dependencies from pyproject.toml are ACTIVE below.
+# - Packages previously considered non-essential are listed in the commented
+#   baseline section so you can quickly uncomment if a specific demo/test path
+#   imports them.
+# - To skip a package on RISC-V, use an environment marker:
+#     package_name ; platform_machine != 'riscv64' and platform_machine != 'riscv32'
+# - Useful aliases for RISC-V that appear in some environments are:
+#     riscv64, riscv32, riscv
+
+# -----------------------------------------------------------------------------
+# RISC-V skip marker examples (COMMENTED)
+# Copy/paste and adapt for any package that has no RISC-V wheel or is unsupported.
+# -----------------------------------------------------------------------------
+# seaborn==0.13.2 ; platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+# pyarrow==20.0.0 ; platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+
+# -----------------------------------------------------------------------------
+# Package index for CPU torch wheels on x86_64 hosts
+# -----------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# -----------------------------------------------------------------------------
+# Core TTNN runtime (ACTIVE)
+# These are required to avoid common import-time failures.
+# -----------------------------------------------------------------------------
+numpy>=1.24.4,<2
+loguru==0.6.0
+networkx==3.1
+graphviz>=0.20.3
+pyyaml>=5.4
+click==8.1.7
+pandas==2.0.3
+seaborn==0.13.2
+ml_dtypes==0.5.3
+
+# PyTorch stack
+torch==2.7.1 ; platform_machine == 'aarch64' and platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+torchvision==0.22.1 ; platform_machine == 'aarch64' and platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+torch==2.7.1 ; platform_machine == 'x86_64' and platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+torchvision==0.22.1 ; platform_machine == 'x86_64' and platform_machine != 'riscv64' and platform_machine != 'riscv32' and platform_machine != 'riscv'
+
+# -----------------------------------------------------------------------------
+# LLM inference/demo stack (ACTIVE)
+# -----------------------------------------------------------------------------
+transformers==4.53.0
+huggingface-hub>=0.30.0
+sentencepiece==0.2.0
+tiktoken==0.7.0
+einops==0.6.1
+blobfile==2.1.1
+protobuf==3.20.2
+requests
+tqdm==4.66.3
+
+# Llama reference stack used by demo setup (ACTIVE)
+fairscale
+fire
+
+# -----------------------------------------------------------------------------
+# Demo test runner stack (ACTIVE)
+# -----------------------------------------------------------------------------
+pytest==8.4.2
+pytest-timeout==2.4.0
+pytest-split==0.10.0
+pytest-benchmark==5.1.0
+
+# -----------------------------------------------------------------------------
+# Eval-demo stack (ACTIVE)
+# Enable by default because you said you will run eval demos/tests.
+# -----------------------------------------------------------------------------
+datasets==2.9.0
+pyarrow==20.0.0
+evaluate==0.4.0
+bert-score==0.3.12
+fsspec==2023.9.2
+multiprocess==0.70.14
+tabulate==0.9.0
+
+# -----------------------------------------------------------------------------
+# Optional compatibility baseline (COMMENTED)
+# These are intentionally commented. Uncomment only if your chosen model/test
+# imports them.
+# -----------------------------------------------------------------------------
+
+# Important manual-install pins (verified against current tt-metal requirements-dev)
+# pyarrow==20.0.0
+# datasets==2.9.0
+# evaluate==0.4.0
+# bert-score==0.3.12
+# fsspec==2023.9.2
+# multiprocess==0.70.14
+# tt-smi==3.0.30
+# pyluwen==0.7.11  # from tenstorrent/tt-smi v3.0.30 dependencies
+# tt-tools-common==1.4.28  # package key is tt_tools_common in pyproject
+# tt-common-tools==1.4.28  # alias note; install package name is tt-tools-common
+# tt-flash  # not pinned by tt-metal v0.64.0; INSTALLING.md references firmware bundles (e.g., fw_pack-18.7.0)
+
+# Metrics/quality helpers
+# torchmetrics==1.3.1
+# torch-fidelity==0.3.0
+# jiwer==3.0.5
+
+# CLI/reporting/utils
+# xlsxwriter==3.0.8
+# enlighten==1.12.4
+# docopt==0.6.2
+# toolz==0.12.0
+# pydantic==2.9.2
+# gitpython==3.1.41
+# jsbeautifier==1.14.7
+
+# Vision/audio/generative families
+# timm>=1.0.0
+# opencv-python-headless==4.8.1.78
+# librosa==0.10.0
+# diffusers==0.35.1
+# accelerate==1.7.0
+# peft==0.18.1
+# ftfy==6.1.1
+# open_clip_torch==2.26.1
+# medpy==0.5.2
+# efficientnet-pytorch==0.7.1
+# fiftyone==0.25.2
+# kagglehub==0.2.9
+
+# Heavy UniAD-specific packages
+# mmcv==2.2.0
+# casadi==3.7.1
+# mmcv-full==1.7.2
+
+# Notebook/viz stack
+# matplotlib
+# Pillow==12.1.1
+# jupyterlab==4.2.5
+# ipywidgets==8.1.1
+# bokeh==3.1.1
+# dash==2.15.0
+# plotly==5.18.0
+
+# Dev/docs/lint/publish tooling
+# pre-commit==3.5.0
+# black==24.3.0
+# clang-format==19.1.4
+# build==0.10.0
+# twine==4.0.2
+# yamllint==1.32.0
+# mypy==1.9.0
+# platformdirs<4.0.0
+# pytest-cov==7.0.0
+# pytest-github-actions-annotate-failures==0.3.0
+# termcolor
+# beautifultable
+# faster-fifo
+# psycopg2-binary==2.9.11
+# ijson
+# docutils==0.18.1
+# sphinx==7.1.2
+# sphinx-rtd-theme==1.3.0
+# sphinxcontrib-email==0.3.5
+# lxml==4.9.4
+# breathe==4.35.0
+# nbsphinx==0.9.3
+# sphinxcontrib-jquery==4.1
+# ipython==8.12.3
+# pandoc==2.3
+# myst-parser==3.0.0
+# nbconvert==7.17.0
+
+# Environment/tooling extras
+# tt-smi==3.0.30 ; platform_machine == 'x86_64'
+# numba>=0.58.1

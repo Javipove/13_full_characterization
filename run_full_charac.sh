@@ -39,6 +39,18 @@ for ((i=0; i < ${#args[@]}; i++)); do
     fi
 done
 
+# Runtime root resolution for out-of-tree benchmark execution.
+# If TT_METAL_RUNTIME_ROOT is not set, inherit from TT_METAL_HOME.
+if [[ -z "${TT_METAL_RUNTIME_ROOT}" ]]; then
+    if [[ -n "${TT_METAL_HOME}" ]]; then
+        export TT_METAL_RUNTIME_ROOT="${TT_METAL_HOME}"
+        echo "TT_METAL_RUNTIME_ROOT not set; defaulting to TT_METAL_HOME=${TT_METAL_RUNTIME_ROOT}"
+    else
+        echo "Warning: TT_METAL_RUNTIME_ROOT is unset and TT_METAL_HOME is also unset."
+        echo "         Export TT_METAL_RUNTIME_ROOT to the tt-metal repo root if runtime init fails."
+    fi
+fi
+
 if [[ "$CLEAN_MODE" == "1" ]]; then
     # Resolve cache directory: TT_METAL_CACHE -> $HOME/.cache -> /tmp
     if [[ -n "${TT_METAL_CACHE}" ]]; then
@@ -60,20 +72,26 @@ fi
 
 echo "Generating kernels with $NUM_RT_ARGS runtime arguments..."
 
-KERNEL_DIR="${TT_METAL_HOME}/tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels"
-KERNEL_COMMON_DIR="${TT_METAL_HOME}/tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels_common"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KERNEL_DIR="$SCRIPT_DIR/kernels"
+KERNEL_COMMON_DIR="$SCRIPT_DIR/kernels_common"
+
+if [[ ! -d "$KERNEL_COMMON_DIR" ]]; then
+    echo "Error: kernels_common directory not found at $KERNEL_COMMON_DIR"
+    exit 1
+fi
 
 # Clean kernel directory
-rm -rf $KERNEL_DIR
-mkdir -p $KERNEL_DIR
+rm -rf "$KERNEL_DIR"
+mkdir -p "$KERNEL_DIR"
 
 if [[ "$TEST_TYPE" == "0" ]]; then
     # Empty Kernel Launch
     echo "Preparing Empty Kernel Launch kernels..."
-    cp $KERNEL_COMMON_DIR/empty_compute.cpp $KERNEL_DIR/
+    cp "$KERNEL_COMMON_DIR/empty_compute.cpp" "$KERNEL_DIR/"
 
     # Generate empty_reader.cpp
-    cat <<EOF > $KERNEL_DIR/empty_reader.cpp
+    cat <<EOF > "$KERNEL_DIR/empty_reader.cpp"
 // Auto-generated empty_reader.cpp
 // SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
 //
@@ -89,13 +107,13 @@ void kernel_main() {
 EOF
 
     for ((i=0; i < NUM_RT_ARGS; i++)); do
-        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_reader.cpp
+        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> "$KERNEL_DIR/empty_reader.cpp"
     done
 
-    echo "}" >> $KERNEL_DIR/empty_reader.cpp
+    echo "}" >> "$KERNEL_DIR/empty_reader.cpp"
 
     # Generate empty_writer.cpp
-    cat <<EOF > $KERNEL_DIR/empty_writer.cpp
+    cat <<EOF > "$KERNEL_DIR/empty_writer.cpp"
 // SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -108,10 +126,10 @@ void kernel_main() {
 EOF
 
     for ((i=0; i < NUM_RT_ARGS; i++)); do
-        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> $KERNEL_DIR/empty_writer.cpp
+        echo "    uint32_t runtime_arg$i = get_arg_val<uint32_t>($i);" >> "$KERNEL_DIR/empty_writer.cpp"
     done
 
-    echo "}" >> $KERNEL_DIR/empty_writer.cpp
+    echo "}" >> "$KERNEL_DIR/empty_writer.cpp"
 
 elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" || "$TEST_TYPE" == "5" || "$TEST_TYPE" == "6" ]]; then
     # Compute MM (1) or SubDevice MM (2) or ComputeMMAsyncBatch (5) or ComputeMMTraceReplay (6)
@@ -130,21 +148,21 @@ elif [[ "$TEST_TYPE" == "1" || "$TEST_TYPE" == "2" || "$TEST_TYPE" == "5" || "$T
     echo "Preparing Compute MM kernels..."
 
     # Compute kernel — always copied (same for both modes)
-    cp $KERNEL_COMMON_DIR/bmm_large_block_zm_fused_bias_activation.cpp $KERNEL_DIR/
+    cp "$KERNEL_COMMON_DIR/bmm_large_block_zm_fused_bias_activation.cpp" "$KERNEL_DIR/"
     echo "  Copied compute kernel: bmm_large_block_zm_fused_bias_activation.cpp"
 
     if [[ "$USE_DRAM" == "1" ]]; then
         # DRAM mode: copy DRAM-specific reader/writer kernels
         echo "  DRAM mode enabled — copying DRAM reader/writer kernels..."
-        cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout_dram.cpp $KERNEL_DIR/
-        cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout_dram.cpp $KERNEL_DIR/
+        cp "$KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout_dram.cpp" "$KERNEL_DIR/"
+        cp "$KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout_dram.cpp" "$KERNEL_DIR/"
         echo "  Copied: in0_reader_bmm_tile_layout_dram.cpp"
         echo "  Copied: in1_reader_writer_bmm_tile_layout_dram.cpp"
     else
         # L1 mode (default): copy L1-specific reader/writer kernels
         echo "  L1 mode (default) — copying L1 reader/writer kernels..."
-        cp $KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout.cpp $KERNEL_DIR/
-        cp $KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout.cpp $KERNEL_DIR/
+        cp "$KERNEL_COMMON_DIR/in0_reader_bmm_tile_layout.cpp" "$KERNEL_DIR/"
+        cp "$KERNEL_COMMON_DIR/in1_reader_writer_bmm_tile_layout.cpp" "$KERNEL_DIR/"
         echo "  Copied: in0_reader_bmm_tile_layout.cpp"
         echo "  Copied: in1_reader_writer_bmm_tile_layout.cpp"
     fi

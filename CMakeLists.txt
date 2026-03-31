@@ -60,7 +60,7 @@ if(NOT DEFINED ENV{TT_METAL_HOME})
 endif()
 
 set(TT_METAL_HOME "$ENV{TT_METAL_HOME}")
-set(TT_BUILD_DIR "${TT_METAL_HOME}/build_tracy_reldeb")
+set(TT_BUILD_DIR "${TT_METAL_HOME}/build")
 
 # Point cmake to all package configs
 list(PREPEND CMAKE_PREFIX_PATH

@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -72,7 +73,7 @@
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
-#include <tt-metalium/command_queue.hpp>
+// command_queue.hpp removed upstream; APIs now in mesh_command_queue.hpp / distributed.hpp
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/data_types.hpp>
@@ -159,6 +160,41 @@ void log_validation_sample_pairs(const std::string &tag,
     log_info(LogTest, "{} [{}] ref={:.6f}, obs={:.6f}, abs_err={:.6f}", tag, i,
              reference[i], observed[i], abs_err);
   }
+}
+
+std::string resolve_kernel_source_path(const std::string &kernel_filename) {
+  namespace fs = std::filesystem;
+  std::vector<fs::path> kernel_dirs;
+
+  // Local project layout only: kernels/ lives next to this benchmark source
+  // and run script. We intentionally do not look under TT_METAL_HOME.
+  kernel_dirs.emplace_back(fs::current_path() / "kernels");
+
+  std::error_code ec;
+  fs::path exe_path = fs::read_symlink("/proc/self/exe", ec);
+  if (!ec) {
+    const fs::path exe_dir = exe_path.parent_path();
+    kernel_dirs.emplace_back(exe_dir / "../kernels");
+    kernel_dirs.emplace_back(exe_dir / "kernels");
+  }
+
+  for (const auto &dir : kernel_dirs) {
+    ec.clear();
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+      continue;
+    }
+
+    fs::path candidate = dir / kernel_filename;
+    if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
+      fs::path canonical = fs::weakly_canonical(candidate, ec);
+      return ec ? candidate.string() : canonical.string();
+    }
+  }
+
+  throw std::runtime_error(
+      "Unable to find kernel source file '" + kernel_filename +
+      "'. Checked local cwd/kernels and executable-adjacent kernels "
+      "directories.");
 }
 
 } // namespace
@@ -1984,24 +2020,19 @@ void create_program_compute_mm(
     // No IN1_IS_IDENTITY — every K-block reads fresh data from DRAM.
     // NOTE: The shell script (run_full_charac.sh) copies these from
     //       kernels_common/ into kernels/ when --dram is specified.
-    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
-                         "13_full_charac/kernels/"
-                         "in0_reader_bmm_tile_layout_dram.cpp";
-    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
-                         "13_full_charac/kernels/"
-                         "in1_reader_writer_bmm_tile_layout_dram.cpp";
+    reader_kernel_path =
+      resolve_kernel_source_path("in0_reader_bmm_tile_layout_dram.cpp");
+    writer_kernel_path = resolve_kernel_source_path(
+      "in1_reader_writer_bmm_tile_layout_dram.cpp");
     // No IN1_IS_IDENTITY for DRAM — we read real matrix data from DRAM
   } else {
     // L1 kernels: read from local L1 SRAM.
     // IN1_IS_IDENTITY define tells the writer kernel to reuse the same
     // IN1 block for all K-block iterations (identity matrix workaround).
     // NOTE: The shell script copies these from kernels_common/ into kernels/.
-    reader_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
-                         "13_full_charac/kernels/"
-                         "in0_reader_bmm_tile_layout.cpp";
-    writer_kernel_path = "tests/tt_metal/tt_metal/perf_microbenchmark/"
-                         "13_full_charac/kernels/"
-                         "in1_reader_writer_bmm_tile_layout.cpp";
+    reader_kernel_path = resolve_kernel_source_path("in0_reader_bmm_tile_layout.cpp");
+    writer_kernel_path =
+      resolve_kernel_source_path("in1_reader_writer_bmm_tile_layout.cpp");
     writer_defines["IN1_IS_IDENTITY"] = "1";
   }
 
@@ -2024,8 +2055,7 @@ void create_program_compute_mm(
   // NOTE: Shell script always copies this from kernels_common/ into kernels/.
   tt_metal::CreateKernel(
       program,
-      "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/kernels/"
-      "bmm_large_block_zm_fused_bias_activation.cpp",
+      resolve_kernel_source_path("bmm_large_block_zm_fused_bias_activation.cpp"),
       all_cores,
       tt_metal::ComputeConfig{.math_fidelity = math_fidelity,
                               .fp32_dest_acc_en = fp32_dest_acc_en,
@@ -4112,9 +4142,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         std::vector<uint32_t> reader_compile_args = {uint32_t(core_group_idx)};
         auto reader_kernel = tt_metal::CreateKernel(
             program,
-            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-            "kernels/"
-            "empty_reader.cpp",
+          resolve_kernel_source_path("empty_reader.cpp"),
             group_of_cores,
             tt_metal::DataMovementConfig{
                 .processor = tt_metal::DataMovementProcessor::RISCV_1,
@@ -4124,9 +4152,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         std::vector<uint32_t> writer_compile_args = {uint32_t(core_group_idx)};
         auto writer_kernel = tt_metal::CreateKernel(
             program,
-            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-            "kernels/"
-            "empty_writer.cpp",
+          resolve_kernel_source_path("empty_writer.cpp"),
             group_of_cores,
             tt_metal::DataMovementConfig{
                 .processor = tt_metal::DataMovementProcessor::RISCV_0,
@@ -4136,9 +4162,7 @@ bool test_empty_kernel_launch(tt::tt_metal::distributed::MeshDevice *device,
         std::vector<uint32_t> compute_compile_args = {uint32_t(core_group_idx)};
         tt_metal::CreateKernel(
             program,
-            "tests/tt_metal/tt_metal/perf_microbenchmark/13_full_charac/"
-            "kernels/"
-            "empty_compute.cpp",
+          resolve_kernel_source_path("empty_compute.cpp"),
             group_of_cores,
             tt_metal::ComputeConfig{.compile_args = compute_compile_args});
 

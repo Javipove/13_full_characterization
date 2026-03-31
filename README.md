@@ -5,6 +5,7 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 ## Table of Contents
 - [Overview](#overview)
 - [Quick Start](#quick-start)
+- [Environment Export Presets](#environment-export-presets)
 - [Test Catalog](#test-catalog)
 - [CLI Reference](#cli-reference)
 - [Command Playbook](#command-playbook)
@@ -52,6 +53,85 @@ unset TT_METAL_SLOW_DISPATCH_MODE
 
 ### 3) Default execution behavior
 If `--x_size 0 --y_size 0`, current code defaults to `1x1` execution.
+
+## Environment Export Presets
+These presets are based on runtime option behavior and the tests exercised in this repo (`0,1,2,5,6`, plus host pipelines `3,4`).
+
+### 1) Mandatory baseline (out-of-tree runs)
+Use this for all benchmark commands unless your shell/session already sets these.
+
+```bash
+export TT_METAL_HOME=/scratch/javier/tt-metal
+export TT_METAL_RUNTIME_ROOT="${TT_METAL_RUNTIME_ROOT:-$TT_METAL_HOME}"
+export TT_METAL_CACHE="${TT_METAL_CACHE:-$HOME/.cache/tt-metal-cache}"
+unset TT_METAL_SLOW_DISPATCH_MODE
+```
+
+### 2) Accurate measurement preset (low-noise baseline)
+Use this when collecting latency/throughput numbers and comparing test modes.
+
+```bash
+unset TT_METAL_WATCHER
+unset TT_METAL_DPRINT_CORES
+unset TT_METAL_DEVICE_PROFILER
+unset TT_METAL_TRACE_PROFILER
+unset TT_METAL_DISABLE_DMA_OPS
+unset TT_METAL_RECORD_NOC_TRANSFER_DATA
+
+export TT_METAL_GTEST_NUM_HW_CQS=1
+export TT_METAL_NUMA_BASED_AFFINITY=1
+unset TT_METAL_SLOW_DISPATCH_MODE
+```
+
+### 3) Tracy and device-profiler preset
+Use this for device timeline analysis. A Tracy-enabled tt-metal build is required when enabling `TT_METAL_DEVICE_PROFILER=1`.
+
+```bash
+export TT_METAL_DEVICE_PROFILER=1
+export TT_METAL_DEVICE_PROFILER_DISPATCH=1
+export TT_METAL_PROFILER_SYNC=1
+export TT_METAL_TRACE_PROFILER=1
+export TT_METAL_PROFILER_TRACE_TRACKING=1
+export TT_METAL_PROFILER_CPP_POST_PROCESS=1
+export TT_METAL_TRACY_MID_RUN_PUSH=1
+```
+
+### 4) DMA and transfer-debug preset
+Use this when isolating suspected DMA/data-movement issues. This mode is intentionally intrusive and can change behavior/performance.
+
+```bash
+export TT_METAL_DISABLE_DMA_OPS=1
+export TT_METAL_VALIDATE_PROGRAM_BINARIES=1
+export TT_METAL_RECORD_NOC_TRANSFER_DATA=1
+export TT_METAL_WATCHER=500ms
+export TT_METAL_WATCHER_ENABLE_NOC_SANITIZE_LINKED_TRANSACTION=1
+export TT_METAL_LOG_KERNELS_COMPILE_COMMANDS=1
+```
+
+### 5) DPRINT preset (firmware-side logs)
+Use this for core-local debug logs. Do not combine with device profiler in the same run.
+
+```bash
+unset TT_METAL_DEVICE_PROFILER
+unset TT_METAL_TRACE_PROFILER
+
+export TT_METAL_DPRINT_CORES=all
+export TT_METAL_DPRINT_CHIPS=all
+export TT_METAL_DPRINT_RISCVS=BR+NCRISC+TRISC0
+export TT_METAL_DPRINT_FILE=/tmp/tt_dprint.log
+export TT_METAL_DPRINT_PREPEND_DEVICE_CORE_RISC=1
+```
+
+### 6) Fast reset helper
+Use this to return to clean benchmark conditions.
+
+```bash
+unset TT_METAL_DEVICE_PROFILER TT_METAL_DEVICE_PROFILER_DISPATCH TT_METAL_PROFILER_SYNC
+unset TT_METAL_TRACE_PROFILER TT_METAL_PROFILER_TRACE_TRACKING TT_METAL_PROFILER_CPP_POST_PROCESS
+unset TT_METAL_TRACY_MID_RUN_PUSH TT_METAL_WATCHER TT_METAL_DISABLE_DMA_OPS TT_METAL_RECORD_NOC_TRANSFER_DATA
+unset TT_METAL_DPRINT_CORES TT_METAL_DPRINT_CHIPS TT_METAL_DPRINT_RISCVS TT_METAL_DPRINT_FILE
+unset TT_METAL_LOG_KERNELS_COMPILE_COMMANDS TT_METAL_VALIDATE_PROGRAM_BINARIES
+```
 
 ## Test Catalog
 | Test ID | Name | Purpose | Dispatches Kernels |
