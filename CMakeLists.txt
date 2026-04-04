@@ -75,24 +75,15 @@ endif()
 if(NOT TARGET TTNN::TTNN)
     find_package(tt-nn CONFIG REQUIRED)
 endif()
+if(NOT TARGET benchmark::benchmark)
+    find_package(benchmark CONFIG REQUIRED)
+endif()
 
-add_executable(test_full_charac test_full_charac.cpp)
-
-# TTNN::TTNN maps to _ttnncpp.so and brings TT::Metalium transitively,
-# which in turn brings umd::device, fmt, Tracy, tt_stl, nlohmann_json, etc.
-target_link_libraries(test_full_charac PRIVATE
-    TTNN::TTNN
-    TT::Metalium
-)
-
-# Source-tree include paths for internal/private headers NOT part of the
-# exported public API. Needed by util.hpp and its transitive include chain.
-# Matches the in-tree perf_microbenchmark CMakeLists.txt pattern.
-target_include_directories(test_full_charac BEFORE PRIVATE
+set(TT_TEST_COMMON_PRIVATE_INCLUDES
     # Internal tt-metal source headers (for util.hpp transitive chain)
     ${TT_METAL_HOME}                          # "tt_metal/impl/dispatch/device_command.hpp"
     ${TT_METAL_HOME}/tt_metal/                # "impl/context/metal_context.hpp", "impl/program/..."
-    ${TT_BUILD_DIR}/include/tt-metalium        # bare includes like "core_coord.hpp" in internal headers
+    ${TT_BUILD_DIR}/include/tt-metalium       # bare includes like "core_coord.hpp" in internal headers
     ${TT_METAL_HOME}/tt_metal/llrt/           # "llrt.hpp"
     ${TT_METAL_HOME}/tt_metal/common/         # "env_lib.hpp"
     ${TT_METAL_HOME}/tt_stl/                  # non-exported tt_stl headers (enum.hpp, etc.)
@@ -102,9 +93,35 @@ target_include_directories(test_full_charac BEFORE PRIVATE
     # Test utilities (test_common.hpp, deprecated/tensor.hpp, util.hpp)
     ${TT_METAL_HOME}/tests
     ${TT_METAL_HOME}/tests/tt_metal/test_utils
+    ${TT_BUILD_DIR}/include                 # benchmark headers and other generated includes
 )
 
-set_target_properties(test_full_charac PROPERTIES
-    BUILD_RPATH "${TT_BUILD_DIR}/lib"
-    INSTALL_RPATH "${TT_BUILD_DIR}/lib"
-)
+function(add_tt_benchmark_target target_name source_file)
+    add_executable(${target_name} ${source_file})
+
+    # TTNN::TTNN maps to _ttnncpp.so and brings TT::Metalium transitively,
+    # which in turn brings umd::device, fmt, Tracy, tt_stl, nlohmann_json, etc.
+    target_link_libraries(${target_name} PRIVATE
+        TTNN::TTNN
+        TT::Metalium
+    )
+
+    # Source-tree include paths for internal/private headers NOT part of the
+    # exported public API. Needed by util.hpp and its transitive include chain.
+    # Matches the in-tree perf_microbenchmark CMakeLists.txt pattern.
+    target_include_directories(${target_name} BEFORE PRIVATE
+        ${TT_TEST_COMMON_PRIVATE_INCLUDES}
+    )
+
+    set_target_properties(${target_name} PROPERTIES
+        BUILD_RPATH "${TT_BUILD_DIR}/lib"
+        INSTALL_RPATH "${TT_BUILD_DIR}/lib"
+    )
+endfunction()
+
+add_tt_benchmark_target(test_full_charac test_full_charac.cpp)
+add_tt_benchmark_target(test_rw_buffer tt_test/test_rw_buffer.cpp)
+add_tt_benchmark_target(test_pgm_dispatch tt_test/test_pgm_dispatch.cpp)
+
+# dispatch/test_pgm_dispatch.cpp uses Google Benchmark APIs directly.
+target_link_libraries(test_pgm_dispatch PRIVATE benchmark::benchmark)

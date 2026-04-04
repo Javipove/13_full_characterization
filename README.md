@@ -9,6 +9,8 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 - [Test Catalog](#test-catalog)
 - [CLI Reference](#cli-reference)
 - [Command Playbook](#command-playbook)
+- [Dispatch Accuracy Study (Matrix32)](#dispatch-accuracy-study-matrix32)
+- [RW Buffer Sweep](#rw-buffer-sweep)
 - [Test 6 Trace/Replay Engineering Decisions](#test-6-tracereplay-engineering-decisions)
 - [Validation and Precision Model](#validation-and-precision-model)
 - [Execution Matrix (Tried)](#execution-matrix-tried)
@@ -253,6 +255,150 @@ unset TT_METAL_LOG_KERNELS_COMPILE_COMMANDS TT_METAL_VALIDATE_PROGRAM_BINARIES
 ./run_full_charac.sh ./build/test/test_full_charac \
   --test 4 --m 4096 --n 4096 --k 4096 --num-iters 20
 ```
+
+## Dispatch Accuracy Study (Matrix32)
+This section captures the exact commands used to run a precision-focused dispatch study, including multicore (`1x1` vs `7x7`) and cache policy (`warm` vs `clean-case`) with parser-safe TSV/CSV outputs.
+
+### Script defaults (run_pgm_dispatch_host_suite.sh)
+- `--mode phases`
+- `--warmup 2000`
+- `--iters 3000`
+- `--repeats 1`
+- `--phases A,B,C,D`
+- `--cache-mode warm`
+- `--binary ./build/test_pgm_dispatch`
+- `--reset` disabled by default
+- Default output directory if `--out-dir` is not set:
+  - `logs/pgm_dispatch_suite_<name_config_timestamp>`
+  - Config fields include mode, phases (for `phases` mode), warmup, iters, repeats, and cache mode.
+
+### Reset option
+- Use `--reset` to run `tt-smi -r 0` before each case repetition.
+- `--reset-before-each` is supported as an alias.
+
+### 1) Clean only raw logs (keep CSV/TSV analysis data)
+```bash
+find logs -type f -name '*.log' -delete
+```
+
+### 2) Warm-cache accurate run
+```bash
+./run_pgm_dispatch_host_suite.sh \
+  --mode matrix32 \
+  --warmup 200 \
+  --iters 1000 \
+  --repeats 3 \
+  --cache-mode warm \
+  --taskset-cpus 2-8 \
+  --out-dir logs/pgm_dispatch_matrix32_accuracy_warm_v2 \
+  --log-dir logs/pgm_dispatch_logs_matrix32_accuracy
+```
+
+### 3) Clean-cache-per-case accurate run
+```bash
+./run_pgm_dispatch_host_suite.sh \
+  --mode matrix32 \
+  --warmup 200 \
+  --iters 1000 \
+  --repeats 3 \
+  --cache-mode clean-case \
+  --taskset-cpus 2-8 \
+  --out-dir logs/pgm_dispatch_matrix32_accuracy_clean_v2 \
+  --log-dir logs/pgm_dispatch_logs_matrix32_accuracy
+```
+
+### 4) Result files for Python/Excel
+- `summary.tsv` / `summary.csv`: one row per configuration.
+- `measurements.tsv` / `measurements.csv`: one row per repetition.
+- `matrix32_pivot.csv`: compact plotting matrix (`grid`, `runtime_args`, `tr0_f0`, `tr0_f1`, `tr1_f0`, `tr1_f1`).
+
+### 5) Notes on stability and interpretation
+- `--iters` controls internal averaging in each invocation.
+- `--repeats` controls run-to-run averaging and stddev.
+- `--taskset-cpus` reduces host scheduling noise.
+- `--cache-mode clean-case` can expose cold-start/cache-sensitive behavior, but it may also increase variance in low-latency `finish-only` paths.
+
+## RW Buffer Sweep
+Use [run_rw_buffer_sweep.sh](run_rw_buffer_sweep.sh) to benchmark host-to-device and device-to-host bandwidth across transfer/page-size sweeps with parser-friendly TSV/CSV outputs.
+
+### Script defaults (run_rw_buffer_sweep.sh)
+- `--binary ./build/test_rw_buffer`
+- `--device 0`
+- `--num-tests 20`
+- `--repeats 3`
+- `--buffer-types 0`
+- `--transfer-sizes 67108864,268435456,536870912,1073741824`
+- `--page-sizes 2048,8192,32768`
+- `--mode full`
+- `--reset` disabled by default
+- Default output directory if `--out-dir` is not set:
+  - `logs/rw_buffer_sweep_<name_config_timestamp>`
+  - Config fields include mode, buffer types, transfer sizes, page sizes, num-tests, and repeats.
+
+### Reset option
+- Use `--reset` to run `tt-smi -r 0` before each command repetition.
+
+### Reproducible size-only sweep (DRAM, single core, forced page 2048)
+This is the exact reproducibility recipe used for the latest size-focused campaign.
+
+```bash
+./run_rw_buffer_sweep.sh \
+  --mode full \
+  --device 0 \
+  --buffer-types 0 \
+  --transfer-sizes 8388608,67108864,268435456,536870912,1073741824 \
+  --page-sizes 2048 \
+  --num-tests 30 \
+  --repeats 3 \
+  --taskset-cpus 2 \
+  --out-dir logs/rw_buffer_size_only_page2048_v1 \
+  --log-dir logs/rw_buffer_logs_size_only_page2048_v1
+```
+
+### Iteration accounting for averaging
+- Cases: `5` transfer sizes (`8MB, 64MB, 256MB, 512MB, 1GB`).
+- Internal iterations per case: `num-tests * repeats = 30 * 3 = 90`.
+- Total internal iterations: `cases * num-tests * repeats = 5 * 30 * 3 = 450`.
+- In `--mode full`, each iteration runs one write and one read.
+- Total transfer operations: `2 * 450 = 900`.
+
+### Alternate heavy-workload sweep (multi-page exploration)
+```bash
+./run_rw_buffer_sweep.sh \
+  --device 0 \
+  --buffer-types 0 \
+  --transfer-sizes 67108864,268435456,536870912,1073741824 \
+  --page-sizes 2048,8192,32768 \
+  --num-tests 20 \
+  --repeats 3 \
+  --taskset-cpus 2-8 \
+  --out-dir logs/rw_buffer_sweep_heavy \
+  --log-dir logs/rw_buffer_logs_heavy
+```
+
+### Tunable parameters and what they represent
+- `--buffer-types`: `0=DRAM`, `1=L1`.
+  - For realistic large-ML host IO pressure, prefer DRAM (`0`).
+  - Use L1 (`1`) for on-chip residency sensitivity checks.
+- `--transfer-sizes` (bytes): workload batch pressure.
+  - Larger values increase sustained bandwidth sensitivity.
+  - Suggested heavy range: `64MB` to `1GB`.
+- `--page-sizes` (bytes): transaction granularity.
+  - Smaller pages stress dispatch/descriptor overhead.
+  - Larger pages emphasize sustained transfer efficiency.
+- `--num-tests`: in-binary averaging window.
+  - Increase to reduce measurement jitter.
+- `--repeats`: external repetition for confidence intervals.
+- `--mode full|write-only|read-only`:
+  - `full` for balanced throughput behavior.
+  - `write-only` isolates H2D path.
+  - `read-only` isolates D2H path.
+- `--taskset-cpus`, `--numactl-cpubind`, `--numactl-membind`: host placement controls for reproducible runs.
+
+### Generated files
+- `summary.csv`: averaged H2D/D2H and best read/write with stddev.
+- `measurements.csv`: raw per-repeat measurements for plotting error bars.
+- Logs are overwritten in the selected log directory each run; summary outputs remain in the selected output directory.
 
 ## Test 6 Trace/Replay Engineering Decisions
 This section documents the exact decisions used to make Test 6 (`ComputeMMTraceReplay`) reliable in this repository.
