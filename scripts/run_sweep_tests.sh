@@ -4,14 +4,15 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
     DRY_RUN=1
 fi
 
-TT_METAL_HOME_DEFAULT="/scratch/javier/tt-metal"
-VENV_ACTIVATE_DEFAULT="${TT_METAL_HOME_DEFAULT}/venv_tt_javi/bin/activate"
+TT_METAL_HOME_DEFAULT="$ROOT_DIR"
+VENV_ACTIVATE_DEFAULT="${VENV_ACTIVATE:-$ROOT_DIR/venv/bin/activate}"
 
 if [[ -f "$VENV_ACTIVATE_DEFAULT" ]]; then
     # shellcheck disable=SC1090
@@ -24,13 +25,16 @@ export TT_METAL_HOME="${TT_METAL_HOME:-$TT_METAL_HOME_DEFAULT}"
 export TT_METAL_RUNTIME_ROOT="${TT_METAL_RUNTIME_ROOT:-$TT_METAL_HOME}"
 unset TT_METAL_SLOW_DISPATCH_MODE
 
-if [[ ! -x "./run_full_charac.sh" ]]; then
-    echo "Error: ./run_full_charac.sh not found or not executable"
+RUN_FULL_CHARAC="$ROOT_DIR/run_full_charac.sh"
+TEST_FULL_CHARAC_BIN="$ROOT_DIR/build/test_full_charac"
+
+if [[ ! -x "$RUN_FULL_CHARAC" ]]; then
+    echo "Error: $RUN_FULL_CHARAC not found or not executable"
     exit 1
 fi
 
-if [[ ! -x "./build/test_full_charac" ]]; then
-    echo "Error: ./build/test_full_charac not found. Build the project first."
+if [[ ! -x "$TEST_FULL_CHARAC_BIN" ]]; then
+    echo "Error: $TEST_FULL_CHARAC_BIN not found. Build the project first."
     exit 1
 fi
 
@@ -40,7 +44,7 @@ if ! command -v tt-smi >/dev/null 2>&1; then
 fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="logs/sweep_${STAMP}"
+OUT_DIR="$ROOT_DIR/logs/sweep_${STAMP}"
 mkdir -p "$OUT_DIR"
 SUMMARY_TSV="$OUT_DIR/summary.tsv"
 
@@ -59,13 +63,13 @@ TEST_NAMES=(
 )
 
 TEST_COMMANDS=(
-    "./run_full_charac.sh ./build/test_full_charac --test 0 --num-iters 3 --num-rt-args 4 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 1 --dram --pack-tile cpu --unpack-tile cpu --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 1 --dram --pack-tile device --unpack-tile device --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 3 --dram --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 4 --dram --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 5 --dram --num-iters 10 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
-    "./run_full_charac.sh ./build/test_full_charac --test 6 --dram --num-iters 10 --num-rt-args 1 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 0 --num-iters 3 --num-rt-args 4 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 1 --dram --pack-tile cpu --unpack-tile cpu --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 1 --dram --pack-tile device --unpack-tile device --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 3 --dram --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 4 --dram --num-iters 3 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 5 --dram --num-iters 10 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
+    "$RUN_FULL_CHARAC $TEST_FULL_CHARAC_BIN --test 6 --dram --num-iters 10 --num-rt-args 1 --cpu 2 --cpu-range 8 --x_size 7 --y_size 7 --m 4096 --n 4096 --k 4096 --bypass-check"
 )
 
 run_case() {

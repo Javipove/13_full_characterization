@@ -5,8 +5,18 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BINARY="./build/test_pgm_dispatch"
+to_abs_from_root() {
+    local path="$1"
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+    else
+        echo "$ROOT_DIR/$path"
+    fi
+}
+
+BINARY="build/test_pgm_dispatch"
 WARMUP=2000
 ITERATIONS=3000
 PHASES="A,B,C,D"
@@ -31,7 +41,7 @@ Usage:
   ./run_pgm_dispatch_host_suite.sh [options]
 
 Options:
-  --binary PATH              Path to test_pgm_dispatch binary (default: ./build/test_pgm_dispatch)
+    --binary PATH              Path to test_pgm_dispatch binary (default: build/test_pgm_dispatch)
     --mode MODE                phases or matrix32 (default: phases)
   --warmup N                 Warmup iterations for --custom runs (default: 2000)
   --iters N                  Timed iterations for --custom runs (default: 3000)
@@ -66,7 +76,7 @@ Notes:
     - CSV exports are auto-generated: summary.csv and measurements.csv.
     - In matrix32 mode, a pivot-friendly matrix32_pivot.csv is also generated.
     - Log files are overwritten each run in the selected log directory.
-    - If --out-dir is not set, output defaults to logs/pgm_dispatch_suite_<config>_<timestamp>.
+    - If --out-dir is not set, output defaults to <repo-root>/logs/pgm_dispatch_suite_<config>_<timestamp>.
     - Cache cleaning can be controlled with --cache-mode for warm vs cold studies.
 EOF
 }
@@ -267,6 +277,17 @@ if [[ "$REPEATS" -lt 1 ]]; then
     exit 1
 fi
 
+BINARY="$(to_abs_from_root "$BINARY")"
+if [[ -n "$OUT_DIR" ]]; then
+    OUT_DIR="$(to_abs_from_root "$OUT_DIR")"
+fi
+if [[ -n "$LOG_DIR" ]]; then
+    LOG_DIR="$(to_abs_from_root "$LOG_DIR")"
+fi
+if [[ -n "$CACHE_DIR" ]]; then
+    CACHE_DIR="$(to_abs_from_root "$CACHE_DIR")"
+fi
+
 if [[ ! -x "$BINARY" ]]; then
     echo "Error: binary not found or not executable: $BINARY"
     exit 1
@@ -289,7 +310,7 @@ if [[ -n "$NUMACTL_CPUBIND" || -n "$NUMACTL_MEMBIND" ]]; then
     fi
 fi
 
-TT_METAL_HOME_DEFAULT="/scratch/javier/tt-metal"
+TT_METAL_HOME_DEFAULT="$ROOT_DIR"
 if [[ -z "${TT_METAL_HOME:-}" ]]; then
     export TT_METAL_HOME="$TT_METAL_HOME_DEFAULT"
 fi
@@ -300,10 +321,8 @@ fi
 if [[ -z "$CACHE_DIR" ]]; then
     if [[ -n "${TT_METAL_CACHE:-}" ]]; then
         CACHE_DIR="$TT_METAL_CACHE"
-    elif [[ -n "${HOME:-}" ]]; then
-        CACHE_DIR="$HOME/.cache/tt-metal-cache"
     else
-        CACHE_DIR="/tmp/tt-metal-cache"
+        CACHE_DIR="$ROOT_DIR/.cache/tt-metal-cache"
     fi
 fi
 export TT_METAL_CACHE="$CACHE_DIR"
@@ -318,14 +337,14 @@ if [[ -z "$OUT_DIR" ]]; then
         OUT_BASE="pgm_dispatch_suite_m${MODE}_w${WARMUP}_i${ITERATIONS}_r${REPEATS}_c${CACHE_TAG}"
     fi
     if [[ "$NO_TIMESTAMP" -eq 1 ]]; then
-        OUT_DIR="logs/${OUT_BASE}"
+        OUT_DIR="$ROOT_DIR/logs/${OUT_BASE}"
     else
-        OUT_DIR="logs/${OUT_BASE}_${STAMP}"
+        OUT_DIR="$ROOT_DIR/logs/${OUT_BASE}_${STAMP}"
     fi
 fi
 
 if [[ -z "$LOG_DIR" ]]; then
-    LOG_DIR="logs/pgm_dispatch_logs_${MODE}"
+    LOG_DIR="$ROOT_DIR/logs/pgm_dispatch_logs_${MODE}"
 fi
 
 mkdir -p "$OUT_DIR"

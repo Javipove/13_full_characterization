@@ -5,8 +5,18 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BINARY="./build/test_rw_buffer"
+to_abs_from_root() {
+    local path="$1"
+    if [[ "$path" == /* ]]; then
+        echo "$path"
+    else
+        echo "$ROOT_DIR/$path"
+    fi
+}
+
+BINARY="build/test_rw_buffer"
 DEVICE_ID=0
 NUM_TESTS=20
 REPEATS=3
@@ -25,7 +35,7 @@ NUMACTL_MEMBIND=""
 NO_TIMESTAMP=0
 RESET_DEVICE=0
 
-TT_METAL_HOME_DEFAULT="/scratch/javier/tt-metal"
+TT_METAL_HOME_DEFAULT="$ROOT_DIR"
 
 usage() {
     cat <<'EOF'
@@ -33,7 +43,7 @@ Usage:
   ./run_rw_buffer_sweep.sh [options]
 
 Options:
-  --binary PATH              Path to test_rw_buffer binary (default: ./build/test_rw_buffer)
+    --binary PATH              Path to test_rw_buffer binary (default: build/test_rw_buffer)
   --device ID                Device id (default: 0)
   --num-tests N              Internal test iterations in test_rw_buffer (default: 20)
   --repeats N                Repeat each sweep point N times (default: 3)
@@ -58,7 +68,7 @@ Outputs:
 
 Notes:
   - Logs are overwritten each run in log directory.
-    - If --out-dir is not provided, output defaults to logs/rw_buffer_sweep_<config>_<timestamp>.
+    - If --out-dir is not provided, output defaults to <repo-root>/logs/rw_buffer_sweep_<config>_<timestamp>.
   - Use DRAM (buffer-type 0) for realistic large ML transfer studies.
 EOF
 }
@@ -233,6 +243,14 @@ else
     exit 1
 fi
 
+BINARY="$(to_abs_from_root "$BINARY")"
+if [[ -n "$OUT_DIR" ]]; then
+    OUT_DIR="$(to_abs_from_root "$OUT_DIR")"
+fi
+if [[ -n "$LOG_DIR" ]]; then
+    LOG_DIR="$(to_abs_from_root "$LOG_DIR")"
+fi
+
 if ! is_uint "$DEVICE_ID" || ! is_uint "$NUM_TESTS" || ! is_uint "$REPEATS"; then
     echo "Error: --device, --num-tests and --repeats must be integers"
     exit 1
@@ -277,13 +295,13 @@ if [[ -z "$OUT_DIR" ]]; then
     PAGE_TAG="$(safe_tag "$PAGE_SIZES")"
     OUT_BASE="rw_buffer_sweep_m${MODE_TAG}_b${BUFFER_TAG}_x${XFER_TAG}_p${PAGE_TAG}_n${NUM_TESTS}_r${REPEATS}"
     if [[ "$NO_TIMESTAMP" -eq 1 ]]; then
-        OUT_DIR="logs/${OUT_BASE}"
+        OUT_DIR="$ROOT_DIR/logs/${OUT_BASE}"
     else
-        OUT_DIR="logs/${OUT_BASE}_${STAMP}"
+        OUT_DIR="$ROOT_DIR/logs/${OUT_BASE}_${STAMP}"
     fi
 fi
 if [[ -z "$LOG_DIR" ]]; then
-    LOG_DIR="logs/rw_buffer_logs"
+    LOG_DIR="$ROOT_DIR/logs/rw_buffer_logs"
 fi
 mkdir -p "$OUT_DIR"
 mkdir -p "$LOG_DIR"
