@@ -35,6 +35,7 @@
 #include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/program.hpp>
 #include "impl/context/metal_context.hpp"
+#include "impl/dispatch/dispatch_mem_map.hpp"
 #include "impl/buffers/semaphore.hpp"
 #include <tt_stl/span.hpp>
 #include "test_common.hpp"
