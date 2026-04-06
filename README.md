@@ -11,6 +11,8 @@ Compact benchmark suite for host overhead, data movement, and dispatch character
 - [Command Playbook](#command-playbook)
 - [Dispatch Accuracy Study (Matrix32)](#dispatch-accuracy-study-matrix32)
 - [RW Buffer Sweep](#rw-buffer-sweep)
+- [Automated test_full_charac + Tracy Sweep](#automated-test_full_charac--tracy-sweep)
+- [Replay-Heavy Matmul Methodology](#replay-heavy-matmul-methodology)
 - [Test 6 Trace/Replay Engineering Decisions](#test-6-tracereplay-engineering-decisions)
 - [Validation and Precision Model](#validation-and-precision-model)
 - [Execution Matrix (Tried)](#execution-matrix-tried)
@@ -399,6 +401,211 @@ This is the exact reproducibility recipe used for the latest size-focused campai
 - `summary.csv`: averaged H2D/D2H and best read/write with stddev.
 - `measurements.csv`: raw per-repeat measurements for plotting error bars.
 - Logs are overwritten in the selected log directory each run; summary outputs remain in the selected output directory.
+
+## Automated test_full_charac + Tracy Sweep
+Use [scripts/run_full_charac_tracy_sweep.sh](scripts/run_full_charac_tracy_sweep.sh) to automate repeated/swept `test_full_charac` executions while collecting one Tracy file per command execution.
+
+### What this script guarantees
+- Per-command capture lifecycle: start capture in tmux -> run command -> stop capture.
+- Optional per-command device reset (`tt-smi -r 0`) before execution.
+- One trace file per execution (including repeated runs of the same config).
+- Case-tagged filenames for traces and logs (`test`, `dram`, `clean-mode`, sizes, `num-iters`, `num-rt-args`, repeat index).
+- Parser-friendly outputs: `summary.tsv/csv` and `measurements.tsv/csv`.
+
+### Script defaults
+- `--binary build/test_full_charac`
+- `--runner run_full_charac.sh`
+- `--test-ids 1`
+- `--dram-modes 1`
+- `--clean-modes 0`
+- `--x-sizes 7`
+- `--y-sizes 7`
+- `--m-sizes 4096`
+- `--n-sizes 4096`
+- `--k-sizes 4096`
+- `--num-iters 20`
+- `--num-rt-args 255`
+- `--repeats 1`
+- `--bypass-check` enabled by default (disable with `--no-bypass-check`)
+- Internal test pinning disabled by default (opt in with `--internal-cpu-pin`)
+- Tracy capture binary default: `$TT_METAL_HOME/build/tools/profiler/bin/capture-release`
+
+### Main options (by category)
+Execution matrix:
+- `--test-ids LIST`
+- `--dram-modes LIST` (`0` or `1`)
+- `--clean-modes LIST` (`0` or `1`)
+- `--x-sizes LIST`, `--y-sizes LIST`
+- `--m-sizes LIST`, `--n-sizes LIST`, `--k-sizes LIST`
+- `--num-iters LIST`
+- `--num-rt-args LIST`
+- `--repeats N`
+
+Command behavior:
+- `--no-bypass-check`
+- `--no-reset`
+- `--extra-args STRING`
+
+Host affinity:
+- `--taskset-cpus LIST`
+- `--numactl-cpubind NODE`
+- `--numactl-membind NODE`
+- `--internal-cpu-pin` with `--cpu` and `--cpu-range`
+
+Tracy capture:
+- `--capture-bin PATH`
+- `--capture-cmd-template STRING` (supports `{capture_bin}`, `{output}`, `{case}`)
+- `--start-delay-sec N`
+- `--stop-delay-sec N`
+
+Output control:
+- `--out-dir DIR`
+- `--log-dir DIR`
+- `--trace-dir DIR`
+- `--no-timestamp`
+- `--dry-run`
+
+### Incompatibilities and precedence
+- Affinity overlap risk:
+  - External pinning (`taskset`/`numactl`) and internal test pinning (`--internal-cpu-pin`) can overlap but are not strictly 1:1.
+  - Recommended production path: use only external pinning (`--taskset-cpus` and/or `--numactl-*`) and keep internal pinning disabled.
+- Reset dependency:
+  - If `--no-reset` is not set, `tt-smi` must be available.
+- Runtime dependency checks:
+  - Non-dry runs require `tmux` and an executable capture binary.
+- Runtime root requirement:
+  - `TT_METAL_HOME` must point to a tt-metal checkout containing `tt_metal/soc_descriptors`.
+  - If unset, the script defaults it to this repository root; set it explicitly in environments where descriptors live elsewhere.
+- List validation:
+  - `--dram-modes` and `--clean-modes` accept only `0` or `1`.
+  - Numeric lists (`--test-ids`, sizes, `--num-iters`, `--num-rt-args`) must be integer values.
+
+### Sweep patterns
+1) Repeat same config for manual Tracy comparison (recommended baseline)
+```bash
+./scripts/run_full_charac_tracy_sweep.sh \
+  --test-ids 1 \
+  --dram-modes 1 \
+  --clean-modes 0 \
+  --x-sizes 7 --y-sizes 7 \
+  --m-sizes 4096 --n-sizes 4096 --k-sizes 4096 \
+  --num-iters 10 \
+  --num-rt-args 255 \
+  --repeats 3 \
+  --taskset-cpus 2-5 \
+  --capture-bin "$TT_METAL_HOME/build/tools/profiler/bin/capture-release" \
+  --out-dir logs/full_charac_trace_repeat3
+```
+
+2) Sweep clean mode and runtime args
+```bash
+./scripts/run_full_charac_tracy_sweep.sh \
+  --test-ids 1 \
+  --dram-modes 1 \
+  --clean-modes 0,1 \
+  --num-rt-args 8,32,128,255 \
+  --num-iters 10 \
+  --repeats 1 \
+  --taskset-cpus 2-5 \
+  --capture-bin "$TT_METAL_HOME/build/tools/profiler/bin/capture-release" \
+  --out-dir logs/full_charac_trace_clean_rt
+```
+
+3) Dry-run matrix sanity check before expensive runs
+```bash
+./scripts/run_full_charac_tracy_sweep.sh \
+  --dry-run \
+  --clean-modes 0,1 \
+  --num-rt-args 8,255 \
+  --taskset-cpus 2-5 \
+  --out-dir logs/full_charac_trace_dryrun
+```
+
+### Output artifacts
+- `summary.tsv` / `summary.csv`: one row per case configuration.
+- `measurements.tsv` / `measurements.csv`: one row per execution (repeat-level granularity).
+- `traces/`: one Tracy file per command execution.
+- `logs/`: execution logs, reset logs, and capture launcher logs.
+
+## Replay-Heavy Matmul Methodology
+This benchmark now supports modular replay-heavy experiments through
+[scripts/run_async_trace_compare.sh](scripts/run_async_trace_compare.sh).
+
+### Three control knobs
+- `--async-iters N`: number of async enqueues for Test 5.
+- `--trace-capture-ops N`: number of matmul ops captured into one trace body for Test 6.
+- `--trace-replay-iters N`: number of trace replays for Test 6.
+
+Legacy compatibility:
+- `--iters N` still works, but is deprecated and sets both `async-iters` and `trace-replay-iters`.
+
+### Operation-count contract
+The parser and summary use the following basis:
+
+$$
+async\_ops\_total = async\_iters
+$$
+
+$$
+trace\_ops\_total = trace\_capture\_ops \times trace\_replay\_iters
+$$
+
+$$
+op\_matched = (async\_ops\_total == trace\_ops\_total)
+$$
+
+Interpretation rules:
+- Raw total-time side-by-side comparison is valid only when `op_matched=true`.
+- Per-op metrics are always valid (`async_per_op_exec_us`, `trace_per_op_exec_us`, `trace_per_op_total_with_capture_us`).
+- Capture-inclusive view (`trace_total_for_x_us`) is the correct metric when setup overhead matters.
+
+### Experiment lanes
+1) Inference-like replay-heavy lane:
+- `trace_capture_ops=1`
+- large `trace_replay_iters`
+- compare against `async_iters=trace_replay_iters`.
+
+2) Large-trace stress lane:
+- `trace_capture_ops>1`
+- tune replay count independently.
+- For fair side-by-side totals, set `async_iters = trace_capture_ops * trace_replay_iters`.
+
+### Command templates
+Fair baseline:
+```bash
+./scripts/run_async_trace_compare.sh \
+  --async-iters 20 \
+  --trace-capture-ops 1 \
+  --trace-replay-iters 20 \
+  --num-rt-args 8 \
+  --output ./logs/test_async_trace_fair.log
+```
+
+Replay-heavy large-trace, op-matched (2 capture ops, 20 total trace ops):
+```bash
+./scripts/run_async_trace_compare.sh \
+  --async-iters 20 \
+  --trace-capture-ops 2 \
+  --trace-replay-iters 10 \
+  --num-rt-args 8 \
+  --output ./logs/test_async_trace_replayheavy_2x10.log
+```
+
+One huge trace replayed once, still op-matched:
+```bash
+./scripts/run_async_trace_compare.sh \
+  --async-iters 20 \
+  --trace-capture-ops 20 \
+  --trace-replay-iters 1 \
+  --num-rt-args 8 \
+  --output ./logs/test_async_trace_one_huge_once.log
+```
+
+### Reproducibility discipline
+- Keep host pinning policy fixed (`--cpu/--cpu-range` in current script wiring).
+- Keep cache mode and bypass-check policy fixed across compared runs.
+- Report medians across repeats for publication-quality comparisons.
+- Treat mismatch warnings (`warning_raw_totals`) as hard guardrails for interpretation.
 
 ## Test 6 Trace/Replay Engineering Decisions
 This section documents the exact decisions used to make Test 6 (`ComputeMMTraceReplay`) reliable in this repository.

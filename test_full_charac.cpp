@@ -244,6 +244,7 @@ struct TestParams {
   uint32_t num_iters;
   bool bypass_check;
   uint32_t num_rt_args;
+  uint32_t trace_capture_ops;
   uint32_t cpu_id;
   uint32_t cpu_range;
   uint32_t clean_mode;
@@ -449,10 +450,13 @@ void log_effective_configuration(const TestParams &params,
            unpack_mode);
   log_info(LogTest,
            "core_x={}, core_y={}, core_groups={}, num_iters={}, "
-           "bypass_check={}, cache={}, clean_mode={}, cpu_id={}, cpu_range={}",
+           "num_rt_args={}, trace_capture_ops={}, bypass_check={}, cache={}, "
+           "clean_mode={}, cpu_id={}, cpu_range={}",
            params.core_x, params.core_y, params.core_groups, params.num_iters,
-           params.bypass_check ? "on" : "off", params.use_cache ? "on" : "off",
-           params.clean_mode, params.cpu_id, params.cpu_range);
+           params.num_rt_args, params.trace_capture_ops,
+           params.bypass_check ? "on" : "off",
+           params.use_cache ? "on" : "off", params.clean_mode,
+           params.cpu_id, params.cpu_range);
   log_info(LogTest, "validation_mode={}", validation_mode);
 
   if (params.input_dtype == 2) {
@@ -476,6 +480,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   bool use_cache = false;
   bool bypass_check = false;
   uint32_t num_rt_args;
+  uint32_t trace_capture_ops;
   uint32_t cpu_id;
   uint32_t cpu_range;
   uint32_t clean_mode;
@@ -561,6 +566,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(num_rt_args, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
             input_args, "--num-rt-args", 255);
+    std::tie(trace_capture_ops, input_args) =
+      test_args::get_command_option_uint32_and_remaining_args(
+        input_args, "--trace-capture-ops", 1);
     std::tie(cpu_id, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
             input_args, "--cpu", 0xFFFFFFFF);
@@ -608,6 +616,10 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     if (test_uint > static_cast<uint32_t>(TestType::InvalidTest)) {
       throw std::runtime_error("Invalid --test value");
     }
+    if (trace_capture_ops == 0) {
+      throw std::runtime_error(
+          "Invalid --trace-capture-ops value: must be >= 1");
+    }
     test = static_cast<TestType>(test_uint);
     test_args::validate_remaining_args(input_args);
 
@@ -651,6 +663,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .num_iters = num_iters,
                     .bypass_check = bypass_check,
                     .num_rt_args = num_rt_args,
+                    .trace_capture_ops = trace_capture_ops,
                     .cpu_id = cpu_id,
                     .cpu_range = cpu_range,
                     .clean_mode = clean_mode,
@@ -2902,10 +2915,21 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
           std::chrono::duration_cast<std::chrono::microseconds>(t_finish_end -
                                                                 t_enqueue_begin)
               .count();
+        const double async_per_op_exec_us =
+          params.num_iters > 0
+            ? static_cast<double>(total_us) /
+              static_cast<double>(params.num_iters)
+            : 0.0;
       log_info(LogTest,
                "Async batch timing: enqueue_window={}us, finish_wait={}us, "
                "total={}us, iters={}",
                enqueue_us, finish_wait_us, total_us, params.num_iters);
+        log_info(
+          LogTest,
+          "Async cost model (X-ops): exec_total={}us, per_op_exec={:.3f}us, "
+          "async_ops_executed={}, compare_ops_basis={}, "
+          "host_setup_readback_excluded=true",
+          total_us, async_per_op_exec_us, params.num_iters, params.num_iters);
     }
 
     if (!params.bypass_check) {
@@ -3310,19 +3334,33 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
       ZoneScopedN("ComputeMMTrace: ComputeMM Host Dispatch");
       const uint8_t trace_cq_id = 0;
       auto &trace_cq = device->mesh_command_queue(trace_cq_id);
-      uint32_t ops_per_capture = params.num_rt_args;
-      // Reuse existing CLI while avoiding legacy default behavior for this mode.
-      if (ops_per_capture == 0 || ops_per_capture == 255) {
+      uint32_t ops_per_capture = params.trace_capture_ops;
+      if (ops_per_capture == 0) {
         ops_per_capture = 1;
       }
 
+      const uint64_t replay_ops_total =
+          static_cast<uint64_t>(params.num_iters) *
+          static_cast<uint64_t>(ops_per_capture);
+      const uint64_t compare_ops_basis = static_cast<uint64_t>(params.num_iters);
+
       log_info(LogTest,
-               "Trace replay config: capture_ops_per_trace={}, replay_iters={} "
-               "(--num-rt-args reused for capture ops)",
-               ops_per_capture, params.num_iters);
+               "Trace replay config: capture_ops_per_trace={}, replay_iters={}, "
+               "replayed_ops_total={}, compare_ops_basis={}",
+               ops_per_capture, params.num_iters, replay_ops_total,
+               compare_ops_basis);
+      if (ops_per_capture != 1) {
+        log_warning(
+            LogTest,
+            "capture_ops_per_trace={} means replayed_ops_total={} for "
+            "compare_ops_basis={}; for strict side-by-side fairness with async "
+            "num_iters, set --trace-capture-ops 1.",
+            ops_per_capture, replay_ops_total, compare_ops_basis);
+      }
 
       std::optional<tt::tt_metal::distributed::MeshTraceId> trace_id;
       bool capture_ended = false;
+      int64_t capture_record_us = -1;
       try {
         // Warmup once so compile/setup work is not included in trace replay.
         {
@@ -3342,7 +3380,7 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
           }
           device->end_mesh_trace(trace_cq_id, trace_id.value());
           auto t_capture_end = std::chrono::steady_clock::now();
-          auto capture_record_us =
+            capture_record_us =
               std::chrono::duration_cast<std::chrono::microseconds>(
                   t_capture_end - t_capture_begin)
                   .count();
@@ -3378,11 +3416,34 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
               std::chrono::duration_cast<std::chrono::microseconds>(
                   t_replay_finish_end - t_replay_issue_begin)
                   .count();
+            const uint64_t total_cost_for_x_us =
+              static_cast<uint64_t>(replay_total_us) +
+              static_cast<uint64_t>(std::max<int64_t>(capture_record_us, 0));
+            const double trace_per_op_exec_us =
+              replay_ops_total > 0
+                ? static_cast<double>(replay_total_us) /
+                  static_cast<double>(replay_ops_total)
+                : 0.0;
+            const double trace_per_op_total_us =
+              replay_ops_total > 0
+                ? static_cast<double>(total_cost_for_x_us) /
+                  static_cast<double>(replay_ops_total)
+                : 0.0;
           log_info(LogTest,
                    "Trace timing: replay_issue_window={}us, finish_wait={}us, "
                    "replay_total={}us, replay_iters={}",
                    replay_issue_us, replay_finish_wait_us, replay_total_us,
                    params.num_iters);
+            log_info(
+              LogTest,
+              "Trace cost model (X-ops): setup_capture={}us, exec_replay={}us, "
+              "total_for_replayed_ops={}us, per_op_exec={:.3f}us, "
+              "per_op_total_with_capture={:.3f}us, trace_ops_captured={}, "
+              "trace_ops_replayed={}, compare_ops_basis={}, "
+              "host_setup_readback_excluded=true",
+              std::max<int64_t>(capture_record_us, 0), replay_total_us,
+              total_cost_for_x_us, trace_per_op_exec_us, trace_per_op_total_us,
+              ops_per_capture, replay_ops_total, compare_ops_basis);
         }
 
         {
