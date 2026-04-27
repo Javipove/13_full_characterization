@@ -14,7 +14,6 @@ TRACE_REPLAY_ITERS=20
 NUM_RT_ARGS=8
 TRACE_CAPTURE_OPS=1
 DRY_RUN=0
-USED_LEGACY_ITERS_ALIAS=0
 
 usage() {
     cat <<'USAGE'
@@ -26,10 +25,8 @@ Options:
   --summary-output FILE      Parsed summary log path. If omitted, defaults next to --output.
     --async-iters N            Number of async enqueues for Test 5 (default: 20).
     --trace-replay-iters N     Number of trace replays for Test 6 (default: 20).
-    --iters N                  Deprecated alias: sets both async and trace replay iters.
   --num-rt-args N            Kernel runtime args for both async/trace runs (default: 8).
   --trace-capture-ops N      Number of ops captured into trace setup phase (default: 1).
-  --trace-rt-args N          Deprecated alias for --num-rt-args.
   --runner PATH              Path to run_full_charac.sh (default: ./run_full_charac.sh).
   --binary PATH              Path to test_full_charac binary (default: ./build/test_full_charac).
   --dry-run                  Print commands without executing.
@@ -45,8 +42,8 @@ What it runs (exact comparison setup):
   - Config matrix:
       1) size=512 mode=dram
       2) size=4096 mode=dram
-  - Common flags: --cache --bypass-check --x_size 8 --y_size 7
-    - Raw total-time side-by-side comparison is only valid when op_matched=true.
+    - Common flags: --bypass-check --x_size 8 --y_size 7
+        - Raw total-time side-by-side comparison is only valid when op_matched=true.
 
 Output behavior:
   - Appends raw command output and parsed timing summary into --output log.
@@ -103,22 +100,12 @@ while [[ $# -gt 0 ]]; do
             TRACE_REPLAY_ITERS="$2"
             shift 2
             ;;
-        --iters)
-            ASYNC_ITERS="$2"
-            TRACE_REPLAY_ITERS="$2"
-            USED_LEGACY_ITERS_ALIAS=1
-            shift 2
-            ;;
         --num-rt-args)
             NUM_RT_ARGS="$2"
             shift 2
             ;;
         --trace-capture-ops)
             TRACE_CAPTURE_OPS="$2"
-            shift 2
-            ;;
-        --trace-rt-args)
-            NUM_RT_ARGS="$2"
             shift 2
             ;;
         --runner)
@@ -163,10 +150,6 @@ fi
 if ! is_uint "$TRACE_CAPTURE_OPS" || [[ "$TRACE_CAPTURE_OPS" -lt 1 ]]; then
     echo "Error: --trace-capture-ops must be an integer >= 1"
     exit 1
-fi
-
-if [[ "$USED_LEGACY_ITERS_ALIAS" -eq 1 ]]; then
-    echo "WARN: --iters is deprecated; use --async-iters and --trace-replay-iters for modular control."
 fi
 
 RUNNER="$(to_abs_from_root "$RUNNER")"
@@ -244,6 +227,7 @@ export TT_METAL_RUNTIME_ROOT="${TT_METAL_RUNTIME_ROOT:-$TT_METAL_HOME}"
     echo "- op_matched: true only when async_ops_total == trace_ops_total."
     echo "- per_op_* metrics normalize by executed ops and remain valid even when op_matched=false."
     echo "- raw total-time comparisons are only side-by-side fair when op_matched=true."
+    echo "- speedup_*: explicit x-speedup using async/trace (values > 1.0 mean trace is faster)."
     echo ""
 } > "$SUMMARY_OUTPUT"
 
@@ -256,12 +240,12 @@ run_case() {
         dram_flag="--dram"
     fi
 
-    local header="===== COMPARE async_vs_trace | test5=ComputeMMAsyncBatch | test6=ComputeMMTraceReplay | size=${size} | mode=${mode} | async_iters=${ASYNC_ITERS} | trace_replay_iters=${TRACE_REPLAY_ITERS} | num_rt_args=${NUM_RT_ARGS} | trace_capture_ops=${TRACE_CAPTURE_OPS} | cache=on | bypass_check=on ====="
+    local header="===== COMPARE async_vs_trace | test5=ComputeMMAsyncBatch | test6=ComputeMMTraceReplay | size=${size} | mode=${mode} | async_iters=${ASYNC_ITERS} | trace_replay_iters=${TRACE_REPLAY_ITERS} | num_rt_args=${NUM_RT_ARGS} | trace_capture_ops=${TRACE_CAPTURE_OPS} | bypass_check=on ====="
 
     echo "$header" | tee -a "$OUTPUT"
 
-    local cmd5="$RUNNER $BINARY --test 5 --num-iters ${ASYNC_ITERS} --num-rt-args ${NUM_RT_ARGS} --x_size 8 --y_size 7 --m ${size} --n ${size} --k ${size} --cache ${dram_flag} --bypass-check --pack-tile device --unpack-tile device --input-dtype bfp8 --output-dtype native --cpu 0 --cpu-range 4"
-    local cmd6="$RUNNER $BINARY --test 6 --num-iters ${TRACE_REPLAY_ITERS} --num-rt-args ${NUM_RT_ARGS} --trace-capture-ops ${TRACE_CAPTURE_OPS} --x_size 8 --y_size 7 --m ${size} --n ${size} --k ${size} --cache ${dram_flag} --bypass-check --pack-tile device --unpack-tile device --input-dtype bfp8 --output-dtype native --cpu 0 --cpu-range 4"
+    local cmd5="$RUNNER $BINARY --test 5 --num-iters ${ASYNC_ITERS} --num-rt-args ${NUM_RT_ARGS} --x_size 8 --y_size 7 --m ${size} --n ${size} --k ${size} ${dram_flag} --bypass-check --pack-tile device --unpack-tile device --input-dtype bfp8 --output-dtype native --cpu 0 --cpu-range 4 --cache"
+    local cmd6="$RUNNER $BINARY --test 6 --num-iters ${TRACE_REPLAY_ITERS} --num-rt-args ${NUM_RT_ARGS} --trace-capture-ops ${TRACE_CAPTURE_OPS} --x_size 8 --y_size 7 --m ${size} --n ${size} --k ${size} ${dram_flag} --bypass-check --pack-tile device --unpack-tile device --input-dtype bfp8 --output-dtype native --cpu 0 --cpu-range 4 --cache"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo "CMD: $cmd5" | tee -a "$OUTPUT"
@@ -380,8 +364,8 @@ run_case() {
     local trace_per_op_total_with_capture_us="NA"
     local delta_exec_us="NA"
     local delta_total_with_capture_us="NA"
-    local ratio_trace_exec_over_async_exec="NA"
-    local ratio_trace_total_over_async_exec="NA"
+    local speedup_exec_async_over_trace="NA"
+    local speedup_total_async_over_trace="NA"
 
     if is_uint_value "$async_total_us" && [[ "$async_ops" -gt 0 ]]; then
         async_per_op_exec_us="$(awk -v t="$async_total_us" -v n="$async_ops" 'BEGIN { printf "%.4f", t / n }')"
@@ -400,15 +384,15 @@ run_case() {
 
     if is_uint_value "$async_total_us" && is_uint_value "$trace_total_us"; then
         delta_exec_us=$((trace_total_us - async_total_us))
-        if [[ "$async_total_us" -gt 0 ]]; then
-            ratio_trace_exec_over_async_exec="$(awk -v t="$trace_total_us" -v a="$async_total_us" 'BEGIN { printf "%.4f", t / a }')"
+        if [[ "$trace_total_us" -gt 0 ]]; then
+            speedup_exec_async_over_trace="$(awk -v a="$async_total_us" -v t="$trace_total_us" 'BEGIN { printf "%.4f", a / t }')"
         fi
     fi
 
     if is_uint_value "$async_total_us" && is_uint_value "$trace_total_for_x_us"; then
         delta_total_with_capture_us=$((trace_total_for_x_us - async_total_us))
-        if [[ "$async_total_us" -gt 0 ]]; then
-            ratio_trace_total_over_async_exec="$(awk -v t="$trace_total_for_x_us" -v a="$async_total_us" 'BEGIN { printf "%.4f", t / a }')"
+        if [[ "$trace_total_for_x_us" -gt 0 ]]; then
+            speedup_total_async_over_trace="$(awk -v a="$async_total_us" -v t="$trace_total_for_x_us" 'BEGIN { printf "%.4f", a / t }')"
         fi
     fi
 
@@ -450,8 +434,8 @@ run_case() {
         echo "Comparison"
         echo "  delta_exec_us(trace_exec-async_exec): ${delta_exec_us}"
         echo "  delta_total_with_capture_us(trace_total_for_x-async_exec): ${delta_total_with_capture_us}"
-        echo "  ratio_trace_exec_over_async_exec: ${ratio_trace_exec_over_async_exec}"
-        echo "  ratio_trace_total_over_async_exec: ${ratio_trace_total_over_async_exec}"
+        echo "  speedup_exec_x(async_over_trace_exec): ${speedup_exec_async_over_trace}"
+        echo "  speedup_total_x(async_over_trace_total_with_capture): ${speedup_total_async_over_trace}"
         if [[ "$op_matched" != "true" ]]; then
             echo "  warning_raw_totals: op_mismatch_raw_totals_not_side_by_side_fair"
         fi
@@ -470,6 +454,7 @@ run_case() {
 
 # run_case 512 l1
 run_case 512 dram
+run_case 1024 dram
 run_case 4096 dram
 
 echo "Saved comparison log to $OUTPUT"
