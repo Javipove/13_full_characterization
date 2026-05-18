@@ -147,13 +147,15 @@ unset TT_METAL_LOG_KERNELS_COMPILE_COMMANDS TT_METAL_VALIDATE_PROGRAM_BINARIES
 | `4` | HostPipelineEmpty | Host-only single-tensor baseline pipeline | No |
 | `5` | ComputeMMAsyncBatch | ComputeMM async batch enqueue with single finish for fair baseline | Yes |
 | `6` | ComputeMMTraceReplay | TTNN trace capture + replay (capture once, loop replay) | Yes |
+| `7` | ComputeMMSyncBatch | ComputeMM per-iter sync Enqueue+Finish (like test 1) with warmup; emits same metric format as tests 5/6 for hot-state comparison | Yes |
 
 ## CLI Reference
 ### Core selection and runtime
 | Option | Default | Notes |
 | :-- | :-- | :-- |
-| `--test <0..6>` | `7` | `0..4` standard tests; `5` = ComputeMMAsyncBatch, `6` = ComputeMMTraceReplay (`7` internal invalid sentinel). |
+| `--test <0..7>` | `8` | `0..4` standard tests; `5` = ComputeMMAsyncBatch, `6` = ComputeMMTraceReplay, `7` = ComputeMMSyncBatch (`8` internal invalid sentinel). |
 | `--num-iters <N>` | `15` | Iteration count for all tests. |
+| `--warmup <N>` | `5` | Warmup iters before the measured loop in tests 5/6/7. Warmup phase is terminated by a single `Finish` so the measured loop starts from a hot, synchronized state. `0` disables warmup. |
 | `--x_size <N>` | `0` | Grid X. With `0,0`, code defaults to `1x1`. |
 | `--y_size <N>` | `0` | Grid Y. |
 | `--core_groups <N>` | `1` | Must be `> 0` and `<= y_size`. |
@@ -219,6 +221,14 @@ Skips host RNG and O(N³) golden matmul; full transfer + dispatch + readback pat
 ./run_full_charac.sh ./build/test/test_full_charac \
   --test 6 --num-iters 100 --num-rt-args 1 \
   --x_size 1 --y_size 1 --m 512 --n 512 --k 512
+```
+
+### ComputeMM per-iter sync baseline (new test 7)
+Matches test 1's per-iter Enqueue+Finish dispatch shape, but with explicit warmup and the same log format as tests 5/6 so the three can be diff'd directly in hot state.
+```bash
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 7 --num-iters 100 --warmup 5 \
+  --x_size 1 --y_size 1 --m 512 --n 512 --k 512 --bypass-check
 ```
 
 
@@ -538,12 +548,14 @@ Output control:
 
 ## Replay-Heavy Matmul Methodology
 This benchmark now supports modular replay-heavy experiments through
-[scripts/run_async_trace_compare.sh](scripts/run_async_trace_compare.sh).
+[scripts/run_async_trace_compare.sh](scripts/run_async_trace_compare.sh). The driver runs **all three** dispatch variants (tests 5/6/7) per case so async, trace, and per-iter sync can be compared side-by-side in hot state.
 
-### Three control knobs
+### Control knobs
 - `--async-iters N`: number of async enqueues for Test 5.
 - `--trace-capture-ops N`: number of matmul ops captured into one trace body for Test 6.
 - `--trace-replay-iters N`: number of trace replays for Test 6.
+- `--sync-iters N`: number of per-iter sync Enqueue+Finish ops for Test 7. Defaults to `--async-iters` so the three tests are op-matched by default.
+- `--warmup N`: warmup iters before each measured loop (Test 5/6/7). Default `5`. The warmup phase ends with a single `Finish` so the measurement starts from a hot, synchronized state.
 
 Legacy compatibility:
 - `--iters N` still works, but is deprecated and sets both `async-iters` and `trace-replay-iters`.
@@ -560,13 +572,18 @@ trace\_ops\_total = trace\_capture\_ops \times trace\_replay\_iters
 $$
 
 $$
-op\_matched = (async\_ops\_total == trace\_ops\_total)
+sync\_ops\_total = sync\_iters
+$$
+
+$$
+op\_matched = (async\_ops\_total == trace\_ops\_total == sync\_ops\_total)
 $$
 
 Interpretation rules:
 - Raw total-time side-by-side comparison is valid only when `op_matched=true`.
-- Per-op metrics are always valid (`async_per_op_exec_us`, `trace_per_op_exec_us`, `trace_per_op_total_with_capture_us`).
+- Per-op metrics are always valid (`async_per_op_exec_us`, `trace_per_op_exec_us`, `trace_per_op_total_with_capture_us`, `sync_per_op_exec_us`).
 - Capture-inclusive view (`trace_total_for_x_us`) is the correct metric when setup overhead matters.
+- Sync (Test 7) provides the per-iter Finish baseline. Expect `sync_total_us > async_total_us` (no pipelining) and `> trace_total_us` (no trace fast-path); `speedup_exec_x(sync_over_async)` and `speedup_exec_x(sync_over_trace)` quantify the wins.
 
 ### Experiment lanes
 1) Inference-like replay-heavy lane:
@@ -580,14 +597,16 @@ Interpretation rules:
 - For fair side-by-side totals, set `async_iters = trace_capture_ops * trace_replay_iters`.
 
 ### Command templates
-Fair baseline:
+Fair baseline (op-matched across all three tests, 5 warmup iters):
 ```bash
 ./scripts/run_async_trace_compare.sh \
   --async-iters 20 \
   --trace-capture-ops 1 \
   --trace-replay-iters 20 \
+  --sync-iters 20 \
+  --warmup 5 \
   --num-rt-args 8 \
-  --output ./logs/test_async_trace_fair.log
+  --output ./logs/test_async_trace_sync_fair.log
 ```
 
 Replay-heavy large-trace, op-matched (2 capture ops, 20 total trace ops):
@@ -615,6 +634,17 @@ One huge trace replayed once, still op-matched:
 - Keep cache mode and bypass-check policy fixed across compared runs.
 - Report medians across repeats for publication-quality comparisons.
 - Treat mismatch warnings (`warning_raw_totals`) as hard guardrails for interpretation.
+
+### Unified hot-state log format (tests 5/6/7)
+All three measured-loop tests emit a parallel timing line so they can be diff'd as-is by parsers and by `run_async_trace_compare.sh`:
+
+| Test | Log line |
+| :-- | :-- |
+| 5 | `Async batch timing: enqueue_window={}us, finish_wait={}us, total={}us, iters={}, warmup={}` |
+| 6 | `Trace timing: replay_issue_window={}us, finish_wait={}us, replay_total={}us, replay_iters={}, warmup={}` |
+| 7 | `Sync per-iter timing: enqueue_window={}us, finish_wait={}us, total={}us, iters={}, warmup={}` |
+
+Common keys: `enqueue_window` / `replay_issue_window`, `finish_wait`, `total` / `replay_total`, `iters` / `replay_iters`, `warmup`. Each test also emits a `*_per_op_exec_us` cost-model line keyed off `compare_ops_basis`.
 
 ## Test 6 Trace/Replay Engineering Decisions
 This section documents the exact decisions used to make Test 6 (`ComputeMMTraceReplay`) reliable in this repository.
@@ -786,7 +816,7 @@ Notes:
 
 ## Troubleshooting
 ### Invalid test id
-Use `--test` in the `0..6` range.
+Use `--test` in the `0..7` range.
 
 ### `core_y < core_groups`
 Increase `--y_size` or reduce `--core_groups`.

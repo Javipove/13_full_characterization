@@ -218,7 +218,8 @@ enum class TestType : uint32_t {
   HostPipelineEmpty = 4,
   ComputeMMAsyncBatch = 5,
   ComputeMMTraceReplay = 6,
-  InvalidTest = 7
+  ComputeMMSyncBatch = 7,
+  InvalidTest = 8
 };
 
 enum class OutputDTypeMode : uint32_t {
@@ -245,6 +246,7 @@ struct TestParams {
   bool bypass_check;
   uint32_t num_rt_args;
   uint32_t trace_capture_ops;
+  uint32_t warmup_iters;
   uint32_t cpu_id;
   uint32_t cpu_range;
   uint32_t clean_mode;
@@ -349,6 +351,8 @@ const char *test_type_to_string(TestType test) {
     return "ComputeMMAsyncBatch";
   case TestType::ComputeMMTraceReplay:
     return "ComputeMMTraceReplay";
+  case TestType::ComputeMMSyncBatch:
+    return "ComputeMMSyncBatch";
   case TestType::InvalidTest:
     return "InvalidTest";
   default:
@@ -451,10 +455,10 @@ void log_effective_configuration(const TestParams &params,
            unpack_mode);
   log_info(LogTest,
            "core_x={}, core_y={}, core_groups={}, num_iters={}, "
-           "num_rt_args={}, trace_capture_ops={}, bypass_check={}, cache={}, "
-           "clean_mode={}, cpu_id={}, cpu_range={}",
+           "warmup_iters={}, num_rt_args={}, trace_capture_ops={}, "
+           "bypass_check={}, cache={}, clean_mode={}, cpu_id={}, cpu_range={}",
            params.core_x, params.core_y, params.core_groups, params.num_iters,
-           params.num_rt_args, params.trace_capture_ops,
+           params.warmup_iters, params.num_rt_args, params.trace_capture_ops,
            params.bypass_check ? "on" : "off",
            params.use_cache ? "on" : "off", params.clean_mode,
            params.cpu_id, params.cpu_range);
@@ -483,6 +487,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   bool bypass_check = false;
   uint32_t num_rt_args;
   uint32_t trace_capture_ops;
+  uint32_t warmup_iters;
   uint32_t cpu_id;
   uint32_t cpu_range;
   uint32_t clean_mode;
@@ -573,6 +578,9 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
     std::tie(trace_capture_ops, input_args) =
       test_args::get_command_option_uint32_and_remaining_args(
         input_args, "--trace-capture-ops", 1);
+    std::tie(warmup_iters, input_args) =
+        test_args::get_command_option_uint32_and_remaining_args(
+            input_args, "--warmup", 5);
     std::tie(cpu_id, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(
             input_args, "--cpu", 0xFFFFFFFF);
@@ -586,7 +594,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
 
     std::tie(test_uint, input_args) =
         test_args::get_command_option_uint32_and_remaining_args(input_args,
-                    "--test", 7);
+                    "--test", 8);
 
     std::tie(unpack_tile_str, input_args) =
         test_args::get_command_option_and_remaining_args(
@@ -680,6 +688,7 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .bypass_check = bypass_check,
                     .num_rt_args = num_rt_args,
                     .trace_capture_ops = trace_capture_ops,
+                    .warmup_iters = warmup_iters,
                     .cpu_id = cpu_id,
                     .cpu_range = cpu_range,
                     .clean_mode = clean_mode,
@@ -1147,6 +1156,9 @@ bool test_compute_mm_async(tt_metal::distributed::MeshDevice *device,
 
 bool test_compute_mm_trace(tt_metal::distributed::MeshDevice *device,
                            const TestParams &params);
+
+bool test_compute_mm_sync(tt_metal::distributed::MeshDevice *device,
+                          const TestParams &params);
 
 // 1-to-1 match with 1_compute_mm/test_compute_mm.cpp
 // MODIFIED: FP32 ACCUM TO TRUE -> poor preceision
@@ -2949,6 +2961,18 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
 
     {
       ZoneScopedN("ComputeMMAsync Host Dispatch");
+
+      // Warmup phase (excluded from measured timing). Ends with a single Finish
+      // so the measured loop starts from a fully synchronized, hot state.
+      if (params.warmup_iters > 0) {
+        ZoneScopedN("ComputeMMAsync Host Warmup");
+        for (uint32_t w = 0; w < params.warmup_iters; ++w) {
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+        tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
+
       auto t_enqueue_begin = std::chrono::steady_clock::now();
       for (uint32_t i = 0; i < params.num_iters; ++i) {
         ZoneScopedN("ComputeMMAsync Host Dispatch Iteration");
@@ -2987,8 +3011,9 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
             : 0.0;
       log_info(LogTest,
                "Async batch timing: enqueue_window={}us, finish_wait={}us, "
-               "total={}us, iters={}",
-               enqueue_us, finish_wait_us, total_us, params.num_iters);
+               "total={}us, iters={}, warmup={}",
+               enqueue_us, finish_wait_us, total_us, params.num_iters,
+               params.warmup_iters);
         log_info(
           LogTest,
           "Async cost model (X-ops): exec_total={}us, per_op_exec={:.3f}us, "
@@ -3273,6 +3298,464 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
 }
 
 
+bool test_compute_mm_sync(tt::tt_metal::distributed::MeshDevice *device,
+                          const TestParams &params) {
+  // Same setup/prep/validation as ComputeMMAsyncBatch (test 5). Only the
+  // dispatch loop differs: per-iter Enqueue+Finish (synchronous), with
+  // per-iter timings summed so the output format mirrors test 5/6 and the
+  // three tests are directly comparable in hot state.
+  bool pass = true;
+  try {
+    ZoneScopedN("ComputeMMSync Functional Blocks");
+    log_info(LogTest, "Starting Compute MM Test");
+    log_info(LogTest, "M={}, N={}, K={}", params.M, params.N, params.K);
+    log_info(LogTest, "Dispatch mode: per-iter sync enqueue+finish, warmup={}",
+             params.warmup_iters);
+
+    auto arch = device->arch();
+    uint32_t l1_size = 0;
+    uint32_t l1_unreserved_base = 0;
+    MathFidelity math_fidelity = MathFidelity::HiFi4;
+    bool fp32_dest_acc_en = false;
+    uint32_t Mt = 0, Nt = 0, Kt = 0;
+    uint32_t num_cores_x = params.core_x;
+    uint32_t num_cores_y = params.core_y;
+    CoreCoord core_range(num_cores_x, num_cores_y);
+    uint32_t per_core_Mt = 0;
+    uint32_t per_core_Nt = 0;
+    tt::DataFormat data_format = tt::DataFormat::Bfp8_b;
+    uint32_t single_tile_size = 0;
+    uint32_t out_block_h = 0, out_block_w = 0, in0_block_w = 0;
+    uint32_t num_blocks_h = 1, num_blocks_w = 1;
+    uint32_t out_subblock_h = 0, out_subblock_w = 0;
+    uint32_t in0_cb_addr = 0, in1_cb_addr = 0, in2_cb_addr = 0, out_cb_addr = 0,
+             interm_cb_addr = 0, in0_addr = 0, in1_addr = 0, out_addr = 0;
+    BenchmarkInputs inputs;
+    uint32_t effective_in0_addr = 0;
+    uint32_t effective_in1_addr = 0;
+    uint32_t effective_out_addr = 0;
+
+    {
+      ZoneScopedN("ComputeMMSync Input Data Processing");
+
+      {
+        ZoneScopedN("ComputeMMSync Host Setup and Blocking");
+        l1_size = get_l1_size(arch);
+        l1_unreserved_base =
+            device->allocator()->get_base_allocator_addr(HalMemType::L1);
+        std::tie(math_fidelity, fp32_dest_acc_en) = get_compute_params(arch);
+
+        std::tie(Mt, Nt, Kt) =
+            get_aligned_input_tile_num(params.M, params.N, params.K);
+
+        per_core_Mt = ((Mt - 1) / num_cores_y) + 1;
+        per_core_Nt = ((Nt - 1) / num_cores_x) + 1;
+
+        data_format = compute_data_format_from_input_dtype(params.input_dtype);
+        single_tile_size = tt::tile_size(data_format);
+
+        if (params.use_dram) {
+          auto [obh, obw, bw] = get_dynamic_l1_block_params(
+              per_core_Mt, per_core_Nt, Kt, single_tile_size, l1_size,
+              l1_unreserved_base);
+          out_block_h = obh;
+          out_block_w = obw;
+          in0_block_w = bw;
+          num_blocks_h = per_core_Mt / out_block_h;
+          num_blocks_w = per_core_Nt / out_block_w;
+
+          log_info(LogTest,
+                   "DRAM blocking: per_core={}x{}, out_block={}x{}, "
+                   "num_blocks={}x{}, in0_block_w={}",
+                   per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+                   num_blocks_h, num_blocks_w, in0_block_w);
+        } else {
+          out_block_h = per_core_Mt;
+          out_block_w = per_core_Nt;
+          in0_block_w =
+              get_in0_block_w(per_core_Mt, per_core_Nt, Kt, single_tile_size,
+                              l1_size, l1_unreserved_base, false);
+        }
+
+        if (in0_block_w == 0) {
+          uint32_t out_cb_tiles = out_block_h * out_block_w;
+          uint32_t out_cb_bytes = out_cb_tiles * single_tile_size;
+          uint32_t avail_l1 = l1_size - l1_unreserved_base;
+          log_error(LogTest,
+                    "Insufficient L1 memory for M={}, N={}, K={} "
+                    "(out_block={}x{}, out_CB={}tiles={}KB, "
+                    "avail_L1={}KB, dram={})",
+                    params.M, params.N, params.K, out_block_h, out_block_w,
+                    out_cb_tiles, out_cb_bytes / 1024, avail_l1 / 1024,
+                    params.use_dram ? "yes" : "no");
+          return false;
+        }
+
+        std::tie(out_subblock_h, out_subblock_w) =
+            get_out_subblock_params(out_block_h, out_block_w);
+
+        std::tie(in0_cb_addr, in1_cb_addr, in2_cb_addr, out_cb_addr,
+                 interm_cb_addr, in0_addr, in1_addr, out_addr) =
+            get_all_buffers_addresses(out_block_h, out_block_w, in0_block_w,
+                                      single_tile_size, l1_unreserved_base,
+                                      params.use_dram);
+      }
+
+      {
+        ZoneScopedN("ComputeMMSync Host Prepare Inputs");
+        inputs = prepare_inputs_compute_mm(
+            device, core_range, Mt, Nt, Kt, per_core_Mt, per_core_Nt,
+            in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
+            params.use_dram, 0, data_format, params.pack_device,
+            !params.bypass_check, params.unpack_device, params.zeros_mode);
+      }
+
+      {
+        ZoneScopedN("ComputeMMSync Host Resolve Buffer Addresses");
+        effective_in0_addr = in0_addr;
+        effective_in1_addr = in1_addr;
+        effective_out_addr = out_addr;
+        if (params.use_dram) {
+          auto coord = tt::tt_metal::distributed::MeshCoordinate(0, 0);
+          effective_in0_addr =
+              inputs.in0_buffer->get_device_buffer(coord)->address();
+          effective_in1_addr =
+              inputs.in1_buffer->get_device_buffer(coord)->address();
+          effective_out_addr =
+              inputs.out_buffer->get_device_buffer(coord)->address();
+          log_info(LogTest, "DRAM mode: in0=0x{:x}, in1=0x{:x}, out=0x{:x}",
+                   effective_in0_addr, effective_in1_addr, effective_out_addr);
+        }
+      }
+    }
+
+    log_info(LogTest, "Num tests {}", params.num_iters);
+
+    tt_metal::Program program;
+    {
+      ZoneScopedN("ComputeMMSync Host Program Build");
+      create_program_compute_mm(
+          device, data_format, math_fidelity, fp32_dest_acc_en,
+          single_tile_size, core_range, Mt, Nt, Kt, in0_block_w, out_subblock_h,
+          out_subblock_w, per_core_Mt, per_core_Nt, out_block_h, out_block_w,
+          num_blocks_h, num_blocks_w, in0_cb_addr, in1_cb_addr, in2_cb_addr,
+          out_cb_addr, interm_cb_addr, effective_in0_addr, effective_in1_addr,
+          effective_out_addr, params.use_dram, program);
+    }
+
+    auto mesh_workload = tt_metal::distributed::MeshWorkload();
+    mesh_workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange{{0, 0}, {0, 0}},
+        std::move(program));
+
+    {
+      ZoneScopedN("ComputeMMSync Host Dispatch");
+
+      // Warmup phase (excluded from measured timing). Ends with a single Finish
+      // so the measured loop starts from a hot, synchronized state.
+      if (params.warmup_iters > 0) {
+        ZoneScopedN("ComputeMMSync Host Warmup");
+        for (uint32_t w = 0; w < params.warmup_iters; ++w) {
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+        tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
+
+      uint64_t enqueue_sum_us = 0;
+      uint64_t finish_sum_us = 0;
+      auto t_loop_begin = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < params.num_iters; ++i) {
+        ZoneScopedN("ComputeMMSync Host Dispatch Iteration");
+        ZoneValue(i);
+        auto t_e0 = std::chrono::steady_clock::now();
+        {
+          ZoneScopedN("ComputeMMSync Host Enqueue");
+          tt_metal::distributed::EnqueueMeshWorkload(
+              device->mesh_command_queue(), mesh_workload, false);
+        }
+        auto t_e1 = std::chrono::steady_clock::now();
+        {
+          ZoneScopedN("ComputeMMSync Host FinishWait");
+          tt_metal::distributed::Finish(device->mesh_command_queue());
+        }
+        auto t_f1 = std::chrono::steady_clock::now();
+        enqueue_sum_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t_e1 - t_e0)
+                .count();
+        finish_sum_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(t_f1 - t_e1)
+                .count();
+      }
+      auto t_loop_end = std::chrono::steady_clock::now();
+
+      auto total_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(t_loop_end -
+                                                                t_loop_begin)
+              .count();
+      const double sync_per_op_exec_us =
+          params.num_iters > 0
+              ? static_cast<double>(total_us) /
+                    static_cast<double>(params.num_iters)
+              : 0.0;
+      log_info(LogTest,
+               "Sync per-iter timing: enqueue_window={}us, finish_wait={}us, "
+               "total={}us, iters={}, warmup={}",
+               enqueue_sum_us, finish_sum_us, total_us, params.num_iters,
+               params.warmup_iters);
+      log_info(LogTest,
+               "Sync cost model (X-ops): exec_total={}us, per_op_exec={:.3f}us, "
+               "sync_ops_executed={}, compare_ops_basis={}, "
+               "host_setup_readback_excluded=true",
+               total_us, sync_per_op_exec_us, params.num_iters,
+               params.num_iters);
+    }
+
+    if (!params.bypass_check) {
+      ZoneScopedN("ComputeMMSync Host Post Processing");
+      log_info(LogTest, "Validation Started...");
+      log_validation_pipeline_steps(params);
+
+      if (params.use_dram && params.pack_device && !params.zeros_mode) {
+        ZoneScopedN("ComputeMMSync Host Validation: Reconstruct Effective Inputs");
+        std::vector<uint32_t> in0_packed_effective;
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Read Packed IN0 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in0_packed_effective,
+              inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Decode Effective IN0 (Device Pack)");
+          inputs.in0_vec = unpack_device_tiles_to_fp32(in0_packed_effective,
+                                                       Mt * 32, Kt * 32,
+                                                       data_format);
+        }
+
+        std::vector<uint32_t> in1_packed_effective;
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Read Packed IN1 (Device Pack)");
+          tt::tt_metal::distributed::ReadShard(
+              device->mesh_command_queue(), in1_packed_effective,
+              inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
+              true);
+        }
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Decode Effective IN1 (Device Pack)");
+          inputs.in1_vec = unpack_device_tiles_to_fp32(in1_packed_effective,
+                                                       Kt * 32, Nt * 32,
+                                                       data_format);
+        }
+      }
+
+      std::vector<float> golden_vec;
+      {
+        ZoneScopedN("ComputeMMSync Host Golden Reference");
+        if (params.zeros_mode) {
+          log_info(LogTest, "Golden Reference: all-zeros (zeros mode)");
+          golden_vec.assign(static_cast<size_t>(params.M) * params.N, 0.0f);
+        } else {
+          log_info(LogTest, "Computing Golden Reference (FP32)...");
+          golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
+                                        params.M, params.N, params.K);
+        }
+      }
+
+      log_info(LogTest, "Reading Device Results...");
+      std::vector<float> device_vec(params.M * params.N, 0.0f);
+      const bool output_needs_trim =
+          ((params.M % constants::TILE_HEIGHT) != 0) ||
+          ((params.N % constants::TILE_WIDTH) != 0);
+      auto *target_device = device->get_devices()[0];
+
+      {
+        ZoneScopedN("ComputeMMSync Host Device Readback");
+        if (params.use_dram) {
+          if (params.unpack_device) {
+            ZoneScopedN("ComputeMMSync Host Device Unpack (ttnn)");
+            if (!inputs.output_ttnn_tensor.has_value()) {
+              throw std::runtime_error(
+                  "Device unpack requested, but no output TTNN tensor was "
+                  "created. Ensure output tensor bootstrap is enabled.");
+            }
+            auto &device_tensor_out = inputs.output_ttnn_tensor.value();
+
+            if (params.output_dtype_mode == OutputDTypeMode::Fp32) {
+              ttnn::Tensor device_tensor_fp32_tile;
+              {
+                ZoneScopedN("ttnn::typecast(FLOAT32)");
+                device_tensor_fp32_tile =
+                    ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
+              }
+              ttnn::Tensor device_tensor_fp32_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_fp32_rm = ttnn::untilize(device_tensor_fp32_tile);
+              }
+              {
+                ZoneScopedN("ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_fp32_rm.to_vector<float>();
+              }
+            } else {
+              ttnn::Tensor device_tensor_rm;
+              {
+                ZoneScopedN("ttnn::untilize");
+                device_tensor_rm = ttnn::untilize(device_tensor_out);
+              }
+              {
+                ZoneScopedN("ttnn::untilize_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
+              {
+                ZoneScopedN("ttnn::to_vector<float> (Readback)");
+                device_vec = device_tensor_rm.to_vector<float>();
+              }
+            }
+
+            if (output_needs_trim &&
+                device_vec.size() > (size_t)(params.M * params.N)) {
+              ZoneScopedN("ComputeMMSync Host Trim Device Readback to MxN");
+              std::vector<float> trimmed(params.M * params.N, 0.0f);
+              for (uint32_t r = 0; r < params.M; ++r) {
+                for (uint32_t c = 0; c < params.N; ++c) {
+                  trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                }
+              }
+              device_vec = trimmed;
+            }
+          } else {
+            std::vector<uint32_t> out_data;
+            {
+              ZoneScopedN("ComputeMMSync Host ReadShard DRAM Output");
+              tt::tt_metal::distributed::ReadShard(
+                  device->mesh_command_queue(), out_data, inputs.out_buffer,
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+            }
+            {
+              ZoneScopedN("ComputeMMSync Host Decode DRAM");
+              device_vec = unpack_device_tiles_to_fp32(out_data, Mt * 32,
+                                                       Nt * 32, data_format);
+              if (output_needs_trim &&
+                  device_vec.size() > (size_t)(params.M * params.N)) {
+                ZoneScopedN("ComputeMMSync Host Trim DRAM Decode to MxN");
+                std::vector<float> trimmed(params.M * params.N, 0.0f);
+                for (uint32_t r = 0; r < params.M; ++r) {
+                  for (uint32_t c = 0; c < params.N; ++c) {
+                    trimmed[r * params.N + c] = device_vec[r * (Nt * 32) + c];
+                  }
+                }
+                device_vec = trimmed;
+              }
+            }
+          }
+        } else {
+          std::vector<std::vector<uint32_t>> all_core_tiles(num_cores_y *
+                                                            num_cores_x);
+          {
+            ZoneScopedN("ComputeMMSync Host ReadFromDeviceL1 All Cores");
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                CoreCoord core = {(std::size_t)x, (std::size_t)y};
+                uint32_t core_n_tiles = per_core_Mt * per_core_Nt;
+                uint32_t read_size = core_n_tiles * single_tile_size;
+                tt_metal::detail::ReadFromDeviceL1(
+                    target_device, core, out_addr, read_size,
+                    all_core_tiles[y * num_cores_x + x]);
+              }
+            }
+          }
+          {
+            ZoneScopedN("ComputeMMSync Host Decode L1");
+            for (int y = 0; y < (int)num_cores_y; y++) {
+              for (int x = 0; x < (int)num_cores_x; x++) {
+                auto core_data_untilized = unpack_device_tiles_to_fp32(
+                    all_core_tiles[y * num_cores_x + x], per_core_Mt * 32,
+                    per_core_Nt * 32, data_format);
+                uint32_t global_r_start = y * per_core_Mt * 32;
+                uint32_t global_c_start = x * per_core_Nt * 32;
+                uint32_t r_len = per_core_Mt * 32;
+                uint32_t c_len = per_core_Nt * 32;
+                for (uint32_t r = 0; r < r_len; ++r) {
+                  for (uint32_t c = 0; c < c_len; ++c) {
+                    uint32_t global_idx = (global_r_start + r) * (params.N) +
+                                          (global_c_start + c);
+                    if (global_idx < device_vec.size()) {
+                      device_vec[global_idx] =
+                          core_data_untilized[r * c_len + c];
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (params.output_dtype_mode == OutputDTypeMode::Bf16) {
+        ZoneScopedN("ComputeMMSync Host Output DType Postprocess BF16");
+        for (auto &v : device_vec) {
+          v = static_cast<float>(bfloat16(v));
+        }
+      }
+
+      if (params.zeros_mode) {
+        float max_abs = 0.0f;
+        {
+          ZoneScopedN("ComputeMMSync Host Validation Metrics");
+          max_abs = get_max_abs(device_vec);
+        }
+        log_validation_sample_pairs("ComputeMMSync Validation (zeros)",
+                                    golden_vec, device_vec, 12);
+        const float zeros_eps = 1e-6f;
+        log_info(LogTest,
+                 "Validation Result (zeros mode): max_abs={:.6e}, eps={:.1e}",
+                 max_abs, zeros_eps);
+        if (max_abs > zeros_eps) {
+          log_error(LogTest,
+                    "Validation FAILED (zeros mode: max_abs > {:.1e})",
+                    zeros_eps);
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
+      } else {
+        float pcc = 0.0f;
+        float rmse = 0.0f;
+        float relative_rmse = 0.0f;
+        {
+          ZoneScopedN("ComputeMMSync Host Validation Metrics");
+          pcc = get_pcc(golden_vec, device_vec);
+          rmse = get_rmse(golden_vec, device_vec);
+          relative_rmse = get_relative_rmse(device_vec, golden_vec);
+        }
+        log_validation_sample_pairs("ComputeMMSync Validation", golden_vec,
+                                    device_vec, 12);
+        log_info(LogTest,
+                 "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+                 "= {:.4f}",
+                 pcc, rmse, relative_rmse);
+        if (pcc < 0.99f) {
+          log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
+      }
+    }
+
+  } catch (const std::exception &e) {
+    pass = false;
+    log_error(LogTest, "{}", e.what());
+  }
+  return pass;
+}
+
+
 bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
                            const TestParams &params) {
   bool pass = true;
@@ -3455,11 +3938,14 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
       bool capture_ended = false;
       int64_t capture_record_us = -1;
       try {
-        // Warmup once so compile/setup work is not included in trace replay.
-        {
+        // Warmup phase (excluded from measured timing). Ends with a single
+        // Finish so trace capture + replay start from a hot, synchronized state.
+        if (params.warmup_iters > 0) {
           ZoneScopedN("ComputeMMTrace: ComputeMM Trace Warmup");
-          tt_metal::distributed::EnqueueMeshWorkload(
-              trace_cq, mesh_workload, false);
+          for (uint32_t w = 0; w < params.warmup_iters; ++w) {
+            tt_metal::distributed::EnqueueMeshWorkload(
+                trace_cq, mesh_workload, false);
+          }
           tt_metal::distributed::Finish(trace_cq);
         }
 
@@ -3524,9 +4010,9 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
                 : 0.0;
           log_info(LogTest,
                    "Trace timing: replay_issue_window={}us, finish_wait={}us, "
-                   "replay_total={}us, replay_iters={}",
+                   "replay_total={}us, replay_iters={}, warmup={}",
                    replay_issue_us, replay_finish_wait_us, replay_total_us,
-                   params.num_iters);
+                   params.num_iters, params.warmup_iters);
             log_info(
               LogTest,
               "Trace cost model (X-ops): setup_capture={}us, exec_replay={}us, "
@@ -4634,6 +5120,9 @@ int main(int argc, char **argv) {
     break;
   case TestType::ComputeMMTraceReplay:
     pass = test_compute_mm_trace(device_params.device.get(), params);
+    break;
+  case TestType::ComputeMMSyncBatch:
+    pass = test_compute_mm_sync(device_params.device.get(), params);
     break;
   case TestType::SubDeviceMM:
     pass = test_sub_device_manager_mm(device_params.device.get(), params);
