@@ -251,6 +251,7 @@ struct TestParams {
   TestType test;
   bool pack_device;   // true: device, false: cpu
   bool unpack_device; // true: device, false: cpu
+  bool zeros_mode;    // true: fill inputs with 0.0f and skip golden matmul
 };
 
 struct DeviceParams {
@@ -457,7 +458,8 @@ void log_effective_configuration(const TestParams &params,
            params.bypass_check ? "on" : "off",
            params.use_cache ? "on" : "off", params.clean_mode,
            params.cpu_id, params.cpu_range);
-  log_info(LogTest, "validation_mode={}", validation_mode);
+  log_info(LogTest, "validation_mode={}, input_mode={}", validation_mode,
+           params.zeros_mode ? "zeros" : "random");
 
   if (params.input_dtype == 2) {
     log_warning(LogTest,
@@ -494,6 +496,8 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
   std::string output_dtype_str;
   std::string pack_tile_str;
   std::string unpack_tile_str;
+  std::string input_mode_str;
+  bool zeros_mode = false;
   try {
     // Matrix related args
     std::tie(M, input_args) =
@@ -613,6 +617,18 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                                ". Must be 'cpu', 'device', or 'inherit'");
     }
 
+    std::tie(input_mode_str, input_args) =
+        test_args::get_command_option_and_remaining_args(
+            input_args, "--input-mode", "random");
+    if (input_mode_str == "random") {
+      zeros_mode = false;
+    } else if (input_mode_str == "zeros") {
+      zeros_mode = true;
+    } else {
+      throw std::runtime_error("Invalid --input-mode value: " + input_mode_str +
+                               ". Must be 'random' or 'zeros'");
+    }
+
     if (test_uint > static_cast<uint32_t>(TestType::InvalidTest)) {
       throw std::runtime_error("Invalid --test value");
     }
@@ -669,7 +685,8 @@ TestParams parse_input_arguments(std::vector<std::string> input_args,
                     .clean_mode = clean_mode,
                     .test = test,
                     .pack_device = pack_device,
-                    .unpack_device = unpack_device};
+                    .unpack_device = unpack_device,
+                    .zeros_mode = zeros_mode};
   return params;
 }
 
@@ -927,7 +944,8 @@ BenchmarkInputs prepare_inputs_compute_mm(
     tt::DataFormat data_format = tt::DataFormat::Bfp8_b,
     bool pack_device = false,
   bool reconstruct_effective_inputs = false,
-  bool create_output_ttnn_tensor = false);
+  bool create_output_ttnn_tensor = false,
+  bool zeros_mode = false);
 
 std::tuple<MathFidelity, bool> get_compute_params(tt::ARCH arch);
 
@@ -1066,7 +1084,8 @@ bool test_sub_device_manager_mm(tt_metal::distributed::MeshDevice *device,
           in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
           params.use_dram, start_y, data_format, test2_pack_device,
           /*reconstruct_effective_inputs=*/false,
-          /*create_output_ttnn_tensor=*/false);
+          /*create_output_ttnn_tensor=*/false,
+          /*zeros_mode=*/params.zeros_mode);
 
       uint32_t effective_in0_addr = in0_addr;
       uint32_t effective_in1_addr = in1_addr;
@@ -1338,8 +1357,17 @@ float get_relative_rmse(const std::vector<float> &x,
   return static_cast<float>(rrmse);
 }
 
-// Reference Matrix Multiplication (row-major)
-// C = A * B. A is (M x K), B is (K x N), C is (M x N)
+// Maximum absolute value in a vector — used for zeros-mode validation
+// (golden = all zeros, so a passing run has max-abs == 0 within tolerance).
+float get_max_abs(const std::vector<float> &v) {
+  float m = 0.0f;
+  for (float x : v) {
+    float a = std::fabs(x);
+    if (a > m) m = a;
+  }
+  return m;
+}
+
 // Reference Matrix Multiplication (row-major)
 // C = A * B. A is (M x K), B is (K x N), C is (M x N)
 // Uses double precision for accumulation to serve as a rigorous Golden
@@ -1496,18 +1524,26 @@ BenchmarkInputs prepare_inputs_compute_mm(
     uint32_t per_core_Nt, uint32_t in0_block_w, uint32_t single_tile_size,
     uint32_t in0_addr, uint32_t in1_addr, uint32_t in2_cb_addr, bool use_dram,
     uint32_t start_core_y, tt::DataFormat data_format, bool pack_device,
-  bool reconstruct_effective_inputs, bool create_output_ttnn_tensor) {
+  bool reconstruct_effective_inputs, bool create_output_ttnn_tensor,
+  bool zeros_mode) {
 
   ZoneScopedN("Prepare Inputs Compute MM");
   BenchmarkInputs inputs;
 
-  // Generate random FP32 matrices. These are kept in the BenchmarkInputs struct
-  // for later host-side golden-reference validation (matmul_reference).
+  // Generate input matrices. In zeros mode, fill with 0.0f to skip RNG cost
+  // and make the golden trivially zero (validation becomes a max-abs scan).
   // TILE_HW = 32*32 = 1024 elements per tile.
-  // Scale factor for ML-realistic initialization: range [-5, 5] (User Request)
-  float scale = 5.0f;
-  inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, scale);
-  inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, scale);
+  if (zeros_mode) {
+    inputs.in0_vec.assign(static_cast<size_t>(Mt) * Kt * constants::TILE_HW,
+                          0.0f);
+    inputs.in1_vec.assign(static_cast<size_t>(Nt) * Kt * constants::TILE_HW,
+                          0.0f);
+  } else {
+    // Scale factor for ML-realistic initialization: range [-5, 5]
+    float scale = 5.0f;
+    inputs.in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, scale);
+    inputs.in1_vec = generate_fp32_random(Nt * Kt * constants::TILE_HW, scale);
+  }
 
   // Zeros buffer for the "in2" circular buffer (CB index 2).
   // This is written to every core's L1 regardless of L1/DRAM mode.
@@ -1641,37 +1677,35 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // We tilize the ENTIRE matrix at once (Mt*32 × Kt*32), unlike L1 mode
     // which slices per-core.
     std::vector<uint32_t> in0_packed;
+    uint32_t in0_num_tiles = Mt * Kt;
+    uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
     {
-      ZoneScopedN("Tilize and Pack IN0 (DRAM)");
+      ZoneScopedN("ComputeMM Host CPU: Tilize and Pack IN0 (DRAM)");
       in0_packed = pack_tilized_fp32_to_device_format(inputs.in0_vec, Mt * 32,
                                                       Kt * 32, data_format);
+    }
 
+    {
+      ZoneScopedN("ComputeMM Host: Create IN0 DRAM Buffer");
       // Create a DRAM interleaved buffer to hold Mt*Kt tiles.
       // InterleavedBufferConfig tells the allocator to distribute tiles
       // across DRAM banks in round-robin order. Each "page" = one tile.
-      // The buffer's base address (buffer->address()) will be passed to the
-      // kernel as a runtime argument for InterleavedAddrGenFast<true>.
-      uint32_t in0_num_tiles = Mt * Kt;
-      uint32_t in0_size_bytes = in0_num_tiles * single_tile_size;
       tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
           .page_size = single_tile_size,
           .buffer_type = tt_metal::BufferType::DRAM,
       };
       tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
           .size = in0_size_bytes};
-
       inputs.in0_buffer = tt::tt_metal::distributed::MeshBuffer::create(
           global_buf, device_local, device);
-
-      // WriteToBuffer writes the packed data to the interleaved buffer.
-      // Internally, this writes each page (tile) to the correct DRAM bank
-      // based on the round-robin interleaving scheme.
-      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
-          device->mesh_command_queue(), inputs.in0_buffer, in0_packed, false);
     }
 
+    // Bandwidth-attributable H2D zone: enqueue + Finish bundled, so the
+    // zone duration is the full host-visible transfer cost. BW = in0_size_bytes / zone_us.
     {
-      ZoneScopedN("ComputeMM Device: Wait for Transfer IN0 (Finish)");
+      ZoneScopedN("ComputeMM H2D Transfer IN0 (Enqueue+Finish)");
+      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+          device->mesh_command_queue(), inputs.in0_buffer, in0_packed, false);
       tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
@@ -1686,29 +1720,31 @@ BenchmarkInputs prepare_inputs_compute_mm(
     // Same flow as IN0: tilize → pack BFP8 → create DRAM buffer → write.
     // IN1 has dimensions Kt*32 (rows) × Nt*32 (cols), totaling Kt*Nt tiles.
     std::vector<uint32_t> in1_packed;
+    uint32_t in1_num_tiles = Kt * Nt;
+    uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
     {
-      ZoneScopedN("Tilize and Pack IN1 (DRAM)");
+      ZoneScopedN("ComputeMM Host CPU: Tilize and Pack IN1 (DRAM)");
       in1_packed = pack_tilized_fp32_to_device_format(inputs.in1_vec, Kt * 32,
                                                       Nt * 32, data_format);
+    }
 
-      uint32_t in1_num_tiles = Kt * Nt;
-      uint32_t in1_size_bytes = in1_num_tiles * single_tile_size;
+    {
+      ZoneScopedN("ComputeMM Host: Create IN1 DRAM Buffer");
       tt::tt_metal::distributed::DeviceLocalBufferConfig device_local{
           .page_size = single_tile_size,
           .buffer_type = tt_metal::BufferType::DRAM,
       };
       tt::tt_metal::distributed::ReplicatedBufferConfig global_buf{
           .size = in1_size_bytes};
-
       inputs.in1_buffer = tt::tt_metal::distributed::MeshBuffer::create(
           global_buf, device_local, device);
-
-      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
-          device->mesh_command_queue(), inputs.in1_buffer, in1_packed, false);
     }
 
+    // Bandwidth-attributable H2D zone: enqueue + Finish bundled. BW = in1_size_bytes / zone_us.
     {
-      ZoneScopedN("ComputeMM Device: Wait for Transfer IN1 (Finish)");
+      ZoneScopedN("ComputeMM H2D Transfer IN1 (Enqueue+Finish)");
+      tt::tt_metal::distributed::EnqueueWriteMeshBuffer(
+          device->mesh_command_queue(), inputs.in1_buffer, in1_packed, false);
       tt::tt_metal::distributed::Finish(device->mesh_command_queue());
     }
 
@@ -2424,7 +2460,8 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
             params.use_dram, 0, data_format, params.pack_device,
           !params.bypass_check,
-          params.unpack_device);
+          params.unpack_device,
+          params.zeros_mode);
       }
 
       {
@@ -2490,7 +2527,7 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
       log_info(LogTest, "Validation Started...");
       log_validation_pipeline_steps(params);
 
-      if (params.use_dram && params.pack_device) {
+      if (params.use_dram && params.pack_device && !params.zeros_mode) {
         ZoneScopedN("ComputeMM Host Validation: Reconstruct Effective Inputs");
 
         // Reconstruct effective packed inputs for rigorous golden-reference
@@ -2526,13 +2563,18 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Compute Golden Reference
+      // Compute Golden Reference (or trivially all zeros in zeros_mode).
       std::vector<float> golden_vec;
       {
         ZoneScopedN("ComputeMM Host Golden Reference");
-        log_info(LogTest, "Computing Golden Reference (FP32)...");
-        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
-                                      params.N, params.K);
+        if (params.zeros_mode) {
+          log_info(LogTest, "Golden Reference: all-zeros (zeros mode)");
+          golden_vec.assign(static_cast<size_t>(params.M) * params.N, 0.0f);
+        } else {
+          log_info(LogTest, "Computing Golden Reference (FP32)...");
+          golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
+                                        params.M, params.N, params.K);
+        }
       }
 
       // Read Back Results
@@ -2700,29 +2742,51 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Comparison
-      float pcc = 0.0f;
-      float rmse = 0.0f;
-      float relative_rmse = 0.0f;
-      {
-        ZoneScopedN("ComputeMM Host Validation Metrics");
-        pcc = get_pcc(golden_vec, device_vec);
-        rmse = get_rmse(golden_vec, device_vec);
-        relative_rmse = get_relative_rmse(device_vec, golden_vec);
-      }
-      log_validation_sample_pairs("ComputeMM Validation", golden_vec,
-                                  device_vec, 12);
-
-      log_info(LogTest,
-               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
-               "= {:.4f}",
-               pcc, rmse, relative_rmse);
-
-      if (pcc < 0.99f) {
-        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
-        pass = false;
+      if (params.zeros_mode) {
+        float max_abs = 0.0f;
+        {
+          ZoneScopedN("ComputeMM Host Validation Metrics");
+          max_abs = get_max_abs(device_vec);
+        }
+        log_validation_sample_pairs("ComputeMM Validation (zeros)", golden_vec,
+                                    device_vec, 12);
+        const float zeros_eps = 1e-6f;
+        log_info(LogTest,
+                 "Validation Result (zeros mode): max_abs={:.6e}, eps={:.1e}",
+                 max_abs, zeros_eps);
+        if (max_abs > zeros_eps) {
+          log_error(LogTest,
+                    "Validation FAILED (zeros mode: max_abs > {:.1e})",
+                    zeros_eps);
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       } else {
-        log_info(LogTest, "Validation PASSED");
+        // Comparison
+        float pcc = 0.0f;
+        float rmse = 0.0f;
+        float relative_rmse = 0.0f;
+        {
+          ZoneScopedN("ComputeMM Host Validation Metrics");
+          pcc = get_pcc(golden_vec, device_vec);
+          rmse = get_rmse(golden_vec, device_vec);
+          relative_rmse = get_relative_rmse(device_vec, golden_vec);
+        }
+        log_validation_sample_pairs("ComputeMM Validation", golden_vec,
+                                    device_vec, 12);
+
+        log_info(LogTest,
+                 "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+                 "= {:.4f}",
+                 pcc, rmse, relative_rmse);
+
+        if (pcc < 0.99f) {
+          log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       }
     }
 
@@ -2838,7 +2902,8 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
             params.use_dram, 0, data_format, params.pack_device,
           !params.bypass_check,
-          params.unpack_device);
+          params.unpack_device,
+          params.zeros_mode);
       }
 
       {
@@ -2937,7 +3002,7 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
       log_info(LogTest, "Validation Started...");
       log_validation_pipeline_steps(params);
 
-      if (params.use_dram && params.pack_device) {
+      if (params.use_dram && params.pack_device && !params.zeros_mode) {
         ZoneScopedN("ComputeMMAsync Host Validation: Reconstruct Effective Inputs");
 
         // Reconstruct effective packed inputs for rigorous golden-reference
@@ -2973,13 +3038,18 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Compute Golden Reference
+      // Compute Golden Reference (or trivially all zeros in zeros_mode).
       std::vector<float> golden_vec;
       {
         ZoneScopedN("ComputeMMAsync Host Golden Reference");
-        log_info(LogTest, "Computing Golden Reference (FP32)...");
-        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
-                                      params.N, params.K);
+        if (params.zeros_mode) {
+          log_info(LogTest, "Golden Reference: all-zeros (zeros mode)");
+          golden_vec.assign(static_cast<size_t>(params.M) * params.N, 0.0f);
+        } else {
+          log_info(LogTest, "Computing Golden Reference (FP32)...");
+          golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
+                                        params.M, params.N, params.K);
+        }
       }
 
       // Read Back Results
@@ -3147,29 +3217,51 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Comparison
-      float pcc = 0.0f;
-      float rmse = 0.0f;
-      float relative_rmse = 0.0f;
-      {
-        ZoneScopedN("ComputeMMAsync Host Validation Metrics");
-        pcc = get_pcc(golden_vec, device_vec);
-        rmse = get_rmse(golden_vec, device_vec);
-        relative_rmse = get_relative_rmse(device_vec, golden_vec);
-      }
-      log_validation_sample_pairs("ComputeMMAsync Validation", golden_vec,
-                                  device_vec, 12);
-
-      log_info(LogTest,
-               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
-               "= {:.4f}",
-               pcc, rmse, relative_rmse);
-
-      if (pcc < 0.99f) {
-        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
-        pass = false;
+      if (params.zeros_mode) {
+        float max_abs = 0.0f;
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation Metrics");
+          max_abs = get_max_abs(device_vec);
+        }
+        log_validation_sample_pairs("ComputeMMAsync Validation (zeros)",
+                                    golden_vec, device_vec, 12);
+        const float zeros_eps = 1e-6f;
+        log_info(LogTest,
+                 "Validation Result (zeros mode): max_abs={:.6e}, eps={:.1e}",
+                 max_abs, zeros_eps);
+        if (max_abs > zeros_eps) {
+          log_error(LogTest,
+                    "Validation FAILED (zeros mode: max_abs > {:.1e})",
+                    zeros_eps);
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       } else {
-        log_info(LogTest, "Validation PASSED");
+        // Comparison
+        float pcc = 0.0f;
+        float rmse = 0.0f;
+        float relative_rmse = 0.0f;
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation Metrics");
+          pcc = get_pcc(golden_vec, device_vec);
+          rmse = get_rmse(golden_vec, device_vec);
+          relative_rmse = get_relative_rmse(device_vec, golden_vec);
+        }
+        log_validation_sample_pairs("ComputeMMAsync Validation", golden_vec,
+                                    device_vec, 12);
+
+        log_info(LogTest,
+                 "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+                 "= {:.4f}",
+                 pcc, rmse, relative_rmse);
+
+        if (pcc < 0.99f) {
+          log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       }
     }
 
@@ -3286,7 +3378,8 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
             in0_block_w, single_tile_size, in0_addr, in1_addr, in2_cb_addr,
             params.use_dram, 0, data_format, params.pack_device,
           !params.bypass_check,
-          params.unpack_device);
+          params.unpack_device,
+          params.zeros_mode);
       }
 
       {
@@ -3480,7 +3573,7 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
       log_info(LogTest, "Validation Started...");
       log_validation_pipeline_steps(params);
 
-      if (params.use_dram && params.pack_device) {
+      if (params.use_dram && params.pack_device && !params.zeros_mode) {
         ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Reconstruct Effective Inputs");
 
         // Reconstruct effective packed inputs for rigorous golden-reference
@@ -3516,13 +3609,18 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Compute Golden Reference
+      // Compute Golden Reference (or trivially all zeros in zeros_mode).
       std::vector<float> golden_vec;
       {
         ZoneScopedN("ComputeMMTrace: ComputeMM Host Golden Reference");
-        log_info(LogTest, "Computing Golden Reference (FP32)...");
-        golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec, params.M,
-                                      params.N, params.K);
+        if (params.zeros_mode) {
+          log_info(LogTest, "Golden Reference: all-zeros (zeros mode)");
+          golden_vec.assign(static_cast<size_t>(params.M) * params.N, 0.0f);
+        } else {
+          log_info(LogTest, "Computing Golden Reference (FP32)...");
+          golden_vec = matmul_reference(inputs.in0_vec, inputs.in1_vec,
+                                        params.M, params.N, params.K);
+        }
       }
 
       // Read Back Results
@@ -3690,29 +3788,51 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
         }
       }
 
-      // Comparison
-      float pcc = 0.0f;
-      float rmse = 0.0f;
-      float relative_rmse = 0.0f;
-      {
-        ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation Metrics");
-        pcc = get_pcc(golden_vec, device_vec);
-        rmse = get_rmse(golden_vec, device_vec);
-        relative_rmse = get_relative_rmse(device_vec, golden_vec);
-      }
-      log_validation_sample_pairs("ComputeMMTrace Validation", golden_vec,
-                                  device_vec, 12);
-
-      log_info(LogTest,
-               "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
-               "= {:.4f}",
-               pcc, rmse, relative_rmse);
-
-      if (pcc < 0.99f) {
-        log_error(LogTest, "Validation FAILED (PCC < 0.99)");
-        pass = false;
+      if (params.zeros_mode) {
+        float max_abs = 0.0f;
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation Metrics");
+          max_abs = get_max_abs(device_vec);
+        }
+        log_validation_sample_pairs("ComputeMMTrace Validation (zeros)",
+                                    golden_vec, device_vec, 12);
+        const float zeros_eps = 1e-6f;
+        log_info(LogTest,
+                 "Validation Result (zeros mode): max_abs={:.6e}, eps={:.1e}",
+                 max_abs, zeros_eps);
+        if (max_abs > zeros_eps) {
+          log_error(LogTest,
+                    "Validation FAILED (zeros mode: max_abs > {:.1e})",
+                    zeros_eps);
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       } else {
-        log_info(LogTest, "Validation PASSED");
+        // Comparison
+        float pcc = 0.0f;
+        float rmse = 0.0f;
+        float relative_rmse = 0.0f;
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation Metrics");
+          pcc = get_pcc(golden_vec, device_vec);
+          rmse = get_rmse(golden_vec, device_vec);
+          relative_rmse = get_relative_rmse(device_vec, golden_vec);
+        }
+        log_validation_sample_pairs("ComputeMMTrace Validation", golden_vec,
+                                    device_vec, 12);
+
+        log_info(LogTest,
+                 "Validation Result: PCC = {:.4f}, RMSE = {:.4f}, Relative RMSE "
+                 "= {:.4f}",
+                 pcc, rmse, relative_rmse);
+
+        if (pcc < 0.99f) {
+          log_error(LogTest, "Validation FAILED (PCC < 0.99)");
+          pass = false;
+        } else {
+          log_info(LogTest, "Validation PASSED");
+        }
       }
     }
 
@@ -3844,8 +3964,15 @@ bool test_host_pipeline_compute_mm(
         {
           ZoneScopedN("HostPipeline ComputeMM Prepare Inputs");
           auto t0 = std::chrono::steady_clock::now();
-          in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
-          in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
+          if (params.zeros_mode) {
+            in0_vec.assign(static_cast<size_t>(Mt) * Kt * constants::TILE_HW,
+                           0.0f);
+            in1_vec.assign(static_cast<size_t>(Kt) * Nt * constants::TILE_HW,
+                           0.0f);
+          } else {
+            in0_vec = generate_fp32_random(Mt * Kt * constants::TILE_HW, 5.0f);
+            in1_vec = generate_fp32_random(Kt * Nt * constants::TILE_HW, 5.0f);
+          }
           auto t1 = std::chrono::steady_clock::now();
           stats.generate_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -3924,20 +4051,38 @@ bool test_host_pipeline_compute_mm(
                                                                     t0_post)
                   .count();
 
-          float in0_pcc = get_pcc(in0_vec, in0_untilized);
-          float in1_pcc = get_pcc(in1_vec, in1_untilized);
-          log_validation_sample_pairs("HostPipeline ComputeMM IN0", in0_vec,
-                                      in0_untilized, 12);
-          log_validation_sample_pairs("HostPipeline ComputeMM IN1", in1_vec,
-                                      in1_untilized, 12);
+          if (params.zeros_mode) {
+            float in0_max = get_max_abs(in0_untilized);
+            float in1_max = get_max_abs(in1_untilized);
+            log_validation_sample_pairs("HostPipeline ComputeMM IN0 (zeros)",
+                                        in0_vec, in0_untilized, 12);
+            log_validation_sample_pairs("HostPipeline ComputeMM IN1 (zeros)",
+                                        in1_vec, in1_untilized, 12);
+            const float zeros_eps = 1e-6f;
+            if (in0_max > zeros_eps || in1_max > zeros_eps) {
+              log_error(LogTest,
+                        "Host-only ComputeMM zeros roundtrip failed: "
+                        "in0_max={:.6e}, in1_max={:.6e}",
+                        in0_max, in1_max);
+              pass = false;
+              break;
+            }
+          } else {
+            float in0_pcc = get_pcc(in0_vec, in0_untilized);
+            float in1_pcc = get_pcc(in1_vec, in1_untilized);
+            log_validation_sample_pairs("HostPipeline ComputeMM IN0", in0_vec,
+                                        in0_untilized, 12);
+            log_validation_sample_pairs("HostPipeline ComputeMM IN1", in1_vec,
+                                        in1_untilized, 12);
 
-          if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
-            log_error(LogTest,
-                      "Host-only ComputeMM roundtrip check failed: "
-                      "in0_pcc={:.4f}, in1_pcc={:.4f}",
-                      in0_pcc, in1_pcc);
-            pass = false;
-            break;
+            if (in0_pcc < 0.99f || in1_pcc < 0.99f) {
+              log_error(LogTest,
+                        "Host-only ComputeMM roundtrip check failed: "
+                        "in0_pcc={:.4f}, in1_pcc={:.4f}",
+                        in0_pcc, in1_pcc);
+              pass = false;
+              break;
+            }
           }
         }
       }
@@ -4014,7 +4159,13 @@ bool test_host_pipeline_empty_tensor(
         {
           ZoneScopedN("HostPipeline Empty Prepare Inputs");
           auto t0 = std::chrono::steady_clock::now();
-          tensor_vec = generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
+          if (params.zeros_mode) {
+            tensor_vec.assign(static_cast<size_t>(Mt) * Nt * constants::TILE_HW,
+                              0.0f);
+          } else {
+            tensor_vec =
+                generate_fp32_random(Mt * Nt * constants::TILE_HW, 5.0f);
+          }
           auto t1 = std::chrono::steady_clock::now();
           stats.generate_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
@@ -4114,17 +4265,32 @@ bool test_host_pipeline_empty_tensor(
                                                                     t0_post)
                   .count();
 
-          float pcc = get_pcc(tensor_vec, roundtrip);
-          log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
-                                      roundtrip, 12);
+          if (params.zeros_mode) {
+            float max_abs = get_max_abs(roundtrip);
+            log_validation_sample_pairs("HostPipeline Empty (zeros)",
+                                        tensor_vec, roundtrip, 12);
+            const float zeros_eps = 1e-6f;
+            if (max_abs > zeros_eps) {
+              log_error(LogTest,
+                        "Host-only Empty zeros roundtrip failed: "
+                        "max_abs={:.6e}",
+                        max_abs);
+              pass = false;
+              break;
+            }
+          } else {
+            float pcc = get_pcc(tensor_vec, roundtrip);
+            log_validation_sample_pairs("HostPipeline Empty", tensor_vec,
+                                        roundtrip, 12);
 
-          if (pcc < 0.99f) {
-            log_error(LogTest,
-                      "Host-only Empty roundtrip check failed: "
-                      "pcc={:.4f}",
-                      pcc);
-            pass = false;
-            break;
+            if (pcc < 0.99f) {
+              log_error(LogTest,
+                        "Host-only Empty roundtrip check failed: "
+                        "pcc={:.4f}",
+                        pcc);
+              pass = false;
+              break;
+            }
           }
         }
       }

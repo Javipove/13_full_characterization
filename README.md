@@ -163,6 +163,7 @@ unset TT_METAL_LOG_KERNELS_COMPILE_COMMANDS TT_METAL_VALIDATE_PROGRAM_BINARIES
 | `--cache` | off | Enables program and persistent kernel cache lifecycle. |
 | `--clean-mode <0/1>` | `0` | Cache experiment switch. |
 | `--bypass-check` | off | Skips numerical validation when enabled. |
+| `--input-mode <random\|zeros>` | `random` | `zeros`: fills IN0/IN1 with `0.0f`, skips `matmul_reference` (golden is trivially zero), and validates via `max_abs(device_vec) <= 1e-6`. Full pack/transfer/dispatch/readback paths still run — only host-side RNG and O(N³) golden are bypassed. Applies to tests 1/2/3/4/5/6. |
 
 ### Shape and precision
 | Option | Default | Notes |
@@ -197,6 +198,14 @@ unset TT_METAL_LOG_KERNELS_COMPILE_COMMANDS TT_METAL_VALIDATE_PROGRAM_BINARIES
 ./run_full_charac.sh ./build/test/test_full_charac \
   --test 1 --dram --x_size 8 --y_size 7 \
   --m 4096 --n 4096 --k 4096 --num-iters 10
+```
+
+### ComputeMM zeros-input bandwidth run (fast validation)
+Skips host RNG and O(N³) golden matmul; full transfer + dispatch + readback paths are still exercised, so the new H2D bandwidth zones below are valid.
+```bash
+./run_full_charac.sh ./build/test/test_full_charac \
+  --test 1 --dram --input-mode zeros \
+  --x_size 8 --y_size 7 --m 4096 --n 4096 --k 4096 --num-iters 20
 ```
 ### ComputeMM async batch baseline (new test 5)
 ```bash
@@ -748,6 +757,22 @@ Rule used:
 | `ComputeMM Host ReadFromDeviceL1 All Cores` | `ComputeMM Host ReadFromDeviceL1 All Cores (leg)` | Equivalent (legacy naming) |
 | `ComputeMM Host Decode L1` | `ComputeMM Host Decode L1 (leg)` | Equivalent (legacy naming) |
 | `ComputeMM Host Validation Metrics` | `ComputeMM Host Validation Metrics` | Exact |
+
+### H2D Bandwidth-attributable Zones (cpu-pack DRAM path, new)
+The cpu-pack DRAM input-prep path is now split into single-purpose zones so per-tensor H2D bandwidth is directly readable as `bytes / zone_us`:
+
+| Zone | Measures | BW formula |
+| :-- | :-- | :-- |
+| `ComputeMM Host CPU: Tilize and Pack IN0 (DRAM)` | CPU pack only (tilize + BFP8/BF16 pack) | — |
+| `ComputeMM Host: Create IN0 DRAM Buffer` | MeshBuffer metadata allocation | — |
+| `ComputeMM H2D Transfer IN0 (Enqueue+Finish)` | `EnqueueWriteMeshBuffer` + `Finish` bundled | `Mt*Kt*single_tile_size / zone_us` |
+| `ComputeMM Host CPU: Tilize and Pack IN1 (DRAM)` | CPU pack only | — |
+| `ComputeMM Host: Create IN1 DRAM Buffer` | metadata | — |
+| `ComputeMM H2D Transfer IN1 (Enqueue+Finish)` | enqueue + Finish bundled | `Kt*Nt*single_tile_size / zone_us` |
+
+D2H readback bandwidth (cpu-unpack DRAM path) is read from `ComputeMM Host ReadShard DRAM Output` (blocking ReadShard, so zone bounds the full D2H): `Mt*Nt*single_tile_size / zone_us`.
+
+For the `pack-tile device` (ttnn) path, per-tensor H2D timing is not isolatable — `ttnn::IN0_ToDevice` / `ttnn::IN1_ToDevice` are async enqueues, and actual transfer time lands in the shared `ttnn::Sync` Finish zone.
 
 Notes:
 - Legacy deterministic profiling mode for Test 1 DRAM supports two complete pipelines only: `cpu/cpu` or `device/device`; mixed mode is rejected.
