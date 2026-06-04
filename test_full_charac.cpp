@@ -1596,14 +1596,20 @@ BenchmarkInputs prepare_inputs_compute_mm(
         ZoneScopedN("ttnn::IN0_ToDevice");
         device_tensor_a_rm = host_tensor_a.to_device(device);
       }
-
+      {
+        ZoneScopedN("IN0_ToDevice_Finish");
+        tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+      } 
       ttnn::Tensor device_tensor_a_final;
       {
         ZoneScopedN("ttnn::IN0_TilizePack");
         device_tensor_a_final =
           ttnn::tilize(device_tensor_a_rm, std::nullopt, output_ttnn_dtype);
       }
-
+      {
+        ZoneScopedN("IN0_Tilize_Finish");
+        tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
       {
         ZoneScopedN("ttnn::IN0_CaptureBufferAndRetainTensor");
         inputs.in0_buffer =
@@ -1620,14 +1626,20 @@ BenchmarkInputs prepare_inputs_compute_mm(
         ZoneScopedN("ttnn::IN1_ToDevice");
         device_tensor_b_rm = host_tensor_b.to_device(device);
       }
-
+      {
+        ZoneScopedN("IN1_ToDevice_Finish");
+        tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
       ttnn::Tensor device_tensor_b_final;
       {
         ZoneScopedN("ttnn::IN1_TilizePack");
         device_tensor_b_final =
           ttnn::tilize(device_tensor_b_rm, std::nullopt, output_ttnn_dtype);
       }
-
+      {
+        ZoneScopedN("IN1_Tilize_Finish");
+        tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+      }
       {
         ZoneScopedN("ttnn::IN1_CaptureBufferAndRetainTensor");
         inputs.in1_buffer =
@@ -2550,7 +2562,11 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in0_packed_effective,
               inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Read Packed IN0 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
@@ -2565,7 +2581,11 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in1_packed_effective,
               inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMM Host Validation: Read Packed IN1 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
@@ -2618,6 +2638,10 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                     ttnn::typecast(device_tensor_out, ttnn::DataType::FLOAT32);
               }
 
+              {
+                ZoneScopedN("ttnn::typecast_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
               // 2. Convert to ROW_MAJOR layout on device
               ttnn::Tensor device_tensor_fp32_rm;
               {
@@ -2635,6 +2659,10 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
                 ZoneScopedN("ttnn::to_vector<float> (Readback)");
                 device_vec = device_tensor_fp32_rm.to_vector<float>();
               }
+              {
+                ZoneScopedN("ttnn::to_vector<float>_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+              }
             } else {
               // Native/BF16 export path: untilize directly, no explicit FP32 cast.
               ttnn::Tensor device_tensor_rm;
@@ -2649,6 +2677,10 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
               {
                 ZoneScopedN("ttnn::to_vector<float> (Readback)");
                 device_vec = device_tensor_rm.to_vector<float>();
+              }
+              {
+                ZoneScopedN("ttnn::to_vector<float>_Finish");
+                tt::tt_metal::distributed::Finish(device->mesh_command_queue());
               }
             }
 
@@ -2674,9 +2706,12 @@ bool test_compute_mm(tt::tt_metal::distributed::MeshDevice *device,
               ZoneScopedN("ComputeMM Host ReadShard DRAM Output");
               tt::tt_metal::distributed::ReadShard(
                   device->mesh_command_queue(), out_data, inputs.out_buffer,
-                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
             }
-
+            {
+              ZoneScopedN("ReadShard_Finish");
+              tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+            }
             {
               ZoneScopedN("ComputeMM Host Decode DRAM");
               // Unpack and untilize the full output
@@ -3038,7 +3073,11 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in0_packed_effective,
               inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Read Packed IN0 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMAsync Host Validation: Decode Effective IN0 (Device Pack)");
@@ -3053,7 +3092,11 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in1_packed_effective,
               inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMAsync Host Validation: Read Packed IN1 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMAsync Host Validation: Decode Effective IN1 (Device Pack)");
@@ -3162,7 +3205,11 @@ bool test_compute_mm_async(tt::tt_metal::distributed::MeshDevice *device,
               ZoneScopedN("ComputeMMAsync Host ReadShard DRAM Output");
               tt::tt_metal::distributed::ReadShard(
                   device->mesh_command_queue(), out_data, inputs.out_buffer,
-                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            }
+            {
+              ZoneScopedN("ComputeMMAsync Host ReadShard DRAM Output Finish");
+              tt::tt_metal::distributed::Finish(device->mesh_command_queue());
             }
 
             {
@@ -3524,7 +3571,11 @@ bool test_compute_mm_sync(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in0_packed_effective,
               inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Read Packed IN0 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMSync Host Validation: Decode Effective IN0 (Device Pack)");
@@ -3539,7 +3590,11 @@ bool test_compute_mm_sync(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in1_packed_effective,
               inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMSync Host Validation: Read Packed IN1 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMSync Host Validation: Decode Effective IN1 (Device Pack)");
@@ -3634,7 +3689,11 @@ bool test_compute_mm_sync(tt::tt_metal::distributed::MeshDevice *device,
               ZoneScopedN("ComputeMMSync Host ReadShard DRAM Output");
               tt::tt_metal::distributed::ReadShard(
                   device->mesh_command_queue(), out_data, inputs.out_buffer,
-                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            }
+            {
+              ZoneScopedN("ComputeMMSync Host ReadShard DRAM Output Finish");
+              tt::tt_metal::distributed::Finish(device->mesh_command_queue());
             }
             {
               ZoneScopedN("ComputeMMSync Host Decode DRAM");
@@ -4070,7 +4129,11 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in0_packed_effective,
               inputs.in0_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Read Packed IN0 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Decode Effective IN0 (Device Pack)");
@@ -4085,7 +4148,11 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
           tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in1_packed_effective,
               inputs.in1_buffer, tt::tt_metal::distributed::MeshCoordinate(0, 0),
-              true);
+              false);
+        }
+        {
+          ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Read Packed IN1 (Device Pack) Finish");
+          tt::tt_metal::distributed::Finish(device->mesh_command_queue());
         }
         {
           ZoneScopedN("ComputeMMTrace: ComputeMM Host Validation: Decode Effective IN1 (Device Pack)");
@@ -4194,7 +4261,11 @@ bool test_compute_mm_trace(tt::tt_metal::distributed::MeshDevice *device,
               ZoneScopedN("ComputeMMTrace: ComputeMM Host ReadShard DRAM Output");
               tt::tt_metal::distributed::ReadShard(
                   device->mesh_command_queue(), out_data, inputs.out_buffer,
-                  tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
+                  tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            }
+            {
+              ZoneScopedN("ComputeMMTrace: ComputeMM Host ReadShard DRAM Output Finish");
+              tt::tt_metal::distributed::Finish(device->mesh_command_queue());
             }
 
             {
@@ -4500,14 +4571,15 @@ bool test_host_pipeline_compute_mm(
         std::vector<uint32_t> in1_readback;
         {
           ZoneScopedN("HostPipeline ComputeMM Host FinishWait");
-          auto t0 = std::chrono::steady_clock::now();
-          tt::tt_metal::distributed::ReadShard(
+            auto t0 = std::chrono::steady_clock::now();
+            tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in0_readback, in0_buffer,
-              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
-          tt::tt_metal::distributed::ReadShard(
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), in1_readback, in1_buffer,
-              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
-          auto t1 = std::chrono::steady_clock::now();
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+            auto t1 = std::chrono::steady_clock::now();
           stats.read_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                   .count();
@@ -4705,11 +4777,12 @@ bool test_host_pipeline_empty_tensor(
         std::vector<uint32_t> readback;
         {
           ZoneScopedN("HostPipeline Empty Host FinishWait");
-          auto t0 = std::chrono::steady_clock::now();
-          tt::tt_metal::distributed::ReadShard(
+            auto t0 = std::chrono::steady_clock::now();
+            tt::tt_metal::distributed::ReadShard(
               device->mesh_command_queue(), readback, tensor_buffer,
-              tt::tt_metal::distributed::MeshCoordinate(0, 0), true);
-          auto t1 = std::chrono::steady_clock::now();
+              tt::tt_metal::distributed::MeshCoordinate(0, 0), false);
+            tt::tt_metal::distributed::Finish(device->mesh_command_queue());
+            auto t1 = std::chrono::steady_clock::now();
           stats.read_us +=
               std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                   .count();
